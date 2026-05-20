@@ -252,6 +252,8 @@ pub struct HomeView {
 
     // Sound config for state transition sounds
     pub(super) sound_config: crate::sound::SoundConfig,
+    pub(super) status_hook_config: crate::status_hooks::StatusHookConfig,
+    pub(super) status_hook_configs: HashMap<String, crate::status_hooks::StatusHookConfig>,
 
     /// Resolved decay window from `Config.theme.idle_decay_minutes`. Read
     /// at startup and re-resolved on settings reload. Used by render to
@@ -348,6 +350,14 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         let sound_config = resolved.sound.clone();
+        let status_hook_configs = Self::load_status_hook_configs(Self::status_hook_profile_names(
+            active_profile.as_deref(),
+            &storages,
+        ));
+        let status_hook_config = status_hook_configs
+            .get(config_profile)
+            .cloned()
+            .unwrap_or_else(|| resolved.status_hooks.clone());
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
@@ -438,6 +448,8 @@ impl HomeView {
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
+            status_hook_config,
+            status_hook_configs,
             strict_hotkeys,
             idle_decay_window,
             settings_view: None,
@@ -580,6 +592,7 @@ impl HomeView {
             }
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
+        self.refresh_status_hook_config_cache();
 
         for (profile_name, storage) in &self.storages {
             let (mut instances, groups) = storage.load_with_groups()?;
@@ -704,6 +717,23 @@ impl HomeView {
             .collect()
     }
 
+    pub(super) fn attached_status_hook_sessions(
+        &self,
+    ) -> Vec<super::attached_status_hooks::AttachedStatusHookSession> {
+        self.pollable_instances()
+            .into_iter()
+            .filter_map(|instance| {
+                let hook_config = self.status_hook_config_for(&instance);
+                hook_config.enabled.then_some(
+                    super::attached_status_hooks::AttachedStatusHookSession {
+                        instance,
+                        hook_config,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Request a status refresh in the background (non-blocking).
     /// Call `apply_status_updates` to check for and apply results.
     pub fn request_status_refresh(&mut self) {
@@ -732,6 +762,21 @@ impl HomeView {
     /// the apply path directly without having to push through the
     /// background polling thread.
     pub(super) fn apply_one_status_update(&mut self, update: StatusUpdate) {
+        self.apply_status_update(update, true, true);
+    }
+
+    pub(super) fn apply_status_updates_without_hooks(&mut self, updates: Vec<StatusUpdate>) {
+        for update in updates {
+            self.apply_status_update(update, false, false);
+        }
+    }
+
+    pub(super) fn reset_status_refresh(&mut self) {
+        self.status_poller = StatusPoller::new();
+        self.pending_status_refresh = false;
+    }
+
+    fn apply_status_update(&mut self, update: StatusUpdate, play_sound: bool, run_hooks: bool) {
         use crate::session::Status;
 
         let old_status = self.get_instance(&update.id).map(|i| i.status);
@@ -759,9 +804,39 @@ impl HomeView {
 
         if let Some(old) = old_status {
             if old != new_status {
-                crate::sound::play_for_transition(old, new_status, &self.sound_config);
+                if let Some(inst) = self.get_instance(&update.id).cloned() {
+                    self.handle_status_transition(&inst, old, new_status, play_sound, run_hooks);
+                }
             }
         }
+    }
+
+    fn handle_status_transition(
+        &self,
+        inst: &Instance,
+        old: crate::session::Status,
+        new: crate::session::Status,
+        play_sound: bool,
+        run_hooks: bool,
+    ) {
+        if play_sound {
+            crate::sound::play_for_transition(old, new, &self.sound_config);
+        }
+        if run_hooks {
+            let hook_config = self.status_hook_config_for(inst);
+            crate::status_hooks::run_for_transition(inst, old, new, &hook_config);
+        }
+    }
+
+    fn status_hook_config_for(&self, inst: &Instance) -> crate::status_hooks::StatusHookConfig {
+        if self.active_profile.is_some() {
+            return self.status_hook_config.clone();
+        }
+        let profile = inst.effective_profile();
+        self.status_hook_configs
+            .get(&profile)
+            .cloned()
+            .unwrap_or_else(|| self.status_hook_config.clone())
     }
 
     pub fn apply_deletion_results(&mut self) -> bool {
@@ -1817,7 +1892,15 @@ impl HomeView {
     }
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
+        let old_status = self.get_instance(id).map(|inst| inst.status);
         self.mutate_instance(id, |inst| inst.status = status);
+        if let Some(old) = old_status {
+            if old != status {
+                if let Some(inst) = self.get_instance(id).cloned() {
+                    self.handle_status_transition(&inst, old, status, false, true);
+                }
+            }
+        }
     }
 
     /// Stamp `last_accessed_at` on a session (user-initiated interaction).
@@ -2082,6 +2165,8 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         self.sound_config = config.sound.clone();
+        self.status_hook_config = config.status_hooks.clone();
+        self.refresh_status_hook_config_cache();
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
@@ -2093,6 +2178,44 @@ impl HomeView {
                 "Tool hotkey config errors",
                 &hotkey_warnings.join("\n"),
             ));
+        }
+    }
+
+    fn status_hook_profile_names(
+        active_profile: Option<&str>,
+        storages: &HashMap<String, Storage>,
+    ) -> Vec<String> {
+        let mut profile_names = match active_profile {
+            Some(profile) => vec![profile.to_string()],
+            None => storages.keys().cloned().collect(),
+        };
+        if !profile_names.iter().any(|profile| profile == "default") {
+            profile_names.push("default".to_string());
+        }
+        profile_names.sort();
+        profile_names.dedup();
+        profile_names
+    }
+
+    fn load_status_hook_configs(
+        profile_names: Vec<String>,
+    ) -> HashMap<String, crate::status_hooks::StatusHookConfig> {
+        profile_names
+            .into_iter()
+            .map(|profile| {
+                let status_hooks = resolve_config_or_warn(&profile).status_hooks;
+                (profile, status_hooks)
+            })
+            .collect()
+    }
+
+    fn refresh_status_hook_config_cache(&mut self) {
+        let profile_names =
+            Self::status_hook_profile_names(self.active_profile.as_deref(), &self.storages);
+        self.status_hook_configs = Self::load_status_hook_configs(profile_names);
+        let profile = self.active_profile.as_deref().unwrap_or("default");
+        if let Some(status_hooks) = self.status_hook_configs.get(profile) {
+            self.status_hook_config = status_hooks.clone();
         }
     }
 
