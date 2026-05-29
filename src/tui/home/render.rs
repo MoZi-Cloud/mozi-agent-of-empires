@@ -610,7 +610,7 @@ impl HomeView {
             restart_dialog,
             hooks_install_dialog,
             hook_trust_dialog,
-            welcome_dialog,
+            intro_dialog,
             no_agents_dialog,
             changelog_dialog,
             info_dialog,
@@ -841,7 +841,7 @@ impl HomeView {
             || self.rename_dialog.is_some()
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
-            || self.welcome_dialog.is_some()
+            || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()

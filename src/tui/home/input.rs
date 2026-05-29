@@ -14,7 +14,7 @@ use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HookTrustAction,
-    HooksInstallDialog, InfoDialog, NewSessionData, NewSessionDialog, NoAgentsAction,
+    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
     PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
     RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog,
 };
@@ -27,6 +27,32 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 /// environments. Worth tuning if real-world feedback says it's too
 /// fast for trackpads or too slow on remote sessions.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Persist the user's picks from the first-run intro wizard. Theme name goes
+/// to `config.theme.name`; attach mode is mirrored to both
+/// `new_session_attach_mode` (post-create) and `default_attach_mode`
+/// (Enter/double-click) so the two paths stay consistent. Failures are
+/// logged and swallowed: the intro should never block startup on a config
+/// write hiccup.
+fn apply_intro_outcome(outcome: &IntroOutcome) {
+    if outcome.final_theme.is_none() && outcome.final_attach_mode.is_none() {
+        return;
+    }
+    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
+        tracing::warn!(target: "tui.input", "intro outcome: load_config failed; not persisting");
+        return;
+    };
+    if let Some(theme) = &outcome.final_theme {
+        config.theme.name = theme.clone();
+    }
+    if let Some(mode) = outcome.final_attach_mode {
+        config.session.new_session_attach_mode = mode;
+        config.session.default_attach_mode = mode;
+    }
+    if let Err(e) = save_config(&config) {
+        tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
+    }
+}
 
 /// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
 /// has enabled bracketed paste mode (`\e[?2004h`) treats everything
@@ -207,6 +233,14 @@ impl HomeView {
 
     pub fn hit_preview(&self, col: u16, row: u16) -> bool {
         self.preview_area.contains(Position::from((col, row)))
+    }
+
+    /// Drain a theme name queued by intro-dialog clicks. The mouse handler in
+    /// `App` calls this after `handle_dialog_click` and dispatches
+    /// `Action::SetTheme` so the live preview / final pick applies through
+    /// the same path the keyboard route uses.
+    pub fn take_pending_intro_theme(&mut self) -> Option<String> {
+        self.pending_intro_theme.take()
     }
 
     pub fn hit_diff(&self, col: u16, row: u16) -> bool {
@@ -600,6 +634,35 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(dialog) = &mut self.intro_dialog {
+            let click = dialog.handle_click(col, row);
+            let preview = dialog.take_pending_preview();
+            if let Some(result) = click {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.intro_dialog = None;
+                    }
+                    DialogResult::Submit(outcome) => {
+                        self.intro_dialog = None;
+                        apply_intro_outcome(&outcome);
+                        // No pending_intro_theme: the live preview
+                        // already applied the chosen theme to
+                        // `app.theme`; re-applying would force a
+                        // terminal.clear() (the close-flash). Same
+                        // rationale as the keyboard Submit branch.
+                    }
+                }
+                if let Some(name) = preview {
+                    self.pending_intro_theme = Some(name);
+                }
+                return true;
+            }
+            if let Some(name) = preview {
+                self.pending_intro_theme = Some(name);
+            }
+            return true;
+        }
         if let Some(dialog) = &mut self.unified_delete_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
@@ -710,12 +773,6 @@ impl HomeView {
                             Some(Action::SpawnUpdate(method, version));
                     }
                 }
-            }
-            return true;
-        }
-        if let Some(dialog) = &self.welcome_dialog {
-            if let Some(DialogResult::Submit(())) = dialog.handle_click(col, row) {
-                self.welcome_dialog = None;
             }
             return true;
         }
@@ -1093,15 +1150,40 @@ impl HomeView {
             return None;
         }
 
-        // Handle welcome/changelog dialogs first (highest priority)
-        if let Some(dialog) = &mut self.welcome_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Continue => {}
-                DialogResult::Cancel | DialogResult::Submit(_) => {
-                    self.welcome_dialog = None;
+        // Handle intro/changelog dialogs first (highest priority).
+        // Intro live-previews themes as the cursor moves; drain any pending
+        // preview the dialog queued and emit it as Action::SetTheme so the
+        // root App switches themes without round-tripping through the
+        // settings view.
+        if let Some(dialog) = &mut self.intro_dialog {
+            let result = dialog.handle_key(key);
+            let preview = dialog.take_pending_preview();
+            match result {
+                DialogResult::Continue => {
+                    if let Some(name) = preview {
+                        return Some(Action::SetTheme(name));
+                    }
+                    return None;
+                }
+                DialogResult::Cancel => {
+                    self.intro_dialog = None;
+                    if let Some(name) = preview {
+                        return Some(Action::SetTheme(name));
+                    }
+                    return None;
+                }
+                DialogResult::Submit(outcome) => {
+                    self.intro_dialog = None;
+                    apply_intro_outcome(&outcome);
+                    // No SetTheme dispatch: the live preview already
+                    // applied the chosen theme to `app.theme` while the
+                    // user was on the picker page. Re-dispatching here
+                    // would only re-trigger `set_theme → needs_redraw`,
+                    // which forces a `terminal.clear()` on the next loop
+                    // iteration — the close-flash the user sees.
+                    return None;
                 }
             }
-            return None;
         }
 
         if let Some(dialog) = &mut self.changelog_dialog {
@@ -3535,6 +3617,9 @@ impl HomeView {
         }
         if let Some(palette) = &mut self.command_palette {
             overlay_changed |= palette.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.intro_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
         }
 
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
