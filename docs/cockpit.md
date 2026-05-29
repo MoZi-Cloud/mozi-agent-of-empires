@@ -239,6 +239,13 @@ state are always in sync.
 - **TUI status indicators**: a cockpit session that's healthy shows
   as Idle/Active in the TUI session list, since cockpit health is
   observed via the ACP event stream rather than tmux pane probing.
+- **`--auth=passphrase` daemons**: the local TUI attaches to a
+  same-host daemon without going through the passphrase exchange.
+  Loopback callers are treated as fs-trusted because the daemon's
+  serve files under `~/.agent-of-empires/serve.*` are already 0600,
+  so the filesystem permission boundary protects same-host access.
+  Remote callers proxied through a tunnel still hit the passphrase
+  wall as expected. See #1525.
 
 ### TUI cockpit view keybinds
 
@@ -287,6 +294,16 @@ An iPad with a Bluetooth keyboard (or any device that reports both
 `(pointer: coarse)` and `(any-pointer: fine)` to the browser) keeps
 the desktop Enter-to-send convention so hardware-keyboard typing
 feels natural. See #1129.
+
+### iOS Safari dictation
+
+Tapping the on-screen keyboard's mic icon to dictate into the composer
+commits each partial recognition exactly once. The composer detects
+WebKit's `insertReplacementText` burst, suspends its assistant-ui
+controlled-input flush for the duration so WebKit's dictation range
+pointer is not invalidated mid-utterance, then drains the final text
+into the composer state on blur (typically when you tap Send) or
+after a brief idle period. See #1431.
 
 ### Queued prompts (mid-turn + inactive session)
 
@@ -437,6 +454,28 @@ Practical implications:
   agent starts so the UI clears immediately. The same path covers the
   `main`-branch case where there is no runner at all and every cockpit
   session takes the fresh-spawn branch on restart.
+
+## Session deletion
+
+When you delete a cockpit session, aoe opportunistically fires the
+experimental `session/delete` ACP request against the live worker
+(bounded by a 2-second timeout) whenever a stored ACP session id
+exists, and then proceeds with the existing kill path
+(`session/cancel` for in-flight prompts, then SIGTERM on the runner,
+then on-disk cleanup). aoe does not inspect the initialize-time
+capability flag: adapters that implement the method use the request
+to release adapter-side persisted state, for example
+`claude-agent-acp 0.37.0+` clearing the on-disk Claude session
+record so a recreated session id does not inherit prior transcripts.
+Adapters that do not implement the method (`aoe-agent`, `codex`,
+`opencode`, older `claude-agent-acp`) reply with JSON-RPC
+`-32601 method_not_found`; aoe logs that at `debug` and proceeds to
+SIGTERM. A wedged adapter is bounded by the 2-second timeout, so
+delete never stalls the UI. Outcomes are logged under
+`target = "cockpit.acp"` in `debug.log` with an `adapter=<agent_key>`
+field so operators can correlate behavior across adapters: success
+and `-32601` land at `debug`, timeout and other errors at `warn`. See
+[#1404](https://github.com/agent-of-empires/agent-of-empires/issues/1404).
 
 ## Conversation persistence
 
@@ -762,10 +801,55 @@ The rate-limit banner offers a primary "Continue in another agent" CTA. Clicking
 
 After the switch, the modal fetches the context primer and pre-fills the composer with a framed recap of the prior conversation. If the user's last prompt is what triggered the rate-limit (it was published to the event log before the adapter rejected it), the primer endpoint surfaces it separately as `unprocessed_prompt`; the modal drops it into the composer as the user's pending request so they don't have to retype it. The composer is NOT auto-sent; review and submit manually.
 
+### Native binary launch failure
+
+When the cockpit banner shows an error of the form
+
+```text
+Claude Code native binary at /usr/lib/node_modules/.../claude exists but failed to launch.
+```
+
+the adapter found its bundled Claude Code native sub-binary on disk
+but `execve` was rejected by the kernel. Reinstalling
+`claude-agent-acp` does not help; the binary is already there.
+
+The common causes:
+
+1. **Architecture mismatch.** The binary's filename ends in a target
+   triple (`...-linux-arm64/claude`, `...-linux-x64/claude`, etc.).
+   If the host or sandbox container reports a different arch via
+   `uname -m`, the loader refuses the binary. Most often surfaces
+   inside a sandboxed cockpit session where the container image's
+   default arch differs from the host (e.g. an `arm64` host pulling
+   an `amd64` image without `--platform`).
+2. **Missing dynamic loader or old glibc.** Slim base images
+   sometimes ship without `/lib64/ld-linux-x86-64.so.2` or with a
+   glibc too old for the binary. `ldd <binary>` from inside the
+   container reports the gap.
+3. **Bind-mounted `node_modules` across arch.** If the host's npm
+   prefix is bind-mounted into the container (so the container reuses
+   the host install), an `arm64` host binary cannot launch in an
+   `amd64` container and vice versa.
+
+Use **Open agent log** on the red startup banner to see the verbatim
+adapter error from the dashboard, or run `aoe cockpit logs --session
+<id>` from a host terminal. To inspect the binary itself:
+
+```sh
+docker exec <container> file /usr/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-*/claude
+docker exec <container> uname -m
+```
+
+If the file's arch line does not match `uname -m`, the fix is either
+re-pull the image with `--platform linux/<host-arch>` or install
+`claude-agent-acp` inside the container (rather than bind-mounting
+from the host).
+
 ### Cockpit feels "stuck" with no events
 
-- Check `aoe cockpit logs --follow` (when the worker supervisor lands)
-  to see worker stderr.
+- Check `aoe cockpit logs --session <id>` for the runner stderr drain;
+  the dashboard exposes the same content via the **Open agent log**
+  affordance on the red startup-error banner.
 - Check the dashboard's connection chrome at the top of the cockpit
   view; it shows reconnect status if the WebSocket is degraded.
 - The supervisor watchdog respawns the agent up to 3 times in 60s
