@@ -12,20 +12,21 @@ Only when you opt in, and only aggregate counts. Three event kinds, all with a
 closed, versioned schema (see `src/telemetry/events.rs`):
 
 - **`process_start`** on boot of a long-running surface (`tui` / `serve`): the
-  surface, aoe version, OS, and CPU arch. The `tui` and `serve` surfaces emit one
-  per launch (not throttled), so a restart is visible; a pathological crash-loop
-  is absorbed by the gateway rather than a local cap.
+  surface, aoe version, OS, CPU arch, and the version-health signals (see
+  "Version health" below). The `tui` and `serve` surfaces emit one per launch
+  (not throttled), so a restart is visible; a pathological crash-loop is absorbed
+  by the gateway rather than a local cap.
 - **`cli_usage`** from short-lived `aoe <subcommand>` invocations: the surface
   (`cli`), aoe version, OS, CPU arch, a window-start timestamp, and a
   `command_counts` map of allowlisted subcommand name to invocation count
-  (e.g. `{add: 5, list: 2}`). Each `aoe` run is a separate short-lived process,
-  so counts accumulate on disk and flush as one POST per install per day; the
-  daily throttle means scripting `aoe` in a loop never floods the endpoint, and
-  the count mix answers "which subcommands this install actually uses" rather
-  than just "the CLI ran today". The map keys are the fixed clap subcommand set
-  (`add`, `session`, `telemetry`, ...), filtered against an allowlist before
-  sending, so no argument, flag, or path is ever attached; hidden internal
-  commands are never counted.
+  (e.g. `{add: 5, list: 2}`). Each `aoe` run is a separate
+  short-lived process, so counts accumulate on disk and flush as one POST per
+  install per day; the daily throttle means scripting `aoe` in a loop never
+  floods the endpoint, and the count mix answers "which subcommands this install
+  actually uses" rather than just "the CLI ran today". The map keys are the fixed
+  clap subcommand set (`add`, `session`, `telemetry`, ...), filtered against an
+  allowlist before sending, so no argument, flag, or path is ever attached;
+  hidden internal commands are never counted.
 - **`usage_snapshot`** from the TUI and `aoe serve`, on start and then about
   every 12 hours, with a small random jitter on the period so installs that boot
   together don't snapshot in lockstep. It is a point-in-time summary of the
@@ -54,7 +55,30 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     its auth mode (`token`, `passphrase`, or `none`) and its exposure mode
     (`tunnel` for a Cloudflare quick or named tunnel, `tailscale` for a
     Tailscale Funnel, or `local`). These are coarse enums only; the TUI reports
-    neither, since it hosts no server.
+    neither, since it hosts no server,
+  - the same version-health signals carried on `process_start` (see below).
+
+### Version health
+
+The `process_start` and `usage_snapshot` events carry three coarse
+version-health fields so the maintainers can see whether the install base is on
+recent, patched versions and how large the backward-compat support burden is.
+None of them is a version string:
+
+- `data_schema_version`: a small integer, the data-schema version this build
+  targets (`migrations::CURRENT_VERSION`). Successful installs converge to it on
+  startup, since a failed migration aborts boot.
+- `update_status`: a coarse semver-distance bucket from the local update check,
+  one of `unknown` / `current` / `patch_behind` / `minor_behind` / `major_behind`.
+  `unknown` means no update check has been cached yet; it is never reported as
+  `current`.
+- `update_releases_behind`: how many cached releases are newer than the running
+  build, one of `unknown` / `current` / `one_behind` / `several_behind`. Counted
+  from the cached release list, so a fallback cache that only knows the latest
+  release reports the conservative `one_behind`.
+
+Both update fields are read from the local update-check cache; they never trigger
+a network call and never include the latest version number, only the coarse gap.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events

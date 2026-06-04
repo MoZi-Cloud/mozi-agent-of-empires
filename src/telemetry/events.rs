@@ -20,7 +20,9 @@ use serde::Serialize;
 /// allowlisted `usage_seen` count map.
 /// v6 (#1933): added the [`CliUsage`] event and retired the `cli`-surface
 /// [`ProcessStart`] in favor of it.
-pub const SCHEMA_VERSION: u32 = 6;
+/// v7 (#1887): added version-health fields (`data_schema_version`,
+/// `update_status`, `update_releases_behind`) to every event.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,6 +63,14 @@ pub struct ProcessStart {
     pub aoe_version: String,
     pub os: String,
     pub arch: String,
+
+    /// On-disk data-schema version this build targets (`migrations::CURRENT_VERSION`).
+    /// A small integer, never a version string.
+    pub data_schema_version: u32,
+    /// Coarse update-staleness by semver distance, from the cached update check.
+    pub update_status: crate::update::UpdateStatus,
+    /// Coarse "how many releases behind", counted from the cached release list.
+    pub update_releases_behind: crate::update::ReleasesBehind,
 }
 
 /// Emitted by short-lived `aoe <subcommand>` invocations, throttled to at most
@@ -111,6 +121,14 @@ pub struct UsageSnapshot {
     pub aoe_version: String,
     pub os: String,
     pub arch: String,
+
+    /// On-disk data-schema version this build targets (`migrations::CURRENT_VERSION`).
+    /// A small integer, never a version string.
+    pub data_schema_version: u32,
+    /// Coarse update-staleness by semver distance, from the cached update check.
+    pub update_status: crate::update::UpdateStatus,
+    /// Coarse "how many releases behind", counted from the cached release list.
+    pub update_releases_behind: crate::update::ReleasesBehind,
 
     pub session_total: u32,
     pub session_running: u32,

@@ -196,6 +196,8 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
         return None;
     }
     let install_id = state::ensure_install_id()?;
+    let (update_status, update_releases_behind) =
+        crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
     Some(ProcessStart {
         schema: SCHEMA_VERSION,
         event: "process_start",
@@ -205,6 +207,9 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        data_schema_version: crate::migrations::current_schema_version(),
+        update_status,
+        update_releases_behind,
     })
 }
 
@@ -380,6 +385,14 @@ pub fn build_usage_snapshot(
     // `assemble_usage_snapshot` stays focused on session/feature bucketing.
     snapshot.auth_mode = auth_mode.map(str::to_string);
     snapshot.serve_mode = serve_mode.map(str::to_string);
+    // Version-health is install-level I/O (update cache + on-disk schema version),
+    // kept out of the disk-free assembler and filled here. Same source as
+    // `build_process_start`, so both events agree within a launch.
+    let (update_status, update_releases_behind) =
+        crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
+    snapshot.data_schema_version = crate::migrations::current_schema_version();
+    snapshot.update_status = update_status;
+    snapshot.update_releases_behind = update_releases_behind;
     Some(snapshot)
 }
 
@@ -408,6 +421,12 @@ fn assemble_usage_snapshot(
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        // Version-health is install-level I/O (reads the update cache + schema
+        // version file), so the disk-free assembler leaves it at the unset
+        // defaults; `build_usage_snapshot` fills the real values.
+        data_schema_version: 0,
+        update_status: crate::update::UpdateStatus::Unknown,
+        update_releases_behind: crate::update::ReleasesBehind::Unknown,
         session_total: metrics.total,
         session_running: metrics.running,
         session_idle: metrics.idle,
@@ -706,6 +725,9 @@ mod tests {
             aoe_version: "0.0.0".to_string(),
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
+            data_schema_version: 11,
+            update_status: crate::update::UpdateStatus::Current,
+            update_releases_behind: crate::update::ReleasesBehind::Current,
             session_total: 7,
             session_running: 1,
             session_idle: 6,
