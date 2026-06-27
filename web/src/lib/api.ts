@@ -239,6 +239,115 @@ function isValidPluginListResponse(payload: unknown): payload is PluginListRespo
   );
 }
 
+/** One plugin's update status (`GET /api/plugins/updates`). An on-demand
+ *  network check, kept off the always-on plugin list. `available` is a short
+ *  commit for an outdated GitHub source, "modified" for a changed local tree,
+ *  or null when current. `error` is set when the check could not run. */
+export interface PluginUpdateStatus {
+  id: string;
+  source: string;
+  current: string;
+  available: string | null;
+  needs_update: boolean;
+  error: string | null;
+}
+
+export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } | { kind: "error"; message: string };
+
+/** Check installed plugins for updates. Returns a discriminated result (like
+ *  discoverPlugins) so this explicit action can report why it failed instead of
+ *  silently doing nothing on an HTTP/network/JSON error. */
+export async function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
+  try {
+    const res = await fetch("/api/plugins/updates", { headers: { Accept: "application/json" } });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.updates)) {
+      return { kind: "ok", updates: payload.updates as PluginUpdateStatus[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Update check failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** One discovery result (`GET /api/plugins/discover`). Repo-level: the dashboard
+ *  has no install path, so it shows `install_command` for the user to copy. */
+export interface PluginDiscoveryResult {
+  slug: string;
+  html_url: string;
+  description: string | null;
+  stars: number;
+  badge: "installed" | "featured" | "unvetted";
+  install_command: string;
+}
+
+export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
+
+/** Search the `aoe-plugin` GitHub topic. Returns the error message (notably the
+ *  unauthenticated rate limit) so the UI can show it rather than failing
+ *  silently. */
+export async function discoverPlugins(query: string): Promise<DiscoverResult> {
+  const qs = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : "";
+  try {
+    const res = await fetch(`/api/plugins/discover${qs}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.results)) {
+      return { kind: "ok", results: payload.results as PluginDiscoveryResult[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Discovery failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** A plugin's manifest fields as shown in the detail modal (parsed leniently
+ *  server-side, so a plugin targeting a newer api_version still renders). */
+export interface PluginDetailManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  api_version: number;
+  capabilities: string[];
+  ui_contributions: { slot: string; id: string }[];
+}
+
+/** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
+ *  fields plus the repo's published release tags (the available versions). */
+export interface PluginDetail {
+  source: string;
+  manifest: PluginDetailManifest | null;
+  manifest_error: string | null;
+  release_tags: string[];
+}
+
+export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | { kind: "error"; message: string };
+
+/** Fetch a plugin source's detail (manifest + release tags) for the modal.
+ *  Only gh:owner/repo sources are supported server-side. */
+export async function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
+  try {
+    const res = await fetch(`/api/plugins/details?source=${encodeURIComponent(source)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.source === "string") {
+      return { kind: "ok", detail: payload as unknown as PluginDetail };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
 // Plugin UI extension points (#2366).
 
 /** Display tone a plugin attaches to a slot entry or notification. The host

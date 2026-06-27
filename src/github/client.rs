@@ -5,7 +5,7 @@
 //! typed [`GitHubError`] taxonomy. Only unauthenticated public reads (such as
 //! the update check) are wired up today via [`GitHubClient::unauthenticated`].
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::StatusCode;
 
@@ -20,6 +20,11 @@ const TAG_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'%')
     .add(b'&')
     .add(b'+');
+/// Encode a search `q` value: encode everything non-alphanumeric (spaces,
+/// `:`, etc.) so the qualifier syntax (`topic:aoe-plugin fork:false`) survives
+/// into the query string intact.
+const QUERY_VALUE: &AsciiSet = NON_ALPHANUMERIC;
+
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
@@ -59,6 +64,27 @@ pub struct GitHubRelease {
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
+}
+
+/// A repository returned by the search API (the subset plugin discovery shows).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubRepo {
+    /// `owner/repo`.
+    pub full_name: String,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub stargazers_count: u64,
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchReposResponse {
+    #[serde(default)]
+    items: Vec<GitHubRepo>,
 }
 
 #[derive(Deserialize)]
@@ -129,11 +155,64 @@ impl GitHubClient {
         self.send_json(self.http.get(url)).await
     }
 
+    /// `GET /search/repositories?q={query}&sort=stars&order=desc`
+    ///
+    /// Unauthenticated search is heavily rate limited (about 10 requests per
+    /// minute per IP); a 403/429 surfaces as [`GitHubError::RateLimited`] so the
+    /// caller can say so plainly rather than reporting a generic API error.
+    pub async fn search_repositories(&self, query: &str, per_page: u8) -> Result<Vec<GitHubRepo>> {
+        let q = utf8_percent_encode(query, QUERY_VALUE);
+        let url = format!(
+            "{}/search/repositories?q={q}&sort=stars&order=desc&per_page={per_page}",
+            self.api_base
+        );
+        let response: SearchReposResponse = self.send_json(self.http.get(url)).await?;
+        Ok(response.items)
+    }
+
+    /// Fetch a single file's raw contents via the contents API (`Accept:
+    /// application/vnd.github.raw`). Used to read a plugin's `aoe-plugin.toml`
+    /// for the details view without cloning. `reference` pins the branch, tag,
+    /// or commit (`?ref=`); `None` reads the repo's default branch.
+    pub async fn get_repo_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: Option<&str>,
+    ) -> Result<String> {
+        let path = utf8_percent_encode(path, TAG_SEGMENT);
+        let mut url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            self.api_base, owner, repo, path
+        );
+        if let Some(reference) = reference {
+            url.push_str("?ref=");
+            url.extend(utf8_percent_encode(reference, TAG_SEGMENT));
+        }
+        self.send_text(self.http.get(url).header(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github.raw"),
+        ))
+        .await
+    }
+
     async fn send_json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
         let response = request.send().await.map_err(classify_transport_error)?;
         let status = response.status();
         if status.is_success() {
             return response.json::<T>().await.map_err(GitHubError::Decode);
+        }
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        Err(classify_status(status, &headers, &body))
+    }
+
+    async fn send_text(&self, request: reqwest::RequestBuilder) -> Result<String> {
+        let response = request.send().await.map_err(classify_transport_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return response.text().await.map_err(GitHubError::Http);
         }
         let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();

@@ -1703,6 +1703,17 @@ pub struct UpdatesConfig {
     #[serde(default = "default_web_poll_interval_minutes")]
     #[setting(label = "Web Poll Interval (minutes)", widget = "number", min = 0)]
     pub web_poll_interval_minutes: u64,
+
+    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Off by default. The sweep applies only updates that need no new consent;
+    /// any version that changes capabilities, build steps, or UI slots is left
+    /// for a manual `aoe plugin update` so its new grant is reviewed.
+    // global_only: the startup sweep reads the global config
+    // (`Config::load_or_warn`), so a profile/repo override would be silently
+    // ignored; show it but do not offer non-global scopes.
+    #[serde(default)]
+    #[setting(label = "Auto-update plugins", widget = "toggle", global_only)]
+    pub auto_update_plugins: bool,
 }
 
 impl Default for UpdatesConfig {
@@ -1712,6 +1723,7 @@ impl Default for UpdatesConfig {
             check_interval_hours: 24,
             notify_in_cli: true,
             web_poll_interval_minutes: 60,
+            auto_update_plugins: false,
         }
     }
 }
