@@ -351,6 +351,78 @@ pub enum StartupErrorDetail {
     },
 }
 
+/// Lifecycle status of an async background sub-agent. `Completed` is the
+/// only "finished cleanly" state and is set ONLY on an `end_turn` in the
+/// transcript; idle/missing-file/parse states are reported honestly
+/// rather than faked as done. See the background-agent tailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundAgentStatus {
+    /// Transcript is being written; the agent is working.
+    Running,
+    /// No transcript growth for the idle window; the agent may be
+    /// blocked, rate-limited, or wedged. Never flips to `Completed`.
+    Stalled,
+    /// Saw the terminal `end_turn` assistant message. The work is done.
+    Completed,
+    /// The parent session ended before the agent finished; we stopped
+    /// tracking it. Not a success, not a failure.
+    Detached,
+    /// Transcript could not be read or its format was unrecognized.
+    Error,
+}
+
+/// One tool call a background sub-agent made, parsed from its transcript
+/// so the panel can list individual reads / bashes / greps like the main
+/// output. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundAgentTool {
+    /// Tool name, e.g. "Read", "Bash", "Grep".
+    pub name: String,
+    /// Short label from the tool input (command / file path / pattern).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Outcome from the matching tool_result: `None` while running,
+    /// `Some(true)` succeeded, `Some(false)` errored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+}
+
+/// One async background sub-agent, built up from `BackgroundAgent*`
+/// events. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundAgentRecord {
+    pub agent_id: String,
+    /// The parent `Task` tool call that launched this agent, so the
+    /// inline tool card can link to the panel entry.
+    pub tool_call_id: String,
+    pub description: String,
+    pub prompt: String,
+    pub model: String,
+    pub status: BackgroundAgentStatus,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Number of tool calls the agent has made so far (from its transcript).
+    #[serde(default)]
+    pub tool_count: u32,
+    /// The agent's individual tool calls, in order, so the panel can show
+    /// each read / bash / grep like the main output.
+    #[serde(default)]
+    pub tools: Vec<BackgroundAgentTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<String>,
+    /// Short preview of the agent's most recent assistant text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_text: Option<String>,
+    /// Final result text (the terminal assistant message), set on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Non-fatal note shown in the panel, e.g. transcript format not recognized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpState {
     pub session_id: AcpSessionId,
@@ -406,6 +478,13 @@ pub struct AcpState {
     /// on `AgentSwitched`. Mirrors `ModeSwitchFailed` (#1233).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
+    /// Async sub-agents (Claude `Task` with isAsync) launched this
+    /// session. The parent ACP stream only carries each launch; the
+    /// daemon tails each agent's on-disk transcript and emits
+    /// `BackgroundAgent*` events that build this list. Drives the web
+    /// "Background agents" panel and the inline Task-card linkage.
+    #[serde(default)]
+    pub background_agents: Vec<BackgroundAgentRecord>,
 
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
@@ -436,6 +515,7 @@ impl AcpState {
             startup_error: None,
             config_options: Vec::new(),
             config_option_switch_failed: None,
+            background_agents: Vec::new(),
             last_seq: 0,
             updated_at: Utc::now(),
         }
@@ -574,6 +654,18 @@ pub enum Event {
         /// events stay imprecise; new events are accurate end-to-end.
         #[serde(default = "chrono::Utc::now")]
         completed_at: DateTime<Utc>,
+        /// True when this completion is the synchronous launch of an
+        /// asynchronous sub-agent (Claude's `Task` tool with
+        /// `isAsync: true`): the visible tool call completes immediately
+        /// with the SDK marker `Async agent launched successfully` while
+        /// the real sub-agent runs off-protocol and never reports back on
+        /// this stream. Renderers use this to draw a neutral "runs in
+        /// background" sub-agent card instead of a finished tool card, and
+        /// to suppress the marker body (which carries an internal agent id
+        /// the SDK tells us not to surface). Defaults false for events
+        /// persisted before this field landed. See `OffProtocolWorkKind`.
+        #[serde(default)]
+        async_subagent: bool,
     },
     /// Streaming tool output. Some agents emit `ToolCallUpdate` notifications
     /// with `status != Completed` but populated `fields.content` to stream
@@ -732,6 +824,54 @@ pub enum Event {
     /// Carries the raw JSON so UI clients can render best-effort.
     RawAgentUpdate {
         payload: serde_json::Value,
+    },
+    /// An async sub-agent (Claude `Task` with isAsync) was launched. The
+    /// parent ACP stream carries only this launch; the daemon then tails
+    /// the agent's on-disk transcript and emits `BackgroundAgentProgress`
+    /// / `BackgroundAgentCompleted`. See the background-agent tailer.
+    BackgroundAgentLaunched {
+        agent_id: String,
+        tool_call_id: String,
+        description: String,
+        prompt: String,
+        model: String,
+        /// Local transcript path the daemon tails. Never serialized (a
+        /// host fs path, useless and mildly sensitive to clients); read
+        /// by the notification handler to spawn the tailer, then dropped.
+        #[serde(default, skip_serializing)]
+        output_file: String,
+        started_at: DateTime<Utc>,
+    },
+    /// Throttled snapshot of a running background sub-agent's transcript
+    /// (tool count + last action). Persisted so a mid-run reload still
+    /// sees in-flight agents, but coalesced so the event log stays bounded.
+    BackgroundAgentProgress {
+        agent_id: String,
+        status: BackgroundAgentStatus,
+        tool_count: u32,
+        /// Full ordered tool list so far (coalesced into the snapshot, not
+        /// one event per tool). Replaces the record's list wholesale.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_text: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// Terminal state for a background sub-agent: `Completed` (saw
+    /// `end_turn`), `Stalled`, `Detached`, or `Error`.
+    BackgroundAgentCompleted {
+        agent_id: String,
+        status: BackgroundAgentStatus,
+        /// Final ordered tool list. Replaces the record's list.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+        ended_at: DateTime<Utc>,
     },
     /// A prompt reached the adapter, but the adapter-side runtime failed
     /// before any assistant transcript or tool event was emitted. Used
@@ -1154,6 +1294,104 @@ impl AcpState {
                     switched_at: Utc::now(),
                 });
             }
+            Event::BackgroundAgentLaunched {
+                agent_id,
+                tool_call_id,
+                description,
+                prompt,
+                model,
+                output_file: _,
+                started_at,
+            } => {
+                let record = BackgroundAgentRecord {
+                    agent_id: agent_id.clone(),
+                    tool_call_id,
+                    description,
+                    prompt,
+                    model,
+                    status: BackgroundAgentStatus::Running,
+                    started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                // Idempotent on replay / duplicate launch: replace any
+                // existing record for the same agent id.
+                if let Some(existing) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    *existing = record;
+                } else {
+                    self.background_agents.push(record);
+                }
+            }
+            Event::BackgroundAgentProgress {
+                agent_id,
+                status,
+                tool_count,
+                tools,
+                last_tool,
+                last_text,
+                ..
+            } => {
+                if let Some(a) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    // A terminal record never reopens to running.
+                    if !matches!(
+                        a.status,
+                        BackgroundAgentStatus::Completed
+                            | BackgroundAgentStatus::Detached
+                            | BackgroundAgentStatus::Error
+                    ) {
+                        a.status = status;
+                        a.tool_count = tool_count;
+                        if !tools.is_empty() {
+                            a.tools = tools;
+                        }
+                        if last_tool.is_some() {
+                            a.last_tool = last_tool;
+                        }
+                        if last_text.is_some() {
+                            a.last_text = last_text;
+                        }
+                    }
+                }
+            }
+            Event::BackgroundAgentCompleted {
+                agent_id,
+                status,
+                tools,
+                result,
+                warning,
+                ended_at,
+            } => {
+                if let Some(a) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    a.status = status;
+                    a.ended_at = Some(ended_at);
+                    if !tools.is_empty() {
+                        a.tools = tools;
+                    }
+                    if result.is_some() {
+                        a.result = result;
+                    }
+                    if warning.is_some() {
+                        a.warning = warning;
+                    }
+                }
+            }
         }
         self.last_seq = self.last_seq.saturating_add(1);
         self.updated_at = Utc::now();
@@ -1171,6 +1409,78 @@ mod tests {
             AgentName("aoe-agent".into()),
             Some("claude-opus-4-7".into()),
         )
+    }
+
+    #[test]
+    fn background_agent_lifecycle_builds_record() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(s.background_agents.len(), 1);
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Running
+        );
+        assert_eq!(s.background_agents[0].tool_call_id, "tc1");
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 3,
+            tools: vec![BackgroundAgentTool {
+                name: "Read".into(),
+                title: Some("x.rs".into()),
+                ok: Some(true),
+            }],
+            last_tool: Some("Read".into()),
+            last_text: Some("scanning".into()),
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(s.background_agents[0].tool_count, 3);
+        assert_eq!(s.background_agents[0].last_tool.as_deref(), Some("Read"));
+        assert_eq!(s.background_agents[0].tools.len(), 1);
+        assert_eq!(s.background_agents[0].tools[0].name, "Read");
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Completed
+        );
+        assert_eq!(s.background_agents[0].result.as_deref(), Some("done"));
+
+        // A late progress event must not reopen a completed record.
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 9,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Completed
+        );
+        assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
     }
 
     #[test]
@@ -1250,6 +1560,7 @@ mod tests {
             content: String::new(),
             output: Vec::new(),
             completed_at: Utc::now(),
+            async_subagent: false,
         })
         .unwrap();
         assert!(s.in_flight_tool.is_none());

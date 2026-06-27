@@ -396,6 +396,14 @@ export type AcpEvent =
          *  backward compatibility with events persisted before this
          *  field landed. */
         completed_at?: string;
+        /** True when this completion is the synchronous launch of an
+         *  async sub-agent (Claude `Task` with isAsync): the call
+         *  completes immediately while the real work runs off-protocol
+         *  and never reports back on this stream. Renderers draw a
+         *  neutral "runs in background" sub-agent card and drop the
+         *  marker body (it carries an internal agent id). Absent for
+         *  events persisted before this field landed. */
+        async_subagent?: boolean;
       };
     }
   | {
@@ -466,6 +474,37 @@ export type AcpEvent =
       };
     }
   | { RawAgentUpdate: { payload: unknown } }
+  | {
+      BackgroundAgentLaunched: {
+        agent_id: string;
+        tool_call_id: string;
+        description: string;
+        prompt: string;
+        model: string;
+        started_at: string;
+      };
+    }
+  | {
+      BackgroundAgentProgress: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        tool_count: number;
+        tools?: BackgroundAgentTool[];
+        last_tool?: string | null;
+        last_text?: string | null;
+        at: string;
+      };
+    }
+  | {
+      BackgroundAgentCompleted: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        tools?: BackgroundAgentTool[];
+        result?: string | null;
+        warning?: string | null;
+        ended_at: string;
+      };
+    }
   | { AgentMessageChunk: { text: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
@@ -812,6 +851,50 @@ export interface AcpState {
    *  or finished without notifying the daemon (`agentOrphaned`).
    *  Cleared on `AcpSessionAssigned` or `UserPromptSent`. See #1240. */
   agentOrphaned: boolean;
+  /** Async sub-agents (Claude `Task` with isAsync) launched this session.
+   *  The parent stream only carries each launch; the daemon tails each
+   *  agent's transcript and emits `BackgroundAgent*` events that build
+   *  this list. Drives the Background agents panel and the inline Task
+   *  card linkage. Insertion order (oldest first). */
+  backgroundAgents: BackgroundAgent[];
+}
+
+/** Lifecycle status of an async background sub-agent. Mirrors the Rust
+ *  `BackgroundAgentStatus`. `completed` is the only clean-finish state. */
+export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+
+/** One tool call a background sub-agent made, for the per-agent tool list.
+ *  Mirrors the Rust `BackgroundAgentTool`. */
+export interface BackgroundAgentTool {
+  name: string;
+  /** Short label from the tool input (command / file path / pattern). */
+  title?: string | null;
+  /** Outcome: undefined while running, true succeeded, false errored. */
+  ok?: boolean | null;
+}
+
+/** One async background sub-agent, built up from `BackgroundAgent*`
+ *  events. Mirrors the Rust `BackgroundAgentRecord`. */
+export interface BackgroundAgent {
+  agentId: string;
+  /** The parent `Task` tool call that launched this agent; links the
+   *  inline tool card to this panel entry. */
+  toolCallId: string;
+  description: string;
+  prompt: string;
+  model: string;
+  status: BackgroundAgentStatus;
+  /** ISO-8601 launch time. */
+  startedAt: string;
+  /** ISO-8601 terminal time, set on completion/stall/error. */
+  endedAt: string | null;
+  toolCount: number;
+  /** Individual tool calls in order, like the main output. */
+  tools: BackgroundAgentTool[];
+  lastTool: string | null;
+  lastText: string | null;
+  result: string | null;
+  warning: string | null;
 }
 
 export interface RejectedPrompt {
@@ -885,6 +968,10 @@ export interface ActivityRow {
    *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
    *  fallback; the card renders the structured pairs. See #2209. */
   elicitationAnswers?: ElicitationAnswer[];
+  /** True on a `tool_complete` row that is the synchronous launch of an
+   *  async sub-agent (Claude `Task` with isAsync). The runtime routes it
+   *  to a neutral background sub-agent card and drops the marker body. */
+  asyncSubagent?: boolean;
   at: string; // ISO-8601
 }
 
@@ -952,6 +1039,7 @@ export function emptyAcpState(): AcpState {
     rejectedPrompts: [],
     agentUnresponsive: false,
     agentOrphaned: false,
+    backgroundAgents: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1162,7 +1250,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    const { tool_call_id, is_error, content, output, completed_at, async_subagent } = event.ToolCallCompleted;
     // The AskUserQuestion tool's completion is owned by its elicitation
     // card; drop it so no transcript tool card materializes. Clear the
     // in-flight pointer if it still points at this suppressed tool.
@@ -1206,6 +1294,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       text,
       toolCallId: tool_call_id,
       output: output && output.length > 0 ? output : undefined,
+      asyncSubagent: async_subagent || undefined,
       at: completed_at ?? new Date().toISOString(),
     });
     return next;
@@ -1873,6 +1962,67 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // for the cap rationale.
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    return next;
+  }
+  if ("BackgroundAgentLaunched" in event) {
+    const e = event.BackgroundAgentLaunched;
+    const record: BackgroundAgent = {
+      agentId: e.agent_id,
+      toolCallId: e.tool_call_id,
+      description: e.description,
+      prompt: e.prompt,
+      model: e.model,
+      status: "running",
+      startedAt: e.started_at,
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    // Idempotent on replay: replace any existing record for this agent.
+    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
+    next.backgroundAgents =
+      i >= 0 ? next.backgroundAgents.map((a, idx) => (idx === i ? record : a)) : [...next.backgroundAgents, record];
+    return next;
+  }
+  if ("BackgroundAgentProgress" in event) {
+    const e = event.BackgroundAgentProgress;
+    next.backgroundAgents = next.backgroundAgents.map((a) => {
+      if (a.agentId !== e.agent_id) return a;
+      // A terminal record never reopens to running.
+      if (a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      return {
+        ...a,
+        status: e.status,
+        toolCount: e.tool_count,
+        tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+        // Freeze the elapsed timer once stalled (the agent stopped
+        // writing; the SDK likely dropped it). Clear it if it resumes.
+        // The terminal Completed event sets the authoritative ended time.
+        endedAt: e.status === "stalled" ? (a.endedAt ?? e.at) : e.status === "running" ? null : a.endedAt,
+        lastTool: e.last_tool ?? a.lastTool,
+        lastText: e.last_text ?? a.lastText,
+      };
+    });
+    return next;
+  }
+  if ("BackgroundAgentCompleted" in event) {
+    const e = event.BackgroundAgentCompleted;
+    next.backgroundAgents = next.backgroundAgents.map((a) =>
+      a.agentId === e.agent_id
+        ? {
+            ...a,
+            status: e.status,
+            endedAt: e.ended_at,
+            tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+            result: e.result ?? a.result,
+            warning: e.warning ?? a.warning,
+          }
+        : a,
+    );
     return next;
   }
   // RawAgentUpdate, TodoListUpdated, anything else: pass through with

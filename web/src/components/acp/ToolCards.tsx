@@ -22,6 +22,7 @@ import {
   Brain,
   Calendar,
   CalendarPlus,
+  ArrowUpRight,
   CalendarX,
   ChevronDown,
   Clock,
@@ -59,6 +60,7 @@ import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useAcpFileRef } from "./AcpFileRefContext";
+import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
@@ -452,6 +454,10 @@ interface CardChromeProps {
    *  stays on the per-child cards inside the expanded body. See
    *  #1102. */
   neutralOnDone?: boolean;
+  /** When the header click navigates somewhere (e.g. opens a pane)
+   *  rather than expanding the card, show an up-right arrow instead of
+   *  the disclosure chevron so the row doesn't read as collapsible. */
+  navigate?: boolean;
   /** ISO-8601 start timestamp for the underlying tool call. When set
    *  with `endedAt` (completed call) or alone (in-flight call), the
    *  header shows a duration label next to the status badge (#1060).
@@ -497,6 +503,7 @@ function CardChrome({
   startedAt,
   endedAt,
   neutralOnDone,
+  navigate,
 }: CardChromeProps) {
   const { showToolDurations } = useAcpPrefs();
   const Header = onToggle ? "button" : "div";
@@ -519,7 +526,8 @@ function CardChrome({
         {meta}
         {showToolDurations && startedAt && <DurationLabel startedAt={startedAt} endedAt={endedAt} />}
         {!showNeutral && <StatusBadge status={status} />}
-        {onToggle && (
+        {onToggle && navigate && <ArrowUpRight className="h-3.5 w-3.5 text-text-dim" />}
+        {onToggle && !navigate && (
           <ChevronDown
             className={["h-3.5 w-3.5 text-text-dim transition-transform", expanded ? "rotate-180" : ""].join(" ")}
           />
@@ -1450,6 +1458,63 @@ interface SubagentProps {
  *  parent Task shows in the header; the body lists the children using
  *  the same ToolCard dispatch as top-level calls (with `nested=true`
  *  so the indented "↳ subagent" wrap doesn't double up). See #1041. */
+/** Inline card for an async sub-agent launch (Claude `Task` with isAsync).
+ *  The sub-agent runs off-protocol; the daemon tails its transcript and
+ *  publishes a `BackgroundAgent` record, which we look up by the launching
+ *  tool-call id to show live status, elapsed time, and activity, linking
+ *  this card to its entry in the Background agents panel. Before the first
+ *  tailer event arrives (or if the record is gone), it degrades to a
+ *  neutral "runs in background" card. The SDK launch-marker body (which
+ *  carries an internal agent id) is never rendered. */
+export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
+  const args = useMemo(() => parseJsonObject(tool.args_preview), [tool.args_preview]);
+  const description = pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+  const agent = useBackgroundAgentFor(tool.id);
+  const openPane = useOpenBackgroundAgentsPane();
+
+  const status: Status = !agent
+    ? "ok"
+    : agent.status === "running"
+      ? "running"
+      : agent.status === "completed"
+        ? "ok"
+        : agent.status === "error"
+          ? "err"
+          : "stopped"; // stalled / detached
+
+  let metaText = "runs in background";
+  if (agent) {
+    if (agent.status === "running") {
+      const tools = agent.toolCount > 0 ? `${agent.toolCount} ${agent.toolCount === 1 ? "tool" : "tools"}` : null;
+      metaText = [tools, agent.lastTool].filter(Boolean).join(" · ") || "running in background";
+    } else if (agent.status === "stalled") {
+      metaText = "stalled in background";
+    } else if (agent.status === "detached") {
+      metaText = "detached";
+    } else if (agent.status === "completed") {
+      metaText = "finished in background";
+    } else {
+      metaText = agent.warning ?? "background agent error";
+    }
+  }
+
+  return (
+    <CardChrome
+      status={status}
+      neutralOnDone={!agent || agent.status === "stalled" || agent.status === "detached"}
+      icon={<Sparkles className="h-3.5 w-3.5" />}
+      label="subagent"
+      startedAt={agent?.startedAt ?? tool.started_at}
+      endedAt={agent?.endedAt ?? undefined}
+      primary={<span className="truncate">{description}</span>}
+      meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
+      expanded={false}
+      onToggle={openPane}
+      navigate={openPane !== undefined}
+    />
+  );
+}
+
 export function SubagentCard({ tool, result, children }: SubagentProps) {
   const [open, setOpen] = useState(false);
 

@@ -651,3 +651,138 @@ describe("mergeToolStart timestamp branches", () => {
     expect(row?.tool?.memory_recall?.mode).toBe("recall");
   });
 });
+
+describe("applyEvent / background agents", () => {
+  it("builds, updates, and finalizes a background-agent record", () => {
+    let s = emptyAcpState();
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "task-1",
+          description: "map backend",
+          prompt: "do it",
+          model: "claude-opus-4-8",
+          started_at: "2026-06-27T00:00:00Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents).toHaveLength(1);
+    expect(s.backgroundAgents[0]!.status).toBe("running");
+    expect(s.backgroundAgents[0]!.toolCallId).toBe("task-1");
+
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "a1",
+          status: "running",
+          tool_count: 4,
+          last_tool: "Read",
+          last_text: "scanning",
+          at: "2026-06-27T00:00:05Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.toolCount).toBe(4);
+    expect(s.backgroundAgents[0]!.lastTool).toBe("Read");
+
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        BackgroundAgentCompleted: {
+          agent_id: "a1",
+          status: "completed",
+          result: "done",
+          ended_at: "2026-06-27T00:00:10Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("completed");
+    expect(s.backgroundAgents[0]!.result).toBe("done");
+  });
+
+  it("freezes the elapsed timer when an agent stalls and clears it if it resumes", () => {
+    let s = emptyAcpState();
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "t1",
+          description: "x",
+          prompt: "y",
+          model: "m",
+          started_at: "2026-06-27T00:00:00Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.endedAt).toBeNull();
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        BackgroundAgentProgress: { agent_id: "a1", status: "stalled", tool_count: 1, at: "2026-06-27T00:01:30Z" },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("stalled");
+    expect(s.backgroundAgents[0]!.endedAt).toBe("2026-06-27T00:01:30Z");
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        BackgroundAgentProgress: { agent_id: "a1", status: "running", tool_count: 2, at: "2026-06-27T00:01:35Z" },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("running");
+    expect(s.backgroundAgents[0]!.endedAt).toBeNull();
+  });
+
+  it("does not reopen a completed agent on a late progress event", () => {
+    let s = emptyAcpState();
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "task-1",
+          description: "x",
+          prompt: "y",
+          model: "m",
+          started_at: "2026-06-27T00:00:00Z",
+        },
+      },
+    });
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        BackgroundAgentCompleted: {
+          agent_id: "a1",
+          status: "completed",
+          ended_at: "2026-06-27T00:00:10Z",
+        },
+      },
+    });
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "a1",
+          status: "running",
+          tool_count: 99,
+          at: "2026-06-27T00:00:20Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("completed");
+    expect(s.backgroundAgents[0]!.toolCount).toBe(0);
+  });
+});

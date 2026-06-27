@@ -3214,6 +3214,10 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
+            // A replayed launch must be dropped too: the tailer spawn is
+            // skipped during suppression, so letting it through would
+            // create a running record with nothing to ever complete it.
+            | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
     )
 }
@@ -3778,12 +3782,25 @@ fn map_update_to_events(
                 });
             }
             if completed {
+                // An async sub-agent launch (Claude `Task` with isAsync)
+                // completes immediately with the `Async agent launched
+                // successfully` marker while the real work runs
+                // off-protocol. Flag it so renderers draw a neutral
+                // background-sub-agent card and drop the marker body
+                // (which leaks an internal agent id). Same detector the
+                // silent-orphan watchdog uses; this just forwards it to
+                // the UI event stream.
+                let async_subagent = matches!(
+                    detect_off_protocol_work_completed(&update.fields.content),
+                    Some(OffProtocolWorkKind::AsyncAgent)
+                );
                 events.push(Event::ToolCallCompleted {
                     tool_call_id: id,
                     is_error,
                     content: content_text,
                     output: output_blocks,
                     completed_at: chrono::Utc::now(),
+                    async_subagent,
                 });
             } else if !content_text.is_empty() {
                 events.push(Event::ToolCallContent {
@@ -3791,7 +3808,18 @@ fn map_update_to_events(
                     content: content_text,
                 });
             } else if events.is_empty() {
-                events.push(raw_event(&update));
+                // The async sub-agent launch rides a metadata-only
+                // ToolCallUpdate (`_meta.claudeCode.toolName == "Agent"`,
+                // status "async_launched", no status/content/title), so it
+                // lands here rather than the unknown-variant catch-all
+                // below. Promote it to a typed BackgroundAgentLaunched so
+                // the daemon tails the agent's transcript; otherwise pass
+                // the raw payload through unchanged.
+                let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                match background_agent_launched_from_value(&payload) {
+                    Some(event) => events.push(event),
+                    None => events.push(Event::RawAgentUpdate { payload }),
+                }
             }
             // claude-agent-acp emits the initial `tool_call` frame for
             // ScheduleWakeup with empty `raw_input`; the actual
@@ -3900,6 +3928,7 @@ fn map_update_to_events(
                     content: String::new(),
                     output: Vec::new(),
                     completed_at: now,
+                    async_subagent: false,
                 },
             ]
         }
@@ -3981,6 +4010,44 @@ fn map_update_to_events(
         // narrow these as we go.
         other => vec![raw_event(&other)],
     }
+}
+
+/// Detect a Claude async sub-agent launch in an otherwise-unmapped ACP
+/// update and build a typed `BackgroundAgentLaunched`. The launch arrives
+/// as `{ _meta: { claudeCode: { toolName: "Agent", toolResponse: {
+/// agentId, description, prompt, resolvedModel, outputFile, status:
+/// "async_launched" } } }, toolCallId }`. Returns `None` for anything
+/// else (the caller falls back to `RawAgentUpdate`). Field extraction is
+/// fully defensive: a missing `agentId` is the only hard requirement.
+fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Agent") {
+        return None;
+    }
+    let tr = cc.get("toolResponse")?;
+    if tr.get("status").and_then(|s| s.as_str()) != Some("async_launched") {
+        return None;
+    }
+    let agent_id = tr.get("agentId").and_then(|s| s.as_str())?.to_string();
+    let str_field = |key: &str| {
+        tr.get(key)
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(Event::BackgroundAgentLaunched {
+        agent_id,
+        tool_call_id: v
+            .get("toolCallId")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        description: str_field("description"),
+        prompt: str_field("prompt"),
+        model: str_field("resolvedModel"),
+        output_file: str_field("outputFile"),
+        started_at: chrono::Utc::now(),
+    })
 }
 
 /// Build a `ConfigOptionsUpdated` event from a session response's
@@ -4237,6 +4304,7 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
             content: content.to_string(),
             output: Vec::new(),
             completed_at: chrono::Utc::now(),
+            async_subagent: false,
         })
         .await;
 }
@@ -4888,6 +4956,28 @@ async fn run_connection_task<W, R>(
                         .await;
                     }
                     for event in mapped_events {
+                        // An async sub-agent launch: spawn a tailer that
+                        // follows the agent's on-disk transcript and emits
+                        // BackgroundAgent{Progress,Completed}. The tailer
+                        // owns its own lifecycle (self-terminates on
+                        // completion, hard-idle, or when event_tx closes),
+                        // so it can never outlive the session. Skipped on
+                        // replay (the agent already finished). See
+                        // src/acp/background_agent.rs.
+                        if let Event::BackgroundAgentLaunched {
+                            agent_id,
+                            output_file,
+                            ..
+                        } = &event
+                        {
+                            if !suppressing && !output_file.is_empty() {
+                                crate::acp::background_agent::spawn_tailer(
+                                    agent_id.clone(),
+                                    output_file.clone(),
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
                         // During the post-load replay window, drop only
                         // events that would reproduce the prior turns'
                         // visible transcript (assistant chunks, tool
@@ -9393,6 +9483,112 @@ mod tests {
     }
 
     #[test]
+    fn background_agent_launched_parsed_from_agent_meta() {
+        let payload = serde_json::json!({
+            "_meta": { "claudeCode": {
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a3d5ae46a7a0414b1",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a3d5ae46a7a0414b1.output",
+                    "status": "async_launched"
+                }
+            }},
+            "toolCallId": "toolu_012yUZykQT2vqFXZTvqWev5e"
+        });
+        match background_agent_launched_from_value(&payload) {
+            Some(Event::BackgroundAgentLaunched {
+                agent_id,
+                tool_call_id,
+                description,
+                model,
+                output_file,
+                ..
+            }) => {
+                assert_eq!(agent_id, "a3d5ae46a7a0414b1");
+                assert_eq!(tool_call_id, "toolu_012yUZykQT2vqFXZTvqWev5e");
+                assert_eq!(description, "grep tmux mentions repo-wide");
+                assert_eq!(model, "claude-opus-4-8[1m]");
+                assert!(output_file.ends_with(".output"));
+            }
+            other => panic!("expected BackgroundAgentLaunched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_meta_emits_background_agent_launched() {
+        // The real path: the async launch arrives as a metadata-only
+        // ToolCallUpdate (no status/content/title), carrying the Agent
+        // payload under `_meta.claudeCode`. It must map to a typed
+        // BackgroundAgentLaunched, not a raw passthrough. This is the
+        // path the unit test on the helper alone did not cover.
+        use agent_client_protocol::schema::{SessionUpdate, ToolCallUpdate, ToolCallUpdateFields};
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a6654829ea0a19032",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a6654829ea0a19032.output",
+                    "status": "async_launched"
+                }
+            }),
+        );
+        let mut update = ToolCallUpdate::new("toolu_01HzYCZK", ToolCallUpdateFields::new());
+        update.meta = Some(meta);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::BackgroundAgentLaunched {
+                agent_id,
+                description,
+                output_file,
+                ..
+            } => Some((agent_id.clone(), description.clone(), output_file.clone())),
+            _ => None,
+        }) {
+            Some((id, desc, out)) => {
+                assert_eq!(id, "a6654829ea0a19032");
+                assert_eq!(desc, "grep tmux mentions repo-wide");
+                assert!(out.ends_with(".output"));
+            }
+            None => panic!("expected BackgroundAgentLaunched, got {events:?}"),
+        }
+        // It must NOT also leak a RawAgentUpdate for the same payload.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RawAgentUpdate { .. })),
+            "async launch should not also pass through as RawAgentUpdate"
+        );
+    }
+
+    #[test]
+    fn background_agent_launched_ignores_non_agent_meta() {
+        // A normal tool-response RawAgentUpdate must not be promoted.
+        let bash = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
+        });
+        assert!(background_agent_launched_from_value(&bash).is_none());
+        // An Agent update that is not an async launch (no status) stays raw.
+        let sync = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Agent", "toolResponse": {
+                "agentId": "x"
+            }}}
+        });
+        assert!(background_agent_launched_from_value(&sync).is_none());
+        assert!(background_agent_launched_from_value(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
     fn classify_lifecycle_signal_tool_call_defaults_run_in_background_false() {
         use agent_client_protocol::schema::ToolCall;
         let mut tc = ToolCall::new("tc-fg-1", "Bash");
@@ -9434,6 +9630,56 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_flags_async_subagent_launch() {
+        // Claude's async `Task` tool completes immediately with the SDK
+        // marker while the sub-agent runs off-protocol. The completion
+        // event must carry async_subagent so renderers draw a background
+        // card and drop the marker body (it leaks an internal agent id).
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Async agent launched successfully\nagentId: ae6f0567246843e25 (internal ID)",
+            ))]);
+        let update = ToolCallUpdate::new("tc-async", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(flag, "async sub-agent launch must set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_normal_completion_is_not_async_subagent() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new("done"))]);
+        let update = ToolCallUpdate::new("tc-normal", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(!flag, "normal completion must not set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
         }
     }
 

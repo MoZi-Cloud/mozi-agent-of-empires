@@ -33,7 +33,8 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
-import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
+import { BackgroundAgentsContext } from "./backgroundAgentsContext";
+import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
@@ -97,6 +98,9 @@ interface Props {
   /** Repo roots for this session, forwarded to the tool cards so file
    *  paths render repo-relative instead of absolute. See #2143. */
   fileRefSession?: FileRefSession | null;
+  /** Open (or focus) the Sub agents dock pane. Lets an inline async
+   *  sub-agent card jump to its panel entry. */
+  onOpenAgentsPane?: () => void;
 }
 
 const STARTER_PROMPTS = [
@@ -106,7 +110,8 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
+  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession, onOpenAgentsPane } =
+    props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -127,17 +132,21 @@ export function StructuredView(props: Props) {
             showClearedTurns={showClearedTurns}
           >
             {(ctx) => (
-              <AcpChrome
-                sessionId={sessionId}
-                acpWorkerState={acpWorkerState}
-                showClearedTurns={showClearedTurns}
-                onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                toolDensity={toolDensity}
-                onToggleToolDensity={toggleToolDensity}
-                archivedAt={archivedAt}
-                snoozedUntil={snoozedUntil}
-                {...ctx}
-              />
+              <BackgroundAgentsContext.Provider
+                value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
+              >
+                <AcpChrome
+                  sessionId={sessionId}
+                  acpWorkerState={acpWorkerState}
+                  showClearedTurns={showClearedTurns}
+                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                  toolDensity={toolDensity}
+                  onToggleToolDensity={toggleToolDensity}
+                  archivedAt={archivedAt}
+                  snoozedUntil={snoozedUntil}
+                  {...ctx}
+                />
+              </BackgroundAgentsContext.Provider>
             )}
           </AcpRuntime>
         </ToolDisplayModeProvider>
@@ -930,6 +939,10 @@ function AssistantTodoGroup({ argsText }: { argsText?: string }) {
 interface SubagentPayload {
   parent: GroupChild;
   children: GroupChild[];
+  /** True for an async sub-agent launch: the `Task` completed at launch
+   *  and the work runs off-protocol, so there are no children and the
+   *  card renders a neutral "runs in background" state. */
+  async?: boolean;
 }
 
 /** Reconstructs the parent Task tool plus its sub-agent children from
@@ -984,6 +997,11 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
   };
 
   const parent = reconstruct(payload.parent);
+  // An async launch has no inline children; it links to its live entry in
+  // the Background agents panel by the launching tool-call id.
+  if (payload.async) {
+    return <AsyncSubagentCard tool={parent.tool} />;
+  }
   const children = payload.children.map(reconstruct);
   return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
 }
