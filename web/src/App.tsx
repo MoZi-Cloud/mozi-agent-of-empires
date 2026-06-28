@@ -28,7 +28,7 @@ import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
-import { useCommandActions } from "./hooks/useCommandActions";
+import { useCommandActions, buildConversationActions } from "./hooks/useCommandActions";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
@@ -115,6 +115,7 @@ import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
+import { useConversationSearch } from "./hooks/useConversationSearch";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -571,6 +572,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
+  // Palette content-search query (#2515); declared here so the keyboard
+  // handlers below can clear it on close/toggle. Consumed lower down by
+  // useConversationSearch.
+  const [paletteQuery, setPaletteQuery] = useState("");
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
   // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
@@ -1274,6 +1279,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
           if (showPalette) {
             setShowPalette(false);
+            setPaletteQuery("");
             return;
           }
           setShowSessionWizard(false);
@@ -1284,7 +1290,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         },
         onHelp: () => setShowHelp((h) => !h),
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
-        onPalette: () => setShowPalette((p) => !p),
+        onPalette: () => {
+          setPaletteQuery("");
+          setShowPalette((p) => !p);
+        },
         onToggleSidebar: () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
@@ -1329,6 +1338,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     readOnly: !!serverAbout?.read_only,
     onOpenSettingsTab: openSettingsTab,
   });
+
+  // Conversation-content search for the palette (#2515). paletteQuery is
+  // declared above (near showPalette) so the keyboard handlers can clear it
+  // on close/toggle; consumed here.
+  const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
+  const conversationActions = useMemo(
+    () =>
+      buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
+        ...rest,
+        perform: () => handleSelectSession(sessionId),
+      })),
+    [conversationHits, sessions, activeSessionId, handleSelectSession],
+  );
 
   const renderContent = () => {
     if (showSettings) {
@@ -1847,8 +1869,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         <CommandPalette
           open={showPalette}
-          onClose={() => setShowPalette(false)}
-          actions={[...commandActions, ...settingsCommands]}
+          onClose={() => {
+            setShowPalette(false);
+            setPaletteQuery("");
+          }}
+          actions={[...commandActions, ...conversationActions, ...settingsCommands]}
+          onSearchChange={setPaletteQuery}
+          searching={conversationSearching}
         />
 
         {activeWorkspace && activeSession && (
