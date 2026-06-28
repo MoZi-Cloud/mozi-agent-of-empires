@@ -7,7 +7,7 @@
 // shown rather than swallowed.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type {
   DiscoverResult,
@@ -364,6 +364,7 @@ describe("PluginsSettings", () => {
           api_version: 4,
           capabilities: ["net"],
           ui_contributions: [{ slot: "status-bar", id: "s" }],
+          screenshots: [],
         },
         manifest_error: null,
         release_tags: ["v2.3.0", "v2.2.0"],
@@ -379,6 +380,66 @@ describe("PluginsSettings", () => {
     expect(modal.textContent).toContain("net");
     const versions = await findByTestId("plugin-detail-versions");
     expect(versions.textContent).toContain("v2.2.0");
+    // No screenshots in the manifest: no gallery chrome.
+    expect(modal.querySelector("[data-testid='plugin-detail-screenshots']")).toBeNull();
+  });
+
+  it("renders a screenshot gallery when the manifest declares screenshots", async () => {
+    fetchPluginDetails.mockResolvedValue({
+      kind: "ok",
+      detail: {
+        source: "gh:acme/widget",
+        manifest: {
+          id: "acme.widget",
+          name: "Widget",
+          version: "2.3.0",
+          description: "A widget plugin.",
+          api_version: 5,
+          capabilities: [],
+          ui_contributions: [],
+          screenshots: [
+            {
+              src: "https://raw.githubusercontent.com/acme/widget/HEAD/a.png",
+              alt: "Dashboard card",
+              caption: "Live card.",
+            },
+            { src: "https://raw.githubusercontent.com/acme/widget/HEAD/b.gif", alt: "Demo", caption: "" },
+          ],
+        },
+        manifest_error: null,
+        release_tags: [],
+      },
+    });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    const gallery = await findByTestId("plugin-detail-screenshots");
+    const imgs = gallery.querySelectorAll("img");
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0].getAttribute("src")).toBe("https://raw.githubusercontent.com/acme/widget/HEAD/a.png");
+    expect(imgs[0].getAttribute("alt")).toBe("Dashboard card");
+    expect(imgs[0].getAttribute("loading")).toBe("lazy");
+    expect(gallery.textContent).toContain("Live card.");
+    // Clicking a screenshot opens the full-size lightbox.
+    const { findByTestId: findInModal, queryByTestId } = within(document.body);
+    fireEvent.click(imgs[0]!);
+    const lightbox = await findInModal("plugin-detail-lightbox");
+    const bigImg = lightbox.querySelector("img")!;
+    expect(bigImg.getAttribute("src")).toBe("https://raw.githubusercontent.com/acme/widget/HEAD/a.png");
+    // Clicking the image itself does not dismiss; only the backdrop does.
+    fireEvent.click(bigImg);
+    expect(queryByTestId("plugin-detail-lightbox")).not.toBeNull();
+    // Escape closes the lightbox first, leaving the detail modal open.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(queryByTestId("plugin-detail-lightbox")).toBeNull());
+    expect(queryByTestId("plugin-detail-modal")).not.toBeNull();
+    // Backdrop click also dismisses.
+    fireEvent.click(imgs[0]!);
+    fireEvent.click(await findInModal("plugin-detail-lightbox"));
+    await waitFor(() => expect(queryByTestId("plugin-detail-lightbox")).toBeNull());
+    // A 404 (moved ref / deleted asset) hides the figure rather than leaving a
+    // broken-image icon.
+    fireEvent.error(imgs[0]!);
+    expect(imgs[0]!.closest("figure")!.className).toContain("hidden");
   });
 
   it("separates installed management from the marketplace into tabs", async () => {
@@ -410,6 +471,14 @@ describe("PluginsSettings", () => {
     // Falls back to the installed view's fields immediately.
     expect(modal.textContent).toContain("v0.1.0");
     fireEvent.click(await findByTestId("plugin-detail-close"));
+    await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
+  });
+
+  it("Escape closes the detail modal when no lightbox is open", async () => {
+    const { findByTestId, queryByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-example.plugin"));
+    await findByTestId("plugin-detail-modal");
+    fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 
