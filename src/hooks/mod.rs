@@ -74,11 +74,14 @@ const AOE_HOOK_PATH_SENTINEL: &str = concat!(aoe_hook_marker!(), "/$AOE_INSTANCE
 /// Where an agent's settings file lives. Determines which shell command
 /// `hook_command_session_id` emits.
 ///
-/// `Host`: emits a call to the `aoe __extract-session-id` Rust subcommand.
-/// `Sandbox`: emits a POSIX shell pipeline because `aoe` is not installed
-/// inside the sandbox image. The pipeline keeps a known schema-ordering
-/// quirk: a textually-earlier nested `session_id` wins over the top-level
-/// one, accepted because Claude does not emit such payloads.
+/// `Host`: emits a call to the `aoe __extract-session-id` Rust subcommand,
+/// which parses stdin with `serde_json` and writes the top-level
+/// `session_id` string atomically through the hardened per-user dir guard.
+/// `Sandbox`: emits a POSIX shell wrapper around `jq -r` doing the same
+/// structural top-level extraction, because `aoe` is not installed inside
+/// the sandbox image. `jq` ships in the default `aoe-sandbox` image; on a
+/// custom image without `jq` the hook silent-fails (exit 0, no sidecar)
+/// and pane-content reconciliation takes over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookInstallTarget {
     Host,
@@ -352,11 +355,11 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
 /// substring so hooks installed before the trailing marker was added stay
 /// detectable on uninstall.
 ///
-/// Host-variant silent-failure modes (acceptable, equivalent to a regex
-/// miss in the sandbox variant): `aoe` not on PATH at hook-exec time, or
-/// a stale `aoe` on PATH that predates `__extract-session-id`. Both yield
-/// no sidecar without surfacing an error; session resume falls back to
-/// the filesystem scan.
+/// Host-variant silent-failure modes (acceptable, equivalent to a `jq`
+/// absence in the sandbox variant): `aoe` not on PATH at hook-exec time,
+/// or a stale `aoe` on PATH that predates `__extract-session-id`. Both
+/// yield no sidecar without surfacing an error; session resume falls
+/// back to the filesystem scan.
 fn hook_command_session_id(target: HookInstallTarget) -> String {
     match target {
         HookInstallTarget::Host => hook_command_session_id_host(),
@@ -384,6 +387,13 @@ fn hook_command_session_id_host() -> String {
 }
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
+    // `jq -r` does the structural top-level extraction symmetric with the
+    // host's `serde_json` path. POSIX `case` enforces the UUID shape after
+    // jq returns, because `case` has no `{N}` quantifier we expand the
+    // 8-4-4-4-12 layout literally over the `$H` hex-class abbreviation.
+    // The `'\''` close-escape-reopen is the standard shell idiom for a
+    // literal single-quote inside a single-quoted `sh -c '...'`; in Rust
+    // source that is `'\\''`.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -392,8 +402,11 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
-         SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
-         [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
+         command -v jq >/dev/null 2>&1 || exit 0; \
+         SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id else empty end'\\'' 2>/dev/null); \
+         H=[0-9a-fA-F]; \
+         case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) ;; *) exit 0 ;; esac; \
+         printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -3521,8 +3534,35 @@ hooks_auto_accept: false
         child.wait_with_output().expect("wait sh")
     }
 
+    /// Skip end-to-end sandbox shell tests when `jq` is absent. The
+    /// default `aoe-sandbox` image bundles `jq`; minimal CI runners or
+    /// stripped dev environments may not. Without it the body silent-fails
+    /// at the `command -v jq` gate and writes no sidecar, which is the
+    /// contract, not a test failure.
+    ///
+    /// Probes through `sh -c "command -v jq ..."` rather than
+    /// `Command::new("jq")` so the gate asks the same question the
+    /// installed hook asks at runtime (Claude spawns the hook via
+    /// `sh -c <body>`; `command -v` resolves against the inherited
+    /// `$PATH`). Switching to a direct `Command::new("jq")` probe would
+    /// test a different code path with the same answer on common systems.
+    fn skip_if_no_jq() -> bool {
+        let absent = std::process::Command::new("sh")
+            .args(["-c", "command -v jq >/dev/null 2>&1"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true);
+        if absent {
+            eprintln!("skipping: jq not on PATH");
+        }
+        absent
+    }
+
     #[test]
     fn test_hook_command_session_id_extracts_from_compact_payload() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/x"}}"#);
@@ -3536,6 +3576,9 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hook_command_session_id_ignores_user_prompt_injection() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let real = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let fake = "11111111-2222-3333-4444-555555555555";
@@ -3548,30 +3591,37 @@ hooks_auto_accept: false
         assert_eq!(written, real);
     }
 
+    /// Top-level `session_id` wins even when a nested `session_id` appears
+    /// textually earlier in the payload. Locks the fix for issue #1760:
+    /// the previous shell pipeline's `[{,]` regex anchor picked the
+    /// textually-first match, so a payload of the shape
+    /// `{"context":{"session_id":NESTED},"session_id":TOP}` wrote NESTED.
     #[test]
-    fn test_hook_command_session_id_sandbox_pins_nested_first_quirk() {
+    fn test_hook_command_session_id_sandbox_extracts_top_level_over_nested() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let nested = "11111111-2222-3333-4444-555555555555";
         let top_level = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload =
             format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top_level}"}}"#);
-        let output = run_session_id_hook(&payload, "sandbox_nested_first", tmp.path());
+        let output = run_session_id_hook(&payload, "sandbox_top_wins", tmp.path());
         assert!(output.status.success());
         let written =
-            std::fs::read_to_string(tmp.path().join("sandbox_nested_first").join("session_id"))
+            std::fs::read_to_string(tmp.path().join("sandbox_top_wins").join("session_id"))
                 .expect("sidecar file");
         assert_eq!(
-            written, nested,
-            "the sandbox shell pipeline's `[{{,]` regex anchor cannot \
-             distinguish a nested object literal from the top-level field; \
-             a textually-earlier nested `session_id` wins. The host variant \
-             fixes this via `serde_json`. Documented limitation; pinned so \
-             a regex tweak does not silently change ordering semantics."
+            written, top_level,
+            "structural top-level extraction must beat a textually-earlier nested `session_id`"
         );
     }
 
     #[test]
     fn test_hook_command_session_id_extracts_from_multi_line_payload() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload = format!("{{\n  \"session_id\":\"{uuid}\",\n  \"cwd\":\"/x\"\n}}");
@@ -3584,6 +3634,9 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hook_command_session_id_accepts_uppercase_uuid() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
         let payload = format!(r#"{{"session_id":"{uuid}"}}"#);
@@ -3596,12 +3649,58 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hook_command_session_id_skips_when_no_session_id() {
+        if skip_if_no_jq() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let payload = r#"{"cwd":"/x","other":"value"}"#;
         let output = run_session_id_hook(payload, "no_sid", tmp.path());
         assert!(output.status.success());
         let path = tmp.path().join("no_sid").join("session_id");
         assert!(!path.exists());
+    }
+
+    /// End-to-end check against a Claude `PreToolUse` shape: pretty-printed
+    /// JSON, nested `tool_input` carrying its own fields, a user `prompt`
+    /// containing a literal `"session_id":"<uuid>"` substring (which would
+    /// have fooled the legacy grep pipeline), and the real `session_id`
+    /// sitting at the top level.
+    #[test]
+    fn test_hook_command_session_id_sandbox_extracts_from_real_claude_payload() {
+        if skip_if_no_jq() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let real = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let decoy = "11111111-2222-3333-4444-555555555555";
+        let payload = format!(
+            r##"{{
+  "hook_event_name": "PreToolUse",
+  "transcript_path": "/tmp/t.jsonl",
+  "cwd": "/workspace",
+  "tool_name": "Bash",
+  "tool_input": {{
+    "command": "echo hi",
+    "session_id": "{decoy}"
+  }},
+  "prompt": "please do \"session_id\":\"{decoy}\" thing",
+  "session_id": "{real}"
+}}"##
+        );
+        let output = run_session_id_hook(&payload, "real_claude_payload", tmp.path());
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written =
+            std::fs::read_to_string(tmp.path().join("real_claude_payload").join("session_id"))
+                .expect("sidecar file");
+        assert_eq!(
+            written, real,
+            "top-level `session_id` must win over a same-shape value nested under \
+             `tool_input` and over a literal substring inside a `prompt` field"
+        );
     }
 
     #[test]
@@ -3626,15 +3725,23 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_hook_command_session_id_sandbox_keeps_shell_pipeline() {
+    fn test_hook_command_session_id_sandbox_invokes_jq_extractor() {
         let cmd = hook_command_session_id(HookInstallTarget::Sandbox);
         assert!(
-            cmd.contains("grep -oE"),
-            "sandbox hook must keep the POSIX pipeline since `aoe` is not in the image, got: {cmd}"
+            cmd.contains("jq -r"),
+            "sandbox hook must invoke `jq -r` for structural top-level extraction, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("command -v jq"),
+            "sandbox hook must guard on `jq` being on PATH, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("grep -oE"),
+            "sandbox hook must not use the legacy GNU/BSD grep pipeline, got: {cmd}"
         );
         assert!(
             !cmd.contains("aoe __extract-session-id"),
-            "sandbox hook must not invoke the Rust subcommand, got: {cmd}"
+            "sandbox hook must not invoke the Rust subcommand (not in the image), got: {cmd}"
         );
         assert!(
             cmd.contains(AOE_HOOK_MARKER),
@@ -3744,11 +3851,50 @@ hooks_auto_accept: false
     #[test]
     fn hook_command_session_id_sandbox_quotes_and_guards() {
         let cmd = hook_command_session_id_sandbox("/tmp/aoe-hooks");
-        assert!(cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*"));
-        assert!(cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
+            "missing instance-id allowlist: {cmd}"
+        );
         assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
         assert!(cmd.contains("set -f"), "missing globbing pin: {cmd}");
         assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
+        assert!(
+            cmd.contains("LC_ALL=C ls -ldn"),
+            "missing locale-pinned ls: {cmd}"
+        );
+        assert!(
+            cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),
+            "missing strict 0700 mode pattern: {cmd}"
+        );
+        assert!(
+            cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""),
+            "missing instance dir construction: {cmd}"
+        );
+        assert!(
+            cmd.contains("command -v jq >/dev/null 2>&1 || exit 0"),
+            "missing jq presence gate: {cmd}"
+        );
+        assert!(cmd.contains("jq -r "), "missing jq invocation: {cmd}");
+        assert!(
+            cmd.contains(".session_id|type"),
+            "missing jq string-type gate: {cmd}"
+        );
+        assert!(
+            cmd.contains("H=[0-9a-fA-F]"),
+            "missing hex-class abbreviation for UUID case: {cmd}"
+        );
+        assert!(
+            cmd.contains(".session_id.$$.tmp"),
+            "missing atomic .tmp + mv write: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("# {AOE_HOOK_MARKER}")),
+            "missing trailing AoE marker: {cmd}"
+        );
+        assert!(
+            !cmd.contains("grep -oE"),
+            "legacy grep pipeline must be gone: {cmd}"
+        );
     }
 
     #[test]
