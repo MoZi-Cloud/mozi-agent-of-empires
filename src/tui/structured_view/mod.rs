@@ -60,7 +60,8 @@ const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream,
+        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
     use crossterm::terminal::{
@@ -81,6 +82,14 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Push the kitty enhancement stack so `Shift+Enter` arrives as
+    // `KeyEvent { Enter, SHIFT }` inside the structured-view composer
+    // (#2362). Best-effort like `TerminalGuard::enter`.
+    #[cfg(unix)]
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut event_stream = EventStream::new();
@@ -90,6 +99,8 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
 
     let result = run(&mut terminal, &mut event_stream, &theme, session_id).await;
 
+    #[cfg(unix)]
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

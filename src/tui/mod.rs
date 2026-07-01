@@ -43,7 +43,10 @@ pub fn run_vt_pipe(_socket: &str) -> std::io::Result<()> {
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -76,11 +79,20 @@ fn env_mouse_capture_allows() -> bool {
 }
 
 /// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
-/// alternate screen, bracketed paste, and (when requested) mouse capture; the
-/// `Drop` impl reverses all of it. Because it runs on drop, the terminal is
-/// restored on EVERY exit path, including a panic mid-render, where the old
-/// inline teardown was skipped and left the terminal wedged (raw mode / mouse
-/// reporting stuck on). Drop is best-effort and never panics.
+/// alternate screen, bracketed paste, the kitty keyboard protocol
+/// `DISAMBIGUATE_ESCAPE_CODES` flag (so `Shift+Enter` arrives as a distinct
+/// `KeyEvent` instead of collapsing to bare CR, #2362), and (when requested)
+/// mouse capture; the `Drop` impl reverses all of it. Because it runs on drop,
+/// the terminal is restored on EVERY exit path, including a panic mid-render,
+/// where the old inline teardown was skipped and left the terminal wedged (raw
+/// mode / mouse reporting / enhancement stack stuck on). Drop is best-effort
+/// and never panics.
+///
+/// The kitty-enhancement pop depends on Rust's default `panic = "unwind"`. A future
+/// profile that sets `panic = "abort"` would skip every Drop here and leak
+/// raw mode, alt screen, paste, mouse, and the enhancement stack into the
+/// user's shell; recovery from a leaked enhancement stack is
+/// `printf '\e[<1u'`. Same exposure as a SIGKILL/SIGSEGV mid-TUI.
 struct TerminalGuard {
     /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
     /// gate: under Mosh we never enable capture, so we must not disable it
@@ -107,6 +119,38 @@ impl TerminalGuard {
                 return Err(err.into());
             }
         }
+        // Push the kitty keyboard protocol's DISAMBIGUATE_ESCAPE_CODES flag so
+        // crossterm's parser sees `Shift+Enter` as `KeyEvent { Enter, SHIFT }`
+        // instead of a bare CR indistinguishable from plain Enter (#2362). On
+        // every kitty-protocol-capable terminal (Ghostty, Kitty, WezTerm,
+        // foot, Konsole 24+, recent Alacritty/xterm) this enables the
+        // `translate()` Shift+Enter arm in live_send. Non-supporting terminals
+        // (Apple Terminal, default iTerm2, Termius, Mosh) silently ignore the
+        // unknown `ESC[>1u` CSI; the user falls back to today's behavior.
+        //
+        // No `supports_keyboard_enhancement()` probe: it blocks for up to 2s
+        // on unresponsive terminals (slow SSH, mosh) and conflicts with the
+        // concurrent EventStream reader the TUI is about to start. Unknown
+        // CSI is a safer default than a 2s startup stall.
+        //
+        // Only `DISAMBIGUATE_ESCAPE_CODES`. NOT `REPORT_EVENT_TYPES` (would
+        // start emitting `KeyEventKind::Release` events that several input
+        // pumps would need explicit filtering for). NOT `REPORT_ALTERNATE_KEYS`
+        // (broader change in `KeyEvent` shape that would re-test every chord).
+        //
+        // Best-effort: a push failure here means we lose the Shift+Enter
+        // distinction (status quo before #2362), not anything worth aborting
+        // TUI startup for. Mirrors the Drop pop's best-effort posture.
+        #[cfg(unix)]
+        if let Err(err) = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        ) {
+            tracing::debug!(
+                target: "tui.input",
+                "kitty keyboard enhancement push failed (Shift+Enter will submit instead of inserting newline): {err}",
+            );
+        }
         Ok(Self {
             disable_mouse: !mosh_active,
         })
@@ -116,6 +160,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
+        // Pop the kitty enhancement stack first, before anything else, so the
+        // shell never inherits an active stack even if a later restore fails.
+        // Best-effort, ignore errors.
+        #[cfg(unix)]
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         if self.disable_mouse {
             let _ = execute!(stdout, DisableMouseCapture);

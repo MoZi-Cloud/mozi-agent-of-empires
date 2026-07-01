@@ -1452,6 +1452,25 @@ pub fn translate(key: KeyEvent) -> LiveDispatch {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+    // Shift+Enter (and only Shift+Enter) becomes ESC+CR, the readline
+    // convention for "meta-Enter = insert newline". Byte-identical to
+    // what tmux emits for the named chord `M-Enter` (the existing
+    // M-Enter test case in `vt_input_encode_tests::simple_keys_and_chords`
+    // asserts the same `\x1b\r`), so agents that accept Alt+Enter as
+    // newline (Claude Code, Codex, opencode, ...) need no further
+    // mapping. Only reachable when DISAMBIGUATE_ESCAPE_CODES is active
+    // on a kitty-protocol-capable terminal (#2362); legacy terminals
+    // still deliver bare Enter and fall through to the named-key path
+    // below. Strict modifier equality keeps the Ctrl+Shift+Enter and
+    // Alt+Shift+Enter chords on the named-key path so future keybinds
+    // can rely on `C-S-Enter` etc. HexBytes is chosen over
+    // `Named("M-Enter")` because it short-circuits tmux chord-name
+    // parsing and matches the byte representation unambiguously across
+    // tmux versions.
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
+        return LiveDispatch::Send(TmuxKey::HexBytes(vec![0x1b, b'\r']));
+    }
+
     // Char path: tmux chord names are case-insensitive for letters and
     // the case in `Char(c)` already carries Shift, so we drop `S-` here
     // to avoid double-encoding.
@@ -1531,6 +1550,12 @@ mod tests {
         match d {
             LiveDispatch::Send(TmuxKey::Named(s)) => assert_eq!(s, expected),
             other => panic!("expected Named({expected}), got {other:?}"),
+        }
+    }
+    fn assert_hex(d: LiveDispatch, expected: &[u8]) {
+        match d {
+            LiveDispatch::Send(TmuxKey::HexBytes(b)) => assert_eq!(b, expected),
+            other => panic!("expected HexBytes({expected:?}), got {other:?}"),
         }
     }
 
@@ -1825,6 +1850,69 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             )),
             "C-S-Right",
+        );
+    }
+
+    #[test]
+    fn shift_enter_emits_esc_cr_hex_bytes() {
+        // Shift+Enter on a kitty-protocol-capable terminal lands here
+        // (#2362). The agent in the pane reads ESC+CR as the
+        // readline meta-Enter "insert newline" convention, identical
+        // to how Alt+Enter / M-Enter already works today on terminals
+        // that pre-encode Shift+Enter as ESC+CR (Ghostty default).
+        assert_hex(
+            translate(k_mod(KeyCode::Enter, KeyModifiers::SHIFT)),
+            b"\x1b\r",
+        );
+    }
+
+    #[test]
+    fn bare_enter_still_named() {
+        // Plain Enter must stay on the named-key path so it continues
+        // to deliver bare CR to the agent (= submit). Regression guard
+        // against accidentally widening the strict-mod match.
+        assert_named(translate(k(KeyCode::Enter)), "Enter");
+    }
+
+    #[test]
+    fn alt_enter_still_named_m_enter() {
+        // Alt+Enter (legacy path: terminals that pre-encode Shift+Enter
+        // as ESC+CR deliver Enter+ALT) must continue to produce the
+        // named `M-Enter` chord, which tmux expands to ESC+CR. The
+        // kitty-protocol fix adds a parallel path for Shift+Enter; it
+        // must not displace this one.
+        assert_named(
+            translate(k_mod(KeyCode::Enter, KeyModifiers::ALT)),
+            "M-Enter",
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_enter_falls_through_to_named() {
+        // Strict modifier equality means C-S-Enter does NOT hit the
+        // HexBytes arm; it stays on the named-key path so a future
+        // keybind can target `C-S-Enter` distinctly from Shift+Enter.
+        assert_named(
+            translate(k_mod(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            "C-S-Enter",
+        );
+    }
+
+    #[test]
+    fn alt_shift_enter_falls_through_to_named() {
+        // Symmetric to `ctrl_shift_enter_falls_through_to_named`: any
+        // modifier set beyond SHIFT alone is rejected by strict equality
+        // and falls through to the named-key path so a future keybind
+        // can target `M-S-Enter` distinctly from plain Shift+Enter.
+        assert_named(
+            translate(k_mod(
+                KeyCode::Enter,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            )),
+            "M-S-Enter",
         );
     }
 

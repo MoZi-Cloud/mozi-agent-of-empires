@@ -67,6 +67,17 @@ agent's history without leaving live mode or forwarding the keys. Bare
 `PageUp` / `PageDown` still pass through to the agent, so agents that
 page their own UI keep working.
 
+## Inserting newlines
+
+`Shift+Enter` inserts a newline into the agent's input box on
+kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole
+24+, Alacritty 0.13+, recent xterm). On terminals that do not speak the
+kitty keyboard protocol (Apple Terminal, default iTerm2, Termius, Mosh),
+`Shift+Enter` submits like bare `Enter`; use `Alt+Enter` (or
+`Option+Enter` on macOS), which sends `ESC+CR` natively on many
+terminals, or configure the terminal to send `ESC+CR` for `Shift+Enter`
+as a fallback.
+
 ## Configuration
 
 Both chords are editable under Settings, in the Interaction section, and

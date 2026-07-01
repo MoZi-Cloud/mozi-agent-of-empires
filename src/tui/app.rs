@@ -3,7 +3,8 @@
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -468,6 +469,13 @@ impl App {
         F: FnOnce() -> R,
     {
         crossterm::terminal::disable_raw_mode()?;
+        // Pop the kitty enhancement stack before handing the terminal to the
+        // child closure (typically `tmux attach`). Symmetric with the repush
+        // after `EnterAlternateScreen` below so the stack depth is preserved
+        // across the suspend, and tmux gets a clean outer terminal regardless
+        // of its own extended-keys configuration (#2362).
+        #[cfg(unix)]
+        let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
@@ -494,6 +502,13 @@ impl App {
             EnableBracketedPaste,
             crossterm::cursor::Hide
         )?;
+        // Repush the kitty enhancement stack symmetric with the pop above
+        // (#2362). Best-effort, mirrors `TerminalGuard::enter`.
+        #[cfg(unix)]
+        let _ = crossterm::execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        );
         // Defer mouse-capture restore to sync_mouse_capture so we don't
         // briefly enable it only to disable again when the user returned
         // to the serve view. sync_mouse_capture itself respects the Mouse
