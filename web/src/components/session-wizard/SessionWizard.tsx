@@ -39,6 +39,14 @@ const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
  *  every time. See #2210. */
 const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
 
+/** localStorage key remembering the last agent-instruction text the user
+ *  submitted. Per-browser, so someone who reuses the same instruction on
+ *  every session does not retype it. Free text, so no validation on read
+ *  unlike the tool key. Not ACP-scoped (custom_instruction ships for
+ *  tmux-passthrough sessions too), so it uses the new-session prefix. See
+ *  #2614. */
+const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
+
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
   if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
@@ -50,6 +58,14 @@ function loadLastUsedTool(): string {
 function saveLastUsedTool(tool: string): void {
   if (!ACP_CAPABLE_TOOLS.has(tool)) return;
   safeSetItem(LAST_USED_TOOL_KEY, tool);
+}
+
+function loadLastUsedInstruction(): string {
+  return safeGetItem(LAST_USED_INSTRUCTION_KEY) ?? "";
+}
+
+function saveLastUsedInstruction(instruction: string): void {
+  safeSetItem(LAST_USED_INSTRUCTION_KEY, instruction);
 }
 
 function loadMoreOptionsOpen(): boolean {
@@ -64,7 +80,7 @@ function saveMoreOptionsOpen(open: boolean): void {
  *  fresh wizard opens default to whatever the user picked last. The
  *  prefill path overrides this when `prefill.tool` is set. */
 function buildInitialData(): WizardData {
-  return { ...initialData, tool: loadLastUsedTool() };
+  return { ...initialData, tool: loadLastUsedTool(), customInstruction: loadLastUsedInstruction() };
 }
 
 function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
@@ -297,6 +313,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
       saveLastUsedTool(tool);
+      saveLastUsedInstruction(body.custom_instruction ?? "");
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);
