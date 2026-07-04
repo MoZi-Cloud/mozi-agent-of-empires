@@ -816,15 +816,18 @@ struct SilentOrphanWatchdogConfig {
 ///
 /// - `tool_calls_in_flight` non-empty → watchdog is always suppressed.
 /// - `off_protocol_work_seen.is_some()` → effective grace lifts to at
-///   least `off_protocol_grace_floor` for the rest of this prompt.
+///   least `off_protocol_grace_floor` for the rest of this prompt, EXCEPT
+///   the backgrounded-Bash mid-stream-stall case: `BackgroundCommand` with
+///   `last_refresh_was_progress` bypasses the floor and recovers on the
+///   normal per-prompt grace (#2645).
 /// - `wakeup_suppress_until.is_some()` and `now < deadline` →
 ///   suppressed regardless of grace.
 /// - `cost_seen` switches the no-off-protocol case to fast grace; any
 ///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
 ///   `WakeupPending` clears it.
 ///
-/// See #1240 (original wedge), #1360 (async-agent floor), and #1401
-/// (backgrounded Bash + ScheduleWakeup).
+/// See #1240 (original wedge), #1360 (async-agent floor), #1401
+/// (backgrounded Bash + ScheduleWakeup), and #2645 (mid-stream stall).
 #[derive(Debug, Default)]
 struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -833,6 +836,16 @@ struct SilentOrphanWatchdog {
     tool_calls_in_flight: std::collections::HashMap<String, ToolMetadata>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<tokio::time::Instant>,
+    /// True when the last signal that refreshed the progress timer was a
+    /// `Progress` (`AgentMessageChunk` / `AgentThoughtChunk` / `Plan` /
+    /// non-terminal `ToolCallUpdate`) rather than a tool boundary
+    /// (`ToolStarted` / `ToolCompleted`) or a `WakeupPending`. Lets
+    /// `effective_grace` tell a model stream that died mid-message apart
+    /// from a backgrounded Bash that is still being polled: a live bash
+    /// surfaces as `BashOutput` tool activity (flag `false`, keeps the
+    /// 30-min floor), while a mid-stream stall leaves the flag `true`
+    /// (recover on the normal per-prompt grace). See #2645.
+    last_refresh_was_progress: bool,
 }
 
 impl SilentOrphanWatchdog {
@@ -854,6 +867,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = true;
             }
             LifecycleSignal::ToolStarted {
                 id,
@@ -862,6 +876,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // OR the new flag with any existing metadata. A late
                 // `ToolCallUpdate(InProgress)` lacks `raw_input` and
                 // classifies as `is_background_task = false`; without
@@ -886,6 +901,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // Defense in depth: trust either the completion-content
                 // marker OR the original raw_input flag. Either path
                 // alone is enough to mark this prompt as having
@@ -933,6 +949,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // A scheduled wake is deliberate off-protocol idling, not
                 // a wedge: mark the turn so the fast grace (cost_seen)
                 // never applies and the post-`at` grace is the generous
@@ -970,7 +987,21 @@ impl SilentOrphanWatchdog {
     }
 
     fn effective_grace(&self, cfg: SilentOrphanWatchdogConfig) -> std::time::Duration {
-        if self.off_protocol_work_seen.is_some() {
+        // A backgrounded Bash whose turn then died mid-message: the last
+        // signal that refreshed the timer was model stream output
+        // (`Progress`), not a `BashOutput` poll or other tool activity, and
+        // nothing has arrived since. That is a dead stream, not a quietly-
+        // running bash, so bypass the 30-min floor and recover on the normal
+        // per-prompt cascade (~120s base grace). A bash still being polled
+        // refreshes the timer via tool activity, which clears
+        // `last_refresh_was_progress` and keeps the floor. Scoped to
+        // `BackgroundCommand`: an `AsyncAgent` await and a `ScheduledWakeup`
+        // are genuinely invisible off-protocol waits and keep their floor
+        // (preserves #1360 and the monitor-killed-by-watchdog fix). See #2645.
+        let background_stream_stall = self.off_protocol_work_seen
+            == Some(OffProtocolWorkKind::BackgroundCommand)
+            && self.last_refresh_was_progress;
+        if self.off_protocol_work_seen.is_some() && !background_stream_stall {
             cfg.base_grace.max(cfg.off_protocol_grace_floor)
         } else if self.cost_seen && cfg.fast_grace > std::time::Duration::ZERO {
             cfg.fast_grace
@@ -8393,6 +8424,135 @@ mod tests {
             "raw_input.run_in_background must trip off-protocol suppression alone"
         );
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 20), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_then_stream_stall_recovers_on_base_grace() {
+        // #2645: a per-prompt turn launched a backgrounded Bash (latches the
+        // 30-min floor) and then streamed a partial message before the model
+        // stream died mid-chunk. Because the last timer refresh was a
+        // `Progress` (not a `BashOutput` poll), the watchdog must recover on
+        // the normal per-prompt grace (~120s), not ride the 30-min floor.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-stall".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Model resumes streaming a partial message, then the stream dies.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "the backgrounded Bash is still latched",
+        );
+        // Before the base grace lapses: still suppressed.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        // Past the base grace (120s from the last chunk at +2s): fires,
+        // instead of waiting the 30-min floor.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_still_polling_rides_floor() {
+        // #2645 guard: a backgrounded Bash that is genuinely still producing
+        // output is polled via `BashOutput`, which surfaces as tool activity
+        // (ToolStarted / ToolCompleted) and clears `last_refresh_was_progress`.
+        // The watchdog must keep the 30-min floor so a live bash is not cut
+        // short even though a stream chunk preceded the last poll.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-live".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Agent narrates ("still running..."), then polls the bash.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bashoutput".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bashoutput".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(4),
+            wall,
+            cfg,
+        );
+        // Last refresh was tool activity: the floor holds, no early fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 20), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_async_agent_stream_stall_still_rides_floor() {
+        // #2645 scope lock: the mid-stream-stall bypass is BackgroundCommand
+        // only. An AsyncAgent await is a genuinely invisible off-protocol
+        // wait, so even a stream chunk followed by silence must keep the
+        // 30-min floor (preserves #1360 and the monitor-kill fix).
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-async".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::AsyncAgent),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::AsyncAgent),
+        );
+        // Well past the base grace: still suppressed on the 30-min floor.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
     }
 
     #[tokio::test]
