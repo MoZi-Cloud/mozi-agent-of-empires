@@ -4380,15 +4380,19 @@ pub async fn create_session(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
-            let defaults = resolved_config.session.acp_defaults_for(&agent_key);
+            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             instance.agent_model = body
                 .agent_model
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.model.clone()));
-            let mut agent_effort = body
-                .agent_effort
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| defaults.and_then(|d| d.effort.clone()));
+            // Per-model effort override wins when a model is resolved, else the
+            // flat default effort. The explicit request effort always wins.
+            let mut agent_effort =
+                body.agent_effort
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        defaults.and_then(|d| d.effort_for_model(instance.agent_model.as_deref()))
+                    });
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in structured view; a custom
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
