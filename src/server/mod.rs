@@ -2295,6 +2295,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
+    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
 ) {
     // Snapshot suppression here so a worker that unmarks between the
@@ -2337,9 +2338,16 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     #[cfg(feature = "serve")]
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
+
+    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
+    drop(current);
+
+    #[cfg(feature = "serve")]
+    persist_structured_row_repairs(state, repairs);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -2360,6 +2368,188 @@ fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
         inst.status = prior.status;
         inst.last_accessed_at = prior.last_accessed_at;
         inst.idle_entered_at = prior.idle_entered_at;
+    }
+}
+
+#[cfg(feature = "serve")]
+struct StructuredRowRepair {
+    session_id: String,
+    source_profile: String,
+    agent_name: Option<String>,
+    agent_model: Option<String>,
+    acp_session_id: String,
+}
+
+#[cfg(feature = "serve")]
+type LiveStructuredWorkerRecord = (crate::acp::worker_registry::WorkerRecord, String);
+
+#[cfg(feature = "serve")]
+fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
+    use crate::acp::worker_registry::{self, is_record_live};
+
+    let records = match worker_registry::list() {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                error = %e,
+                "worker registry list failed; structured row repair disabled this tick"
+            );
+            return Vec::new();
+        }
+    };
+    records
+        .into_iter()
+        .filter(is_record_live)
+        .filter_map(|record| {
+            let acp_session_id = record
+                .stored_acp_session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())?
+                .to_string();
+            Some((record, acp_session_id))
+        })
+        .collect()
+}
+
+/// Runs before the ACP overlay so freshly repaired rows pass the
+/// `is_structured()` gate and keep their live worker status.
+#[cfg(feature = "serve")]
+fn repair_structured_rows_from_live_workers(
+    merged: &mut [Instance],
+    records: Vec<LiveStructuredWorkerRecord>,
+) -> Vec<StructuredRowRepair> {
+    let live_by_id: std::collections::HashMap<String, LiveStructuredWorkerRecord> = records
+        .into_iter()
+        .map(|(record, acp_session_id)| (record.session_id.clone(), (record, acp_session_id)))
+        .collect();
+
+    let mut repairs = Vec::new();
+    for inst in merged.iter_mut() {
+        if inst.is_structured() {
+            continue;
+        }
+        let Some((record, acp_session_id)) = live_by_id.get(&inst.id) else {
+            continue;
+        };
+        if inst.acp_session_id.is_some()
+            && inst.acp_session_id.as_deref() != Some(acp_session_id.as_str())
+        {
+            tracing::warn!(
+                target: "server.file_watch",
+                session = %inst.id,
+                disk = ?inst.acp_session_id,
+                registry = %acp_session_id,
+                "repairing structured session row with mismatched ACP session id"
+            );
+        }
+        inst.view = crate::session::View::Structured;
+        if inst.agent_name.is_none() && !record.agent_key.is_empty() {
+            inst.agent_name = Some(record.agent_key.clone());
+        }
+        if inst.agent_model.is_none() {
+            inst.agent_model = record.model.clone();
+        }
+        inst.acp_session_id = Some(acp_session_id.clone());
+        tracing::warn!(
+            target: "server.file_watch",
+            session = %inst.id,
+            pid = record.pid,
+            "repaired structured session row from live ACP worker registry"
+        );
+        repairs.push(StructuredRowRepair {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            agent_name: inst.agent_name.clone(),
+            agent_model: inst.agent_model.clone(),
+            acp_session_id: acp_session_id.clone(),
+        });
+    }
+    repairs
+}
+
+#[cfg(feature = "serve")]
+fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
+    if repairs.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let file_watch = state.file_watch.clone();
+    let shutdown = state.shutdown.clone();
+    crate::task_util::spawn_supervised(
+        "server.reload.persist_repairs",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
+                std::collections::HashMap::new();
+            for repair in repairs {
+                by_profile
+                    .entry(repair.source_profile.clone())
+                    .or_default()
+                    .push(repair);
+            }
+            for (profile, repairs) in by_profile {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let file_watch = file_watch.clone();
+                let failed_ids: Vec<String> = repairs
+                    .iter()
+                    .map(|repair| repair.session_id.clone())
+                    .collect();
+                let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let storage = crate::session::Storage::new(&profile, file_watch)?;
+                    storage.update(|all, _groups| {
+                        for repair in repairs {
+                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
+                                inst.view = crate::session::View::Structured;
+                                if inst.agent_name.is_none() {
+                                    inst.agent_name = repair.agent_name;
+                                }
+                                if inst.agent_model.is_none() {
+                                    inst.agent_model = repair.agent_model;
+                                }
+                                inst.acp_session_id = Some(repair.acp_session_id);
+                            } else {
+                                tracing::debug!(
+                                    target: "server.file_watch",
+                                    session = %repair.session_id,
+                                    "repair target not found on disk; skipping"
+                                );
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                })
+                .await;
+                match save_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(target: "server.file_watch", "save after structured row repair: {e}");
+                    }
+                    Err(join_err) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(
+                            target: "server.file_watch",
+                            "structured row repair save task panicked: {join_err}"
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[cfg(feature = "serve")]
+async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
+    let mut instances = state.instances.write().await;
+    for inst in instances.iter_mut() {
+        if failed_ids.iter().any(|id| id == &inst.id) {
+            inst.view = crate::session::View::Terminal;
+            inst.acp_session_id = None;
+        }
     }
 }
 
@@ -2620,30 +2810,39 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         }
         let started = std::time::Instant::now();
         let file_watch_for_load = state.file_watch.clone();
-        let fresh =
-            match tokio::task::spawn_blocking(move || load_all_instances(&file_watch_for_load))
-                .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "disk reload failed"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "spawn_blocking joined with error"
-                    );
-                    continue;
-                }
-            };
+        let loaded = match tokio::task::spawn_blocking(move || {
+            load_all_instances(&file_watch_for_load)
+                .map(|fresh| (fresh, live_structured_worker_records()))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "disk reload failed"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "spawn_blocking joined with error"
+                );
+                continue;
+            }
+        };
+        let (fresh, live_worker_records) = loaded;
         let count = fresh.len();
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            live_worker_records,
+            StatusSource::DiskOnly,
+        )
+        .await;
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -3078,11 +3277,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
             }
-            instances
+            (instances, live_structured_worker_records())
         })
         .await;
 
-        if let Ok(mut instances) = updated {
+        if let Ok((mut instances, live_worker_records)) = updated {
             // Diff BEFORE the helper: status_tx must observe the raw
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
@@ -3161,7 +3360,13 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 .await;
             }
 
-            reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
+            reload_state_instances_from_disk(
+                &state,
+                instances,
+                live_worker_records,
+                StatusSource::TmuxApplied,
+            )
+            .await;
 
             // Drain poller observations into sessions.json so daemon-only
             // sessions (no attached TUI) persist post-`/clear` sids (#2291).
@@ -4401,13 +4606,32 @@ pub mod test_support {
         state.file_watch.clone()
     }
 
-    pub async fn reload_disk_only_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::DiskOnly).await
+    pub async fn reload_disk_only_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::DiskOnly,
+        )
+        .await
     }
 
-    pub async fn reload_tmux_applied_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::TmuxApplied)
-            .await
+    pub async fn reload_tmux_applied_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::TmuxApplied,
+        )
+        .await
     }
 }
 
@@ -4750,6 +4974,127 @@ mod tests {
         assert_eq!(merged.last_error, None);
     }
 
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
+        let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-live.sock");
+        std::fs::write(&socket_path, b"").expect("socket sentinel");
+        let live_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-live".to_string(),
+            std::process::id(),
+            socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-1".to_string()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&live_record).expect("save live worker record");
+
+        let existing_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-existing.sock");
+        std::fs::write(&existing_socket_path, b"").expect("socket sentinel");
+        let existing_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-existing".to_string(),
+            std::process::id(),
+            existing_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-2".to_string()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&existing_record)
+            .expect("save existing-field worker record");
+
+        let stale_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-no-id.sock");
+        std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
+        let no_id_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-no-id".to_string(),
+            std::process::id(),
+            stale_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&no_id_record).expect("save no-id worker record");
+
+        let empty_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-empty-id.sock");
+        std::fs::write(&empty_socket_path, b"").expect("socket sentinel");
+        let empty_id_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-empty-id".to_string(),
+            std::process::id(),
+            empty_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(String::new()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&empty_id_record).expect("save empty-id worker record");
+
+        let mut rows = vec![
+            Instance::new("repair-live", "/tmp/repo"),
+            Instance::new("repair-existing", "/tmp/repo"),
+            Instance::new("repair-no-id", "/tmp/repo"),
+            Instance::new("repair-empty-id", "/tmp/repo"),
+        ];
+        rows[0].id = "repair-live".to_string();
+        rows[1].id = "repair-existing".to_string();
+        rows[1].agent_name = Some("custom-agent".to_string());
+        rows[1].agent_model = Some("custom-model".to_string());
+        rows[2].id = "repair-no-id".to_string();
+        rows[3].id = "repair-empty-id".to_string();
+
+        let live_records = live_structured_worker_records();
+        let repairs = repair_structured_rows_from_live_workers(&mut rows, live_records);
+
+        assert_eq!(repairs.len(), 2);
+        assert_eq!(repairs[0].session_id, "repair-live");
+        assert_eq!(repairs[0].acp_session_id, "acp-session-1");
+        assert_eq!(rows[0].view, crate::session::View::Structured);
+        assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
+        assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[1].view, crate::session::View::Structured);
+        assert_eq!(rows[1].agent_name.as_deref(), Some("custom-agent"));
+        assert_eq!(rows[1].agent_model.as_deref(), Some("custom-model"));
+        assert_eq!(rows[1].acp_session_id.as_deref(), Some("acp-session-2"));
+        assert_eq!(rows[2].view, crate::session::View::Terminal);
+        assert_eq!(rows[2].acp_session_id, None);
+        assert_eq!(rows[3].view, crate::session::View::Terminal);
+        assert_eq!(rows[3].acp_session_id, None);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn init_disk_watch_subscriptions_bootstraps_one_reload_after_wiring() {
@@ -5017,7 +5362,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -5077,7 +5422,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         assert!(

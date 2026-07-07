@@ -2715,8 +2715,9 @@ impl HomeView {
         // Pull the few parent fields we need into owned locals so the
         // immutable borrow of `self` is dropped before the mutable `self.`
         // calls below (dialog construction, info_dialog assignment). A
-        // structured (ACP) parent forks structured, so its captured ACP
-        // session id rides along; the field only exists under `serve`.
+        // structured view parent forks through ACP. The captured ACP session
+        // id is read into a local only under `serve`, since only that fork
+        // branch consumes it.
         let Some(parent) = self
             .selected_session
             .as_ref()
@@ -2756,7 +2757,7 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
-                            "The '{}' agent cannot fork a structured session. Fork is available for agents that support the ACP fork capability, such as Claude.",
+                            "The '{}' agent cannot fork a structured view session. Fork is available for agents that support the ACP fork capability, such as Claude.",
                             tool
                         ),
                     ));
@@ -2773,11 +2774,20 @@ impl HomeView {
                     parent_acp_session_id: acp_id,
                 }
             }
-            // Without `serve` a session can never be structured (the field
-            // doesn't exist and `is_structured()` is hard-coded false), so this
-            // branch is unreachable; keep the compiler happy on bare-core.
             #[cfg(not(feature = "serve"))]
-            unreachable!("is_structured() is always false without the serve feature")
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Fork not available in this build",
+                    "This `aoe` binary was built without the web dashboard \
+                     (a `--no-default-features` source build), so structured \
+                     view session forking is not included.\n\n\
+                     To fork this session:\n\
+                       \u{2022} Install a release build from GitHub Releases, or\n\
+                       \u{2022} Build from source with default features:\n\
+                         cargo build --release",
+                ));
+                return;
+            }
         } else {
             let child_id = crate::session::capture::generate_claude_session_id();
             match crate::session::fork::terminal_fork_seed(

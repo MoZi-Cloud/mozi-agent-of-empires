@@ -267,6 +267,17 @@ pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Respon
     None
 }
 
+fn not_structured_response() -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "not_structured",
+            "message": "Switch the session to structured view before starting an ACP worker",
+        })),
+    )
+        .into_response()
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -279,11 +290,24 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        if !instance.is_structured() {
+            return not_structured_response();
+        }
+        instance
     };
-    drop(instances);
 
     // Pick the structured view agent: explicit request override > stored
     // agent_name on the instance > registry entry keyed on the
@@ -317,10 +341,8 @@ pub async fn spawn_acp(
     // parent id instead of session/new. Cleared once the forked id lands.
     let fork_from = instance.fork_pending.clone();
 
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &inst_lock,
         &id,
         false,
     )
@@ -1767,6 +1789,14 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
@@ -2308,6 +2338,39 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[tokio::test]
+    async fn spawn_acp_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = spawn_acp(
+            State(state.clone()),
+            Path("missing".to_string()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acp_disable_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = acp_disable(State(state.clone()), Path("missing".to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
     }
 
     #[test]
