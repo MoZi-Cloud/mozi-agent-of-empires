@@ -1380,6 +1380,91 @@ fn test_cli_add_attaches_to_existing_worktree() {
 
 #[test]
 #[serial]
+fn test_cli_add_sanitizes_explicit_worktree_branch() {
+    let h = TuiTestHarness::new("cli_branch_sanitize");
+    let project = h.home_path().join("branch-sanitize-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "Exploration and issues v2",
+        "-b",
+        "-t",
+        "SanitizedBranch",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add with unsanitized explicit branch should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("SanitizedBranch"))
+        .expect("SanitizedBranch session should exist");
+    assert_eq!(
+        session["worktree_info"]["branch"].as_str(),
+        Some("Exploration-and-issues-v2"),
+        "CLI should persist the same sanitized explicit branch name as the TUI/API path"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "Exploration-and-issues-v2"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).contains("Exploration-and-issues-v2"),
+        "sanitized branch should exist in the source repo"
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
+    let h = TuiTestHarness::new("cli_blank_branch_title_fallback");
+    let project = h.home_path().join("blank-branch-title-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-w", "   ", "-b"]);
+    assert!(
+        add_output.status.success(),
+        "blank explicit worktree branch should fall back instead of creating branch 'session':\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "expected exactly one session");
+    let session = &sessions[0];
+    assert!(
+        !session["title"].as_str().unwrap_or_default().is_empty(),
+        "blank worktree branch should not become an empty session title"
+    );
+    assert!(
+        session["worktree_info"].is_null(),
+        "blank worktree branch should not create a managed worktree"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "session"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).trim().is_empty(),
+        "blank explicit branch should not create the sanitizer fallback branch"
+    );
+}
+
+#[test]
+#[serial]
 fn test_cli_add_scratch_provisions_dir() {
     let h = TuiTestHarness::new("cli_add_scratch");
 
