@@ -167,13 +167,31 @@ async fn silent_orphan_fires_on_cost_then_silence() {
     // watchdog never fires would still fail (drain returns None).
     let stopped =
         drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(15)).await;
-    let _ = client.shutdown().await;
-
     assert_eq!(
         stopped.as_deref(),
         Some("prompt_orphaned"),
         "silent-orphan watchdog must synthesize Stopped {{ reason: prompt_orphaned }} when the adapter parks after cost-populated UsageUpdate"
     );
+
+    // Regression: the shim honours session/cancel (handleCancel resolves the
+    // SILENT_ORPHAN park), so prompt_fut resolves as Cancelled inside
+    // CANCEL_ESCALATION_GRACE and shutdown stays false. A terminal
+    // prompt_orphaned must still END the connection task so the
+    // supervisor's drain sees channel-close and respawns. Before the fix
+    // the task parked on cmd_rx.recv() after publishing
+    // Stopped{prompt_orphaned} and this stream never closed: permanent
+    // wedge. Drain any trailing events and assert the stream closes on its
+    // own, with no explicit shutdown.
+    let stream_closed = tokio::time::timeout(Duration::from_secs(6), async {
+        while client.next_event().await.is_some() {}
+    })
+    .await;
+    assert!(
+        stream_closed.is_ok(),
+        "connection task must end after Stopped{{prompt_orphaned}} so the supervisor can respawn; event stream stayed open"
+    );
+
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]

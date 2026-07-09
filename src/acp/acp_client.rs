@@ -1109,6 +1109,32 @@ fn terminal_stop_reason(
     }
 }
 
+/// Whether the per-prompt connection arm must end the whole connection
+/// task after publishing its terminal `Stopped`.
+///
+/// The supervisor's kill+respawn only runs once the event channel closes,
+/// i.e. once this task ends: the drain task's respawn block sits after
+/// `inbound.recv()` returns `None` (supervisor.rs). Every restart-reason
+/// except `prompt_orphaned` sets `shutdown = true` at its origin
+/// (rate_limited, cancel-send-failure, cancel_grace escalation, ForceStop,
+/// follow-up-while-cancelling, Shutdown) and so already breaks at the call
+/// site. `prompt_orphaned` is the exception: the cancel-send-success arm
+/// arms `cancel_grace` to escalate instead. If the adapter then honours the
+/// cancel and `prompt_fut` resolves inside that grace, the `prompt_fut` arm
+/// breaks with `shutdown = false`, and without this guard the task would
+/// park on `cmd_rx.recv()`, the channel would never close, and the respawn
+/// the UI banner promised would never happen: a permanent wedge.
+///
+/// Keys on the post-precedence `reason`, not any raw flag: the #2370
+/// `finished_after_orphan_cancel` demotion collapses a late-cost turn back
+/// to `prompt_complete` precisely so it does NOT restart, and a demoted
+/// reason reaching here must keep the task alive. By the time this runs,
+/// `terminal_stop_reason` has already decided whether the orphan flag
+/// survives into the published reason.
+fn prompt_arm_should_end_connection(reason: &str, shutdown: bool) -> bool {
+    shutdown || reason == "prompt_orphaned"
+}
+
 /// Decide whether the between-prompt idle watchdog should synthesize a
 /// terminal `Stopped` for an agent-initiated turn that ran with no
 /// aoe-issued `session/prompt`. A claude-code Monitor (or any backgrounded
@@ -6677,7 +6703,10 @@ async fn run_connection_task<W, R>(
                         // the between-prompt watchdog for any agent-initiated
                         // turn that fires after this point. See #2325.
                         prompt_in_flight.store(false, Ordering::Relaxed);
-                        if shutdown {
+                        // prompt_orphaned must also end the task: the
+                        // supervisor respawns only after this channel
+                        // closes. See prompt_arm_should_end_connection.
+                        if prompt_arm_should_end_connection(reason, shutdown) {
                             break;
                         }
                     }
@@ -7840,6 +7869,30 @@ mod tests {
             terminal_stop_reason(false, true, true, false, false, true, true),
             "user_forced"
         );
+    }
+
+    #[test]
+    fn prompt_arm_ends_on_prompt_orphaned_without_shutdown() {
+        // Regression: the adapter honoured the silent-orphan cancel so
+        // prompt_fut resolved with shutdown still false. The connection
+        // task must still end so the supervisor's drain sees channel-close
+        // and respawns; otherwise the prompt_orphaned banner wedges forever.
+        assert!(prompt_arm_should_end_connection("prompt_orphaned", false));
+    }
+
+    #[test]
+    fn prompt_arm_stays_alive_on_non_restart_reasons() {
+        // prompt_complete (incl. the #2370 late-cost demotion) and a plain
+        // cancel do not restart; the task stays alive for the next prompt.
+        assert!(!prompt_arm_should_end_connection("prompt_complete", false));
+        assert!(!prompt_arm_should_end_connection("cancelled", false));
+    }
+
+    #[test]
+    fn prompt_arm_ends_when_shutdown_flag_set() {
+        // Every other restart path sets shutdown at its origin.
+        assert!(prompt_arm_should_end_connection("prompt_complete", true));
+        assert!(prompt_arm_should_end_connection("agent_unresponsive", true));
     }
 
     // Between-prompt idle watchdog fire decision (#2325). Wall-clock millis.
