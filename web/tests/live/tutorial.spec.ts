@@ -63,10 +63,11 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     const resp = await postSeen;
     expect(resp.status()).toBe(200);
     await expect(page.getByText(FIRST_STEP)).toBeHidden();
-    // The POST returns 200 before the server has flushed the flag to
-    // config.toml, so GET /api/settings can briefly still report false.
-    // Poll with the same 10s budget the rest of this spec uses; the default
-    // 5s poll window is too tight under CI load and flakes here.
+    // `mark_web_tour_seen` awaits its `save_config` in `spawn_blocking`
+    // and `GET /api/settings` re-reads config on every call, so the flag
+    // is committed by the time this poll starts. 20s (twice the 10s
+    // budget the rest of this spec uses) covers the `page.evaluate ->
+    // fetch -> daemon -> disk-read` tail under parallel test load.
     await expect
       .poll(
         () =>
@@ -76,7 +77,7 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
             const cfg = await res.json();
             return cfg?.app_state?.has_seen_web_tour === true;
           }),
-        { timeout: 10_000 },
+        { timeout: 20_000 },
       )
       .toBe(true);
 
