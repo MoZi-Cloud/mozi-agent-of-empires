@@ -636,6 +636,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     let instances = load_all_instances(&file_watch)?;
 
+    // Resolve config before token generation so the token TTL is available
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+
     // Load or generate auth token
     let auth_token = if no_auth {
         eprintln!(
@@ -644,14 +647,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         );
         None
     } else {
-        Some(load_or_generate_token().await?)
+        Some(load_or_generate_token(config.auth.serve_token_ttl_days).await?)
     };
 
     let token_lifetime = test_token_lifetime_override().unwrap_or_else(|| {
         if remote {
             Duration::from_secs(4 * 60 * 60) // 4 hours
         } else {
-            Duration::from_secs(24 * 60 * 60) // 24 hours (existing behavior)
+            Duration::from_secs((config.auth.serve_token_ttl_days as u64) * 24 * 60 * 60)
         }
     });
     let token_grace = test_token_grace_override().unwrap_or(DEFAULT_TOKEN_GRACE);
@@ -2144,11 +2147,12 @@ fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it's less than 24 hours old,
+/// Load an existing auth token from disk if it's less than `ttl_days` old,
 /// otherwise generate a fresh one and persist it.
-async fn load_or_generate_token() -> anyhow::Result<String> {
+async fn load_or_generate_token(ttl_days: u16) -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
     let token_path = app_dir.join("serve.token");
+    let ttl_secs = (ttl_days as u64).saturating_mul(24 * 60 * 60);
 
     // Try to reuse existing token if fresh enough
     if let Ok(metadata) = tokio::fs::metadata(&token_path).await {
@@ -2156,7 +2160,7 @@ async fn load_or_generate_token() -> anyhow::Result<String> {
             let age = std::time::SystemTime::now()
                 .duration_since(modified)
                 .unwrap_or_default();
-            if age < std::time::Duration::from_secs(24 * 60 * 60) {
+            if age < std::time::Duration::from_secs(ttl_secs) {
                 if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
                     let token = token.trim().to_string();
                     if !token.is_empty() && is_valid_token_format(&token) {

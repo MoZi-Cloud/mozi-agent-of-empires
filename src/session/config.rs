@@ -1663,14 +1663,36 @@ pub struct AuthConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Persist login sessions", widget = "toggle", global_only)]
     pub persist_sessions: bool,
+
+    /// How many days the serve auth token is reused across restarts. When
+    /// the server restarts, the existing `serve.token` on disk is kept if
+    /// its age (in days) is below this threshold; otherwise a fresh token
+    /// is generated. Setting this to, say, 365 keeps the same dashboard URL
+    /// valid for a full year across restarts. The default is 1 day (legacy
+    /// behavior). The maximum is 999 days.
+    #[serde(default = "default_serve_token_ttl_days")]
+    #[setting(
+        label = "Token TTL (days)",
+        widget = "number",
+        min = 1,
+        max = 999,
+        global_only
+    )]
+    pub serve_token_ttl_days: u16,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             persist_sessions: true,
+            serve_token_ttl_days: 1,
         }
     }
+}
+
+/// Serde default for `AuthConfig.serve_token_ttl_days`.
+fn default_serve_token_ttl_days() -> u16 {
+    1
 }
 
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
