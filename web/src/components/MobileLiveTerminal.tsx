@@ -345,6 +345,7 @@ export function MobileLiveTerminal({
     setFontSize(configuredFontSize);
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -726,6 +727,96 @@ export function MobileLiveTerminal({
     if (sel && !sel.isCollapsed) return;
     inputRef.current?.focus();
   }, [inputRef]);
+
+  // Floating "Copy" callout shown over an active text selection in the
+  // terminal. The native mobile copy popup is unreliable here: the dashboard
+  // is usually reached over plain HTTP (LAN/Tailscale IP), so
+  // `navigator.clipboard` is undefined and the browser's copy affordance
+  // doesn't fire. We watch the document selection and, when it lands inside
+  // this scroller, surface our own button that writes the selection via
+  // `writeClipboard` (which already falls back to execCommand on HTTP).
+  const [copyMenu, setCopyMenu] = useState<{ left: number; top: number } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const copyMenuRafRef = useRef<number | null>(null);
+
+  const updateCopyMenu = useCallback(() => {
+    const scroller = scrollerRef.current;
+    const container = containerRef.current;
+    setCopied(false);
+    if (!scroller || !container) {
+      setCopyMenu(null);
+      return;
+    }
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      setCopyMenu(null);
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    if (!scroller.contains(range.commonAncestorContainer)) {
+      setCopyMenu(null);
+      return;
+    }
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      setCopyMenu(null);
+      return;
+    }
+    const cRect = container.getBoundingClientRect();
+    const btnW = 72;
+    const btnH = 32;
+    const margin = 8;
+    const left = Math.max(
+      margin,
+      Math.min(cRect.width - btnW - margin, rect.left - cRect.left + rect.width / 2 - btnW / 2),
+    );
+    const above = rect.top - cRect.top - btnH - margin;
+    const top = above > margin ? above : rect.bottom - cRect.top + margin;
+    setCopyMenu({ left, top });
+  }, []);
+
+  // `selectionchange` fires on every selection tick during a drag; coalesce
+  // with rAF so we reposition once per frame instead of thrashing render.
+  useEffect(() => {
+    const onSelectionChange = () => {
+      if (copyMenuRafRef.current != null) cancelAnimationFrame(copyMenuRafRef.current);
+      copyMenuRafRef.current = requestAnimationFrame(updateCopyMenu);
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => {
+      document.removeEventListener("selectionchange", onSelectionChange);
+      if (copyMenuRafRef.current != null) cancelAnimationFrame(copyMenuRafRef.current);
+    };
+  }, [updateCopyMenu]);
+
+  // Hide the callout once the selection scrolls out from under it.
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const onHide = () => {
+      setCopyMenu(null);
+      setCopied(false);
+    };
+    scroller.addEventListener("scroll", onHide, { passive: true });
+    return () => scroller.removeEventListener("scroll", onHide);
+  }, []);
+
+  const copySelection = useCallback(async () => {
+    const text = window.getSelection()?.toString() ?? "";
+    const ok = text ? await writeClipboard(text) : false;
+    navigator.vibrate?.(10);
+    if (ok) {
+      setCopied(true);
+      window.setTimeout(() => {
+        window.getSelection()?.removeAllRanges();
+        setCopyMenu(null);
+        setCopied(false);
+      }, 750);
+    } else {
+      window.getSelection()?.removeAllRanges();
+      setCopyMenu(null);
+    }
+  }, []);
 
   // Map a viewport point to the app's 1-based pane cell for the forwarded
   // wheel event (apps mostly ignore the exact cell, but send a sane one).
@@ -1257,7 +1348,7 @@ export function MobileLiveTerminal({
   const bottomPadLines = visibleRowCount - winEnd;
 
   return (
-    <div className="absolute inset-0" data-live-terminal>
+    <div className="absolute inset-0" data-live-terminal ref={containerRef}>
       <div
         ref={scrollerRef}
         onScroll={onScroll}
@@ -1346,6 +1437,21 @@ export function MobileLiveTerminal({
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
       </div>
+
+      {copyMenu && (
+        <button
+          type="button"
+          data-testid="terminal-copy-selection"
+          // Keep focus on the hidden terminal input so the soft keyboard
+          // doesn't dismiss when the callout is tapped.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={copySelection}
+          style={{ left: copyMenu.left, top: copyMenu.top }}
+          className="absolute z-30 h-8 px-3 rounded-md bg-surface-800/95 border border-surface-700/50 text-text-primary text-xs font-medium shadow-lg backdrop-blur-sm flex items-center active:scale-95 motion-safe:animate-[fadeIn_120ms_ease-out]"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      )}
 
       {LIVE_DEBUG && (
         <div

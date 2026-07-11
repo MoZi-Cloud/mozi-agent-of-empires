@@ -44,6 +44,7 @@ A session manager for AI coding agents on Linux and macOS, driven from the termi
 - **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code
 - **TUI dashboard**: visual interface to create, monitor, and manage sessions
 - **Web dashboard**: create, monitor, and control your agents from any browser, installable as a PWA
+- **Mobile web terminal copy**: select agent terminal text on a phone and a Copy button floats over the selection; tap to copy, works over plain HTTP on LAN/Tailscale where the browser clipboard API is unavailable (a limitation that blocks most xterm.js based web terminals on touch)
 - **Structured view** (web dashboard default): mobile-first native rendering of agent state via the Agent Client Protocol, with plan panels, tool-call cards, and swipe-to-approve. Flip a session to the terminal view for raw tmux rendering
 - **CLI and HTTP API**: drive sessions from the command line or external orchestrators (integrates with tools like OpenClaw)
 - **Remote phone access**: press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth, via Tailscale Funnel or Cloudflare Tunnel
