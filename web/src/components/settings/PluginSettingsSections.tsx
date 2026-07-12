@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { updateSettings } from "../../lib/api";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
@@ -29,6 +30,7 @@ function storedSettings(settings: Record<string, unknown> | null, id: string): R
  * declared default is shown until a value is stored.
  */
 export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
+  const { t } = useTranslation();
   const sections = useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
@@ -51,7 +53,7 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
 
   return (
     <div className="space-y-6">
-      <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Plugin Settings</h4>
+      <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">{t("settings:pluginSettings")}</h4>
       {sections.map((section) => {
         const id = section.slice(PLUGIN_PREFIX.length);
         // Seed manifest defaults for fields with no stored value yet.

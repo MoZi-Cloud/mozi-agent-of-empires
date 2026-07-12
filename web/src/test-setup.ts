@@ -1,3 +1,7 @@
+// Initialise the shared i18n singleton before any component mounts, so
+// `useTranslation`/`t()` are ready in every jsdom test. Mirrors main.tsx;
+// the `isInitialized` guard in i18n.ts makes the double-import a no-op.
+import "./i18n";
 import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
 

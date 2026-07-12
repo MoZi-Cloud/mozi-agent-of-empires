@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useWebSettings } from "../../hooks/useWebSettings";
 
 /// Client-side diff view preferences. These are pure rendering choices stored
@@ -5,6 +6,7 @@ import { useWebSettings } from "../../hooks/useWebSettings";
 /// config, so they need no server round-trip or elevation. The same toggles
 /// are also reachable inline from the diff view itself.
 export function DiffSettings() {
+  const { t } = useTranslation();
   const { settings, update } = useWebSettings();
 
   return (
@@ -13,11 +15,8 @@ export function DiffSettings() {
         <div>
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <div>
-              <div className="text-[13px] text-text-secondary">Side-by-side diff</div>
-              <p className="text-[11px] text-text-muted mt-1">
-                Show diffs in a split (side-by-side) layout instead of unified. On narrow screens the diff falls back to
-                unified automatically.
-              </p>
+              <div className="text-[13px] text-text-secondary">{t("settings:diff.splitTitle")}</div>
+              <p className="text-[11px] text-text-muted mt-1">{t("settings:diff.splitDesc")}</p>
             </div>
             <input
               type="checkbox"
@@ -35,10 +34,8 @@ export function DiffSettings() {
         <div>
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <div>
-              <div className="text-[13px] text-text-secondary">Tree file list</div>
-              <p className="text-[11px] text-text-muted mt-1">
-                Group changed files into a collapsible directory tree. Turn off for a flat list of file paths.
-              </p>
+              <div className="text-[13px] text-text-secondary">{t("settings:diff.treeTitle")}</div>
+              <p className="text-[11px] text-text-muted mt-1">{t("settings:diff.treeDesc")}</p>
             </div>
             <input
               type="checkbox"

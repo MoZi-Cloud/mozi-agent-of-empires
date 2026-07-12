@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { fetchAgents, fetchThemes } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
@@ -61,6 +62,7 @@ export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) 
 /** Default agent picker. The web keeps a free-text field (empty = auto-detect)
  *  rather than the TUI's agent-name select, matching prior behavior. */
 export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const { t } = useTranslation();
   return (
     <TextField
       label={descriptor.label}
@@ -68,7 +70,7 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
       value={typeof value === "string" ? value : ""}
       // Empty clears the override (and falls back to auto-detect).
       onChange={(v) => save(v || null)}
-      placeholder="Auto-detect"
+      placeholder={t("settings:custom.autoDetect")}
       mono
     />
   );
@@ -80,6 +82,7 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
  *  Mirrors the TUI `smart-rename-agent` widget; the install + one-shot filter
  *  keeps the dropdown to agents the rename would actually work on. */
 export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const { t } = useTranslation();
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   useEffect(() => {
     fetchAgents()
@@ -87,7 +90,7 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
       .catch(() => setAgents([]));
   }, []);
   const options = [
-    { value: "", label: "Same as session" },
+    { value: "", label: t("settings:custom.sameAsSession") },
     ...agents.filter((a) => a.installed && a.oneshot_capable).map((a) => ({ value: a.name, label: a.name })),
   ];
   return (
@@ -104,6 +107,7 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
 /** Sound mode. Persisted as the string `"random"` or the tagged object
  *  `{ specific: "..." }`; this maps that enum onto a two-option select. */
 export function SoundModeWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const { t } = useTranslation();
   const mode = typeof value === "string" ? value : typeof value === "object" && value !== null ? "specific" : "random";
   return (
     <SelectField
@@ -112,8 +116,8 @@ export function SoundModeWidget({ descriptor, value, save }: CustomWidgetProps) 
       value={mode}
       onChange={(v) => save(v === "random" ? "random" : { specific: "" })}
       options={[
-        { value: "random", label: "Random" },
-        { value: "specific", label: "Specific" },
+        { value: "random", label: t("settings:custom.soundRandom") },
+        { value: "specific", label: t("settings:custom.soundSpecific") },
       ]}
     />
   );
@@ -186,6 +190,7 @@ const LEVELS = [
  *  map; setting a row to "(default)" removes its override and inherits the
  *  baseline level. */
 export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const { t } = useTranslation();
   const targets = (value ?? {}) as Record<string, string>;
   const saveTarget = (target: string, level: string) => {
     const next = { ...targets };
@@ -196,25 +201,33 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
     }
     save(next);
   };
-  const grouped = KNOWN_TARGETS.reduce<Record<string, typeof KNOWN_TARGETS>>((acc, t) => {
-    (acc[t.group] ||= []).push(t);
+  const grouped = KNOWN_TARGETS.reduce<Record<string, typeof KNOWN_TARGETS>>((acc, tk) => {
+    (acc[tk.group] ||= []).push(tk);
     return acc;
   }, {});
+  // Translate only the "(default)" sentinel; conventional log-level names
+  // (trace/debug/info/warn/error) stay as-is since they are developer-facing.
+  const levels = LEVELS.map((l) => ({
+    value: l.value,
+    label: l.value === "" ? t("settings:custom.levelDefault") : l.label,
+  }));
   return (
     <div className="space-y-4">
       <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>
       {descriptor.description && <p className="text-xs text-text-dim">{descriptor.description}</p>}
       {Object.entries(grouped).map(([group, items]) => (
         <div key={group} className="space-y-2">
-          <h5 className="text-xs font-mono uppercase tracking-widest text-text-primary">{group}</h5>
+          <h5 className="text-xs font-mono uppercase tracking-widest text-text-primary">
+            {t(`settings:custom.targetGroup.${group}`)}
+          </h5>
           <div className="grid gap-3 sm:grid-cols-2">
-            {items.map((t) => (
+            {items.map((tk) => (
               <SelectField
-                key={t.value}
-                label={t.value}
-                value={(targets[t.value] as string) ?? ""}
-                onChange={(v) => saveTarget(t.value, v)}
-                options={LEVELS}
+                key={tk.value}
+                label={tk.value}
+                value={(targets[tk.value] as string) ?? ""}
+                onChange={(v) => saveTarget(tk.value, v)}
+                options={levels}
               />
             ))}
           </div>

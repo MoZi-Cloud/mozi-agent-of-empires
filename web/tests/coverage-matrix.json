@@ -373,6 +373,17 @@
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
+      "id": "settings.i18n",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/useLocalizedSchema.test.ts",
+        "src/components/settings/__tests__/LanguageToggle.test.tsx",
+        "src/components/settings/__tests__/schema-catalog-drift.test.ts"
+      ],
+      "components": ["web/src/components/settings/LanguageToggle.tsx"]
+    },
+    {
       "id": "settings.acp-defaults",
       "kind": "vitest",
       "risk": "medium",

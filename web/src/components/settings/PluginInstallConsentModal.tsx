@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 import type { PluginInstallConsent } from "../../lib/api";
 
@@ -26,6 +27,7 @@ export function PluginInstallConsentModal({
   onApprove,
   onClose,
 }: PluginInstallConsentModalProps) {
+  const { t } = useTranslation();
   const closeIfIdle = () => {
     if (!busy) onClose();
   };
@@ -43,7 +45,7 @@ export function PluginInstallConsentModal({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"
-      aria-label={`Install ${consent.id}`}
+      aria-label={t("settings:plugins.installAria", { id: consent.id })}
       onClick={closeIfIdle}
       data-testid="plugin-install-consent-modal"
     >
@@ -53,7 +55,7 @@ export function PluginInstallConsentModal({
       >
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <h2 className="font-semibold">Install {consent.id}?</h2>
+            <h2 className="font-semibold">{t("settings:plugins.installTitle", { id: consent.id })}</h2>
             <p className="text-xs text-text-dim">
               v{consent.version} ·{" "}
               <span className={consent.validation === "featured" ? "font-medium text-accent-500" : undefined}>
@@ -69,7 +71,7 @@ export function PluginInstallConsentModal({
             onClick={closeIfIdle}
             data-testid="plugin-install-consent-close"
           >
-            Close
+            {t("settings:plugins.close")}
           </button>
         </div>
 
@@ -77,14 +79,15 @@ export function PluginInstallConsentModal({
 
         {consent.unverified && (
           <p className="mb-3 text-xs text-status-warning" data-testid="plugin-install-unverified">
-            This is unverified, un-audited code: it does not come from a vetted release and is not covered by the
-            featured index. Install it only if you trust the source.
+            {t("settings:plugins.unverifiedNotice")}
           </p>
         )}
 
         {consent.capabilities.length > 0 && (
           <div className="mb-3" data-testid="plugin-install-caps">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">Capabilities</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">
+              {t("settings:plugins.capabilitiesLabel")}
+            </p>
             <p className="text-xs text-status-warning">{consent.capabilities.join(", ")}</p>
           </div>
         )}
@@ -92,7 +95,7 @@ export function PluginInstallConsentModal({
         {consent.build_steps.length > 0 && (
           <div className="mb-3" data-testid="plugin-install-build-steps">
             <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">
-              Build commands (run as you, unsandboxed)
+              {t("settings:plugins.buildCommandsLabel")}
             </p>
             <ul className="space-y-0.5">
               {consent.build_steps.map((step, i) => (
@@ -106,16 +109,14 @@ export function PluginInstallConsentModal({
 
         {consent.ui.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">Dashboard UI slots</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.uiSlotsLabel")}
+            </p>
             <p className="text-xs text-text-dim">{[...new Set(consent.ui.map((u) => u.slot))].join(", ")}</p>
           </div>
         )}
 
-        <p className="mb-3 text-[11px] text-text-dim">
-          Installing trusts this plugin. The host enforces capabilities at its API boundary, but a plugin worker (and
-          any build step) runs without OS-level sandboxing, so a malicious plugin is not contained. Build steps run as
-          you before any capability gate. Only install plugins you trust.
-        </p>
+        <p className="mb-3 text-[11px] text-text-dim">{t("settings:plugins.installTrust")}</p>
 
         {error && (
           <p className="mb-3 text-xs text-status-error" data-testid="plugin-install-consent-error">
@@ -131,7 +132,7 @@ export function PluginInstallConsentModal({
             onClick={closeIfIdle}
             data-testid="plugin-install-cancel"
           >
-            Cancel
+            {t("settings:plugins.cancel")}
           </button>
           <button
             type="button"
@@ -140,7 +141,7 @@ export function PluginInstallConsentModal({
             onClick={onApprove}
             data-testid="plugin-install-approve"
           >
-            {busy ? "Starting…" : "Approve and install"}
+            {busy ? t("settings:plugins.starting") : t("settings:plugins.approveInstall")}
           </button>
         </div>
       </div>

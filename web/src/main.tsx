@@ -1,3 +1,5 @@
+// Initialise i18n first so a ready `t()` is available before any render.
+import "./i18n";
 // First: install global error capture so anything that throws during
 // the imports below gets reported to the server.
 import "./logging-init";

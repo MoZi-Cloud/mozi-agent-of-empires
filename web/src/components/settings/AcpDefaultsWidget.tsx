@@ -10,7 +10,9 @@
 // unverified. The raw-JSON escape hatch stays available under an advanced fold.
 
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
+import i18n from "../../i18n";
 import { fetchAcpOptionCatalog, fetchAgents } from "../../lib/api";
 import type { AgentOptionEntry } from "../../lib/api";
 import type { ConfigOptionCategory, ConfigOptionDescriptor } from "../../lib/acpTypes";
@@ -58,18 +60,18 @@ function selectOptions(
   const choices = descriptor?.options ?? [];
   for (const c of choices) opts.push({ value: c.value, label: c.name || c.value });
   if (saved && !choices.some((c) => c.value === saved)) {
-    opts.push({ value: saved, label: `${saved} (unverified)` });
+    opts.push({ value: saved, label: i18n.t("settings:acp.unverifiedValue", { saved }) });
   }
   return opts;
 }
 
 function freshness(entry: AgentOptionEntry | undefined): string {
   if (!entry) {
-    return "No options cached yet. Start a structured session with this agent to populate the lists; you can type values in the meantime.";
+    return i18n.t("settings:acp.noOptionsCached");
   }
   const when = new Date(entry.updated_at);
   const stamp = isNaN(when.getTime()) ? entry.updated_at : when.toLocaleString();
-  return `Options last seen ${stamp}.`;
+  return i18n.t("settings:acp.optionsLastSeen", { stamp });
 }
 
 /** One field: a dropdown when the agent advertised choices for the category,
@@ -113,6 +115,7 @@ function AgentDefaultsCard({
   defaults: AcpAgentDefaults;
   onChange: (next: AcpAgentDefaults) => void;
 }) {
+  const { t } = useTranslation();
   const modelDesc = optionByCategory(entry?.options, "model");
   const modeDesc = optionByCategory(entry?.options, "mode");
   const effortDesc = optionByCategory(entry?.options, "thought_level");
@@ -145,40 +148,40 @@ function AgentDefaultsCard({
     <div className="rounded-md border border-surface-700 bg-surface-850 p-3 space-y-3">
       <div className="flex items-baseline justify-between">
         <h5 className="text-sm font-semibold text-text-primary">{agent.name}</h5>
-        {!agent.installed && <span className="text-[10px] uppercase text-text-dim">not installed</span>}
+        {!agent.installed && (
+          <span className="text-[10px] uppercase text-text-dim">{t("settings:acp.notInstalled")}</span>
+        )}
       </div>
       <p className="text-xs text-text-dim">{freshness(entry)}</p>
 
       <OptionField
-        label="Default model"
+        label={t("settings:acp.defaultModel")}
         descriptor={modelDesc}
         value={defaults.model}
         onChange={(v) => set({ model: v || undefined })}
-        defaultLabel="Adapter default"
-        placeholder="e.g. openai/gpt-5.5"
+        defaultLabel={t("settings:acp.adapterDefault")}
+        placeholder={t("settings:acp.phModel")}
       />
       <OptionField
-        label="Default mode"
+        label={t("settings:acp.defaultMode")}
         descriptor={modeDesc}
         value={defaults.mode}
         onChange={(v) => set({ mode: v || undefined })}
-        defaultLabel="Adapter default"
-        placeholder="e.g. plan"
+        defaultLabel={t("settings:acp.adapterDefault")}
+        placeholder={t("settings:acp.phMode")}
       />
       <OptionField
-        label="Default thinking"
+        label={t("settings:acp.defaultThinking")}
         descriptor={effortDesc}
         value={defaults.effort}
         onChange={(v) => set({ effort: v || undefined })}
-        defaultLabel="Adapter default"
-        placeholder="e.g. high"
+        defaultLabel={t("settings:acp.adapterDefault")}
+        placeholder={t("settings:acp.phThinking")}
       />
 
       <div className="space-y-2">
-        <div className="text-sm text-text-bright">Per-model thinking</div>
-        <div className="text-xs text-text-dim">
-          Overrides the default thinking when that model is the resolved model.
-        </div>
+        <div className="text-sm text-text-bright">{t("settings:acp.perModelTitle")}</div>
+        <div className="text-xs text-text-dim">{t("settings:acp.perModelDesc")}</div>
         {perModel.map(([model, effort]) => (
           <div key={model} className="flex items-center gap-2" data-testid={`per-model-row-${model}`}>
             <span className="flex-1 truncate font-mono text-xs text-text-secondary" title={model}>
@@ -186,12 +189,12 @@ function AgentDefaultsCard({
             </span>
             {effortChoices.length > 0 ? (
               <select
-                aria-label={`Thinking for ${model}`}
+                aria-label={t("settings:acp.thinkingFor", { model })}
                 value={effort}
                 onChange={(e) => setPerModel(model, e.target.value)}
                 className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-xs text-text-primary focus:border-brand-600 focus:outline-none"
               >
-                {selectOptions(effortDesc, effort, "Adapter default").map((o) => (
+                {selectOptions(effortDesc, effort, t("settings:acp.adapterDefault")).map((o) => (
                   <option key={o.value} value={o.value}>
                     {o.label}
                   </option>
@@ -200,7 +203,7 @@ function AgentDefaultsCard({
             ) : (
               <input
                 type="text"
-                aria-label={`Thinking for ${model}`}
+                aria-label={t("settings:acp.thinkingFor", { model })}
                 value={effort}
                 onChange={(e) => setPerModel(model, e.target.value)}
                 className="w-24 bg-surface-900 border border-surface-700 rounded-md px-2 py-1 font-mono text-xs text-text-primary focus:border-brand-600 focus:outline-none"
@@ -208,17 +211,17 @@ function AgentDefaultsCard({
             )}
             <button
               type="button"
-              aria-label={`Remove override for ${model}`}
+              aria-label={t("settings:acp.removeOverrideFor", { model })}
               onClick={() => removePerModel(model)}
               className="rounded px-2 py-1 text-xs text-text-dim hover:text-text-primary"
             >
-              Remove
+              {t("settings:acp.remove")}
             </button>
           </div>
         ))}
         {addableModels.length > 0 && (
           <select
-            aria-label={`Add per-model thinking override for ${agent.name}`}
+            aria-label={t("settings:acp.addOverrideForAgent", { agent: agent.name })}
             value=""
             onChange={(e) => {
               const model = e.target.value;
@@ -226,7 +229,7 @@ function AgentDefaultsCard({
             }}
             className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-xs text-text-primary focus:border-brand-600 focus:outline-none"
           >
-            <option value="">Add override for model…</option>
+            <option value="">{t("settings:acp.addOverrideForModel")}</option>
             {addableModels.map((c) => (
               <option key={c.value} value={c.value}>
                 {c.name || c.value}
@@ -240,6 +243,7 @@ function AgentDefaultsCard({
 }
 
 export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const { t } = useTranslation();
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [catalog, setCatalog] = useState<Record<string, AgentOptionEntry>>({});
   const [rawOpen, setRawOpen] = useState(false);
@@ -285,7 +289,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
       </div>
 
       {acpAgents.length === 0 ? (
-        <p className="text-xs text-text-dim">No ACP-capable agents detected.</p>
+        <p className="text-xs text-text-dim">{t("settings:acp.noAcpAgents")}</p>
       ) : (
         acpAgents.map((agent) => (
           <AgentDefaultsCard
@@ -310,7 +314,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
         }}
       >
         <summary className="cursor-pointer text-xs text-text-dim hover:text-text-primary">
-          Advanced: edit raw JSON
+          {t("settings:acp.advancedRawJson")}
         </summary>
         <div className="mt-2 space-y-1">
           <TextField
@@ -330,10 +334,10 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
                   setRawError(null);
                   void save(parsed);
                 } else {
-                  setRawError("Must be a JSON object (agent -> defaults)");
+                  setRawError(i18n.t("settings:acp.rawMustBeObject"));
                 }
               } catch {
-                setRawError("Invalid JSON");
+                setRawError(i18n.t("settings:acp.rawInvalidJson"));
               }
             }}
             placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
