@@ -50,6 +50,13 @@ export default defineConfig(({ mode, command }) => {
 
   return {
     server: { proxy },
+    // Force a single React instance across every module, including transitive
+    // CJS deps (e.g. react-i18next) that `require('react')`. Without this,
+    // Vite's dep optimizer can inline a second React copy into the dep bundle,
+    // and react-i18next's useTranslation then crashes with "Cannot read
+    // properties of null (reading 'useContext')" because its useContext reads a
+    // different dispatcher than the app's React.
+    resolve: { dedupe: ["react", "react-dom"] },
     plugins: [
       react(),
       tailwindcss(),
