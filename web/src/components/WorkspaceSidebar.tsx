@@ -12,6 +12,7 @@ import {
   useState,
   type MutableRefObject,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
 import {
   Archive,
@@ -82,6 +83,7 @@ import {
   updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import i18n from "../i18n";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
@@ -176,13 +178,16 @@ function BulkTriageMenuItems({
   api: RowBulkApi;
   onDone: () => void;
 }) {
+  const { t } = useTranslation();
   const act = (run: () => void) => {
     onDone();
     run();
   };
   return (
     <>
-      <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">{count} selected</div>
+      <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+        {t("sidebar:bulk.nSelected", { count })}
+      </div>
       {buckets.pinnable.length > 0 && (
         <button
           data-testid="sidebar-context-menu-bulk-pin"
@@ -190,7 +195,7 @@ function BulkTriageMenuItems({
           onClick={() => act(() => api.pin(buckets.pinnable, true))}
         >
           <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-          Pin {buckets.pinnable.length}
+          {t("sidebar:bulk.pinN", { count: buckets.pinnable.length })}
         </button>
       )}
       {buckets.unpinnable.length > 0 && (
@@ -200,7 +205,7 @@ function BulkTriageMenuItems({
           onClick={() => act(() => api.pin(buckets.unpinnable, false))}
         >
           <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-          Unpin {buckets.unpinnable.length}
+          {t("sidebar:bulk.unpinN", { count: buckets.unpinnable.length })}
         </button>
       )}
       {buckets.archivable.length > 0 && (
@@ -210,7 +215,7 @@ function BulkTriageMenuItems({
           onClick={() => act(() => api.archive(buckets.archivable, true))}
         >
           <Archive className="h-3.5 w-3.5 shrink-0" />
-          Archive {buckets.archivable.length}
+          {t("sidebar:bulk.archiveN", { count: buckets.archivable.length })}
         </button>
       )}
       {buckets.unarchivable.length > 0 && (
@@ -220,13 +225,13 @@ function BulkTriageMenuItems({
           onClick={() => act(() => api.archive(buckets.unarchivable, false))}
         >
           <Archive className="h-3.5 w-3.5 shrink-0" />
-          Unarchive {buckets.unarchivable.length}
+          {t("sidebar:bulk.unarchiveN", { count: buckets.unarchivable.length })}
         </button>
       )}
       {buckets.snoozable.length > 0 && (
         <>
           <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-            Snooze {buckets.snoozable.length}
+            {t("sidebar:bulk.snoozeN", { count: buckets.snoozable.length })}
           </div>
           {SNOOZE_PRESETS.map((preset) => (
             <button
@@ -236,7 +241,7 @@ function BulkTriageMenuItems({
               onClick={() => act(() => api.snooze(buckets.snoozable, preset.minutes))}
             >
               <Moon className="h-3.5 w-3.5 shrink-0" />
-              {preset.label}
+              {t(`sidebar:snooze.preset.${preset.minutes}`, preset.label)}
             </button>
           ))}
         </>
@@ -248,7 +253,7 @@ function BulkTriageMenuItems({
           onClick={() => act(() => api.snooze(buckets.unsnoozable, null))}
         >
           <Moon className="h-3.5 w-3.5 shrink-0" />
-          Unsnooze {buckets.unsnoozable.length}
+          {t("sidebar:bulk.unsnoozeN", { count: buckets.unsnoozable.length })}
         </button>
       )}
     </>
@@ -524,6 +529,7 @@ function TrashMenu({
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
 }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -580,8 +586,8 @@ function TrashMenu({
         aria-controls={open ? "sidebar-trash-panel" : undefined}
         data-testid="sidebar-trash-toggle"
         className="h-8 w-full min-w-0 flex items-center gap-2 rounded-md px-2.5 text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer transition-colors"
-        title={`Trash (${count})`}
-        aria-label={`Trash (${count})`}
+        title={t("sidebar:trash.labelWithCount", { count })}
+        aria-label={t("sidebar:trash.labelWithCount", { count })}
       >
         <Trash2 className="h-4 w-4 shrink-0" />
         <span
@@ -590,7 +596,7 @@ function TrashMenu({
         >
           {count}
         </span>
-        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
+        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">{t("sidebar:trash.label")}</span>
       </button>
       {open &&
         panelPosition &&
@@ -599,7 +605,7 @@ function TrashMenu({
             ref={panelRef}
             id="sidebar-trash-panel"
             role="region"
-            aria-label="Trash"
+            aria-label={t("sidebar:trash.label")}
             data-testid="sidebar-trash-menu"
             className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
             style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
@@ -608,17 +614,17 @@ function TrashMenu({
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <Trash2 className="h-4 w-4 shrink-0 text-text-muted" />
-                  <h2 className="text-sm font-semibold text-text-primary">Trash</h2>
+                  <h2 className="text-sm font-semibold text-text-primary">{t("sidebar:trash.label")}</h2>
                   <span className="rounded-full bg-surface-900 px-2 py-0.5 text-[11px] font-mono tabular-nums text-text-dim leading-none">
                     {count}
                   </span>
                 </div>
-                <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
+                <p className="mt-1 text-[12px] text-text-dim">{t("sidebar:trash.restoreHint")}</p>
               </div>
               <button
                 type="button"
                 onClick={() => setOpen(false)}
-                aria-label="Close Trash"
+                aria-label={t("sidebar:trash.close")}
                 className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
               >
                 <X className="h-4 w-4" />
@@ -631,7 +637,10 @@ function TrashMenu({
                   .sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a))
                   .map((ws) => {
                     const sessionCount = ws.sessions.length;
-                    const sessionLabel = sessionCount === 1 ? "1 session" : `${sessionCount} sessions`;
+                    const sessionLabel =
+                      sessionCount === 1
+                        ? t("sidebar:trash.oneSession")
+                        : t("sidebar:trash.nSessions", { count: sessionCount });
                     return (
                       <div
                         key={ws.id}
@@ -664,7 +673,7 @@ function TrashMenu({
                             data-testid="sidebar-trash-open"
                             className="inline-flex h-7 items-center rounded-md border border-surface-700/50 px-2.5 text-[12px] font-medium text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary cursor-pointer transition-colors"
                           >
-                            Open
+                            {t("sidebar:trash.open")}
                           </button>
                           {!readOnly && (
                             <>
@@ -675,12 +684,12 @@ function TrashMenu({
                                   if (ids.length > 0) onRestore(ids);
                                 }}
                                 data-testid="sidebar-trash-restore"
-                                title="Restore"
-                                aria-label="Restore"
+                                title={t("sidebar:trash.restore")}
+                                aria-label={t("sidebar:trash.restore")}
                                 className="inline-flex h-7 items-center gap-1.5 rounded-md border border-accent-500/30 bg-accent-500/10 px-2.5 text-[12px] font-medium text-accent-500 hover:border-accent-500/50 hover:bg-accent-500/15 hover:text-accent-600 cursor-pointer transition-colors"
                               >
                                 <RotateCcw className="h-3.5 w-3.5 shrink-0" />
-                                Restore
+                                {t("sidebar:trash.restore")}
                               </button>
                               <button
                                 type="button"
@@ -689,12 +698,12 @@ function TrashMenu({
                                   onDelete(ws.id);
                                 }}
                                 data-testid="sidebar-trash-purge"
-                                title="Delete permanently"
-                                aria-label="Delete permanently"
+                                title={t("sidebar:trash.deletePermanently")}
+                                aria-label={t("sidebar:trash.deletePermanently")}
                                 className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
                               >
                                 <X className="h-3.5 w-3.5 shrink-0" />
-                                Delete
+                                {t("sidebar:trash.delete")}
                               </button>
                             </>
                           )}
@@ -922,6 +931,7 @@ export const SessionRow = memo(function SessionRow({
   // Stable bridge for bulk triage from the right-click menu. See #2312.
   bulkApi: RowBulkApi;
 }) {
+  const { t } = useTranslation();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
@@ -1013,7 +1023,10 @@ export const SessionRow = memo(function SessionRow({
     return Number.isNaN(reset.getTime()) ? null : reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }, [rateLimited]);
   const rateLimitTitle = rateLimited
-    ? `Rate-limited${rateLimited.count > 1 ? ` (${rateLimited.count} sessions)` : ""}${rateLimitResetLabel ? `; resets at ${rateLimitResetLabel}` : ""}`
+    ? (rateLimited.count > 1
+        ? t("sidebar:badge.rateLimitedCount", { count: rateLimited.count })
+        : t("sidebar:badge.rateLimited")) +
+      (rateLimitResetLabel ? t("sidebar:badge.rateLimitedResets", { time: rateLimitResetLabel }) : "")
     : "";
 
   const setNotifyPreset = async (preset: NotifyPreset) => {
@@ -1099,7 +1112,7 @@ export const SessionRow = memo(function SessionRow({
     if (result.ok && result.session) {
       requestOpenSession(result.session.id);
     } else {
-      reportError(result.error ?? "Could not fork this session. Please try again.");
+      reportError(result.error ?? i18n.t("sidebar:ctx.forkFailed"));
     }
   };
 
@@ -1113,7 +1126,7 @@ export const SessionRow = memo(function SessionRow({
     if (!acpSession) return;
     const result = await smartRenameSession(acpSession.id);
     if (!result.ok) {
-      reportError(result.message ?? "Could not start auto-name. Please try again.");
+      reportError(result.message ?? i18n.t("sidebar:ctx.autoNameFailed"));
     }
   };
 
@@ -1349,13 +1362,17 @@ export const SessionRow = memo(function SessionRow({
           isSelected ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10" : ""
         } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
-        {isSelected && <span className="sr-only">Selected</span>}
+        {isSelected && <span className="sr-only">{t("sidebar:badge.selected")}</span>}
         <div className="flex items-center gap-2">
           <span
             className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
           >
             {showUnreadGlyph ? (
-              <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
+              <span
+                title={t("sidebar:badge.unread")}
+                aria-label={t("sidebar:badge.unread")}
+                data-testid="sidebar-unread-dot"
+              >
                 ●
               </span>
             ) : (
@@ -1367,12 +1384,20 @@ export const SessionRow = memo(function SessionRow({
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {effectivePinned && (
-                <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
+                <span
+                  title={t("sidebar:badge.pinned")}
+                  aria-label={t("sidebar:badge.pinned")}
+                  className="shrink-0 inline-flex text-brand-400"
+                >
                   <Pin className="h-3 w-3 -rotate-45" />
                 </span>
               )}
               {isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-amber-300">
+                <span
+                  title={t("sidebar:badge.favorited")}
+                  aria-label={t("sidebar:badge.favorited")}
+                  className="shrink-0 text-amber-300"
+                >
                   *
                 </span>
               )}
@@ -1380,14 +1405,22 @@ export const SessionRow = memo(function SessionRow({
                 {label}
               </span>
               {hasDraft && (
-                <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
+                <span
+                  title={t("sidebar:badge.unsentDraft")}
+                  aria-label={t("sidebar:badge.unsentDraft")}
+                  className="inline-flex shrink-0"
+                >
                   <Pencil className="h-3 w-3 text-amber-400/90" />
                 </span>
               )}
               {queuedCount > 0 && (
                 <span
-                  title={`${queuedCount} queued prompt${queuedCount === 1 ? "" : "s"}`}
-                  aria-label={`${queuedCount} queued`}
+                  title={
+                    queuedCount === 1
+                      ? t("sidebar:badge.queuedPromptOne", { count: queuedCount })
+                      : t("sidebar:badge.queuedPromptOther", { count: queuedCount })
+                  }
+                  aria-label={t("sidebar:badge.queuedAria", { count: queuedCount })}
                   className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
                 >
                   {queuedCount}
@@ -1406,18 +1439,20 @@ export const SessionRow = memo(function SessionRow({
               )}
               {effectiveArchived && (
                 <span
-                  title="Archived"
-                  aria-label="Archived"
+                  title={t("sidebar:badge.archived")}
+                  aria-label={t("sidebar:badge.archived")}
                   className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
                 >
                   <Archive className="h-3 w-3" />
-                  <span className="hidden sm:inline">archived</span>
+                  <span className="hidden sm:inline">{t("sidebar:badge.archivedShort")}</span>
                 </span>
               )}
               {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
                 <span
-                  title={`Snoozed until ${new Date(effectiveSnoozedUntil).toLocaleString()}`}
-                  aria-label="Snoozed"
+                  title={t("sidebar:badge.snoozedTitle", {
+                    when: new Date(effectiveSnoozedUntil).toLocaleString(),
+                  })}
+                  aria-label={t("sidebar:badge.snoozedAria")}
                   className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
                 >
                   <Moon className="h-3 w-3" />
@@ -1426,32 +1461,32 @@ export const SessionRow = memo(function SessionRow({
               )}
               {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
                 <span
-                  title="Structured view worker is resuming"
-                  aria-label="Resuming"
+                  title={t("sidebar:badge.resumingTitle")}
+                  aria-label={t("sidebar:badge.resuming")}
                   className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
-                  Resuming
+                  {t("sidebar:badge.resuming")}
                 </span>
               )}
               {firstSession?.smart_rename === "pending" && (
                 <span
-                  title="Will auto-name this session from your first message"
-                  aria-label="Will auto-name"
+                  title={t("sidebar:badge.autoNameTitle")}
+                  aria-label={t("sidebar:badge.autoNameAria")}
                   className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
                 >
                   <Sparkles className="h-3 w-3" />
-                  <span className="hidden sm:inline">Auto-name</span>
+                  <span className="hidden sm:inline">{t("sidebar:badge.autoName")}</span>
                 </span>
               )}
               {firstSession?.smart_rename === "running" && (
                 <span
-                  title="Generating a name from your first message"
-                  aria-label="Naming"
+                  title={t("sidebar:badge.namingTitle")}
+                  aria-label={t("sidebar:badge.namingAria")}
                   className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
-                  Naming…
+                  {t("sidebar:badge.naming")}
                 </span>
               )}
               {firstSession?.next_wakeup_at && (
@@ -1527,7 +1562,7 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <Plus className="h-3.5 w-3.5 shrink-0" />
-                    New Session
+                    {t("sidebar:ctx.newSession")}
                   </button>
                 )}
                 <button
@@ -1535,7 +1570,7 @@ export const SessionRow = memo(function SessionRow({
                   data-testid="sidebar-context-menu-rename"
                   className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
                 >
-                  Rename
+                  {t("sidebar:ctx.rename")}
                 </button>
                 {!readOnly && canEditWorkdir && (
                   <button
@@ -1543,7 +1578,7 @@ export const SessionRow = memo(function SessionRow({
                     data-testid="sidebar-context-menu-edit-workdir"
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
                   >
-                    Edit workdir name
+                    {t("sidebar:ctx.editWorkdir")}
                   </button>
                 )}
                 {!readOnly && (
@@ -1552,7 +1587,7 @@ export const SessionRow = memo(function SessionRow({
                     data-testid="sidebar-context-menu-edit-group"
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
                   >
-                    Edit group
+                    {t("sidebar:ctx.editGroup")}
                   </button>
                 )}
                 {!readOnly && acpSession && (
@@ -1562,7 +1597,7 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
-                    Switch agent
+                    {t("sidebar:ctx.switchAgent")}
                   </button>
                 )}
                 {!readOnly && acpSession?.acp_session_id && acpSession.acp_can_fork && (
@@ -1572,7 +1607,7 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <GitFork className="h-3.5 w-3.5 shrink-0" />
-                    Fork session
+                    {t("sidebar:ctx.forkSession")}
                   </button>
                 )}
                 {!readOnly && acpSession?.default_name && (
@@ -1582,7 +1617,7 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                    Auto-name now
+                    {t("sidebar:ctx.autoNameNow")}
                   </button>
                 )}
                 {!readOnly && canStop && (
@@ -1592,7 +1627,7 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <CircleStop className="h-3.5 w-3.5 shrink-0" />
-                    Stop
+                    {t("sidebar:ctx.stop")}
                   </button>
                 )}
                 {!readOnly && canStart && (
@@ -1602,15 +1637,20 @@ export const SessionRow = memo(function SessionRow({
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <Play className="h-3.5 w-3.5 shrink-0" />
-                    Start
+                    {t("sidebar:ctx.start")}
                   </button>
                 )}
                 <div className="border-t border-surface-700/20 my-1" />
                 <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-                  Notifications
+                  {t("sidebar:ctx.notifications")}
                 </div>
                 {(["off", "default", "all"] as const).map((preset) => {
-                  const label = preset === "off" ? "Off" : preset === "default" ? "Default" : "All events";
+                  const label =
+                    preset === "off"
+                      ? t("sidebar:ctx.off")
+                      : preset === "default"
+                        ? t("sidebar:ctx.default")
+                        : t("sidebar:ctx.allEvents");
                   const selected = notifyPreset === preset;
                   return (
                     <button
@@ -1629,7 +1669,7 @@ export const SessionRow = memo(function SessionRow({
                   <>
                     <div className="border-t border-surface-700/20 my-1" />
                     <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-                      Triage
+                      {t("sidebar:ctx.triage")}
                     </div>
                     {(() => {
                       // Menu actions are gated by the row's current triage
@@ -1656,7 +1696,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                              Pin
+                              {t("sidebar:ctx.pin")}
                             </button>
                           )}
                           {shape.showUnpin && (
@@ -1666,7 +1706,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                              Unpin
+                              {t("sidebar:ctx.unpin")}
                             </button>
                           )}
                           {shape.showArchive && (
@@ -1676,7 +1716,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Archive className="h-3.5 w-3.5 shrink-0" />
-                              Archive
+                              {t("sidebar:ctx.archive")}
                             </button>
                           )}
                           {shape.showUnarchive && (
@@ -1686,7 +1726,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Archive className="h-3.5 w-3.5 shrink-0" />
-                              Unarchive
+                              {t("sidebar:ctx.unarchive")}
                             </button>
                           )}
                           {shape.showSnooze && (
@@ -1696,7 +1736,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Moon className="h-3.5 w-3.5 shrink-0" />
-                              Snooze…
+                              {t("sidebar:ctx.snooze")}
                             </button>
                           )}
                           {shape.showUnsnooze && (
@@ -1706,7 +1746,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <Moon className="h-3.5 w-3.5 shrink-0" />
-                              Unsnooze
+                              {t("sidebar:ctx.unsnooze")}
                             </button>
                           )}
                           {/* Unlike the others, the unread toggle is always
@@ -1720,7 +1760,7 @@ export const SessionRow = memo(function SessionRow({
                               className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                             >
                               <CircleDot className="h-3.5 w-3.5 shrink-0" />
-                              {effectiveUnread ? "Mark as read" : "Mark as unread"}
+                              {effectiveUnread ? t("sidebar:ctx.markRead") : t("sidebar:ctx.markUnread")}
                             </button>
                           )}
                         </>
@@ -1732,7 +1772,7 @@ export const SessionRow = memo(function SessionRow({
                       data-testid="sidebar-context-menu-delete"
                       className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
                     >
-                      Delete
+                      {t("sidebar:ctx.delete")}
                     </button>
                   </>
                 )}
@@ -2531,24 +2571,6 @@ const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
   "repo+group": "repo",
 };
 
-const AXIS_HEADING: Record<SidebarAxis, string> = {
-  repo: "Sessions",
-  group: "Groups",
-  "repo+group": "Sessions",
-};
-
-const AXIS_TOOLTIP: Record<SidebarAxis, string> = {
-  repo: "Grouping: by repository",
-  group: "Grouping: by user group",
-  "repo+group": "Grouping: by repository, then user group",
-};
-
-const AXIS_ARIA: Record<SidebarAxis, string> = {
-  repo: "Group sessions by repository",
-  group: "Group sessions by user group",
-  "repo+group": "Group sessions by repository, then user group",
-};
-
 export function WorkspaceSidebar({
   groups,
   nestedGroups,
@@ -2583,6 +2605,11 @@ export function WorkspaceSidebar({
   axis,
   onAxisChange,
 }: Props) {
+  const { t } = useTranslation();
+  // Axis labels/aria are translated; map the 3 axes to catalog keys.
+  const axisTipKey =
+    axis === "repo" ? "axisTooltipRepo" : axis === "group" ? "axisTooltipGroup" : "axisTooltipRepoGroup";
+  const axisAriaKey = axis === "repo" ? "axisAriaRepo" : axis === "group" ? "axisAriaGroup" : "axisAriaRepoGroup";
   // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
   // control and the sort-picker options stay local to the sidebar; the active
   // plugin sort comparator itself is built and threaded by AppContent.
@@ -3090,13 +3117,17 @@ export function WorkspaceSidebar({
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
-            {AXIS_HEADING[axis]}
+            {axis === "group" ? t("sidebar:header.axisGroup") : t("sidebar:header.axisRepo")}
           </span>
-          <Tooltip text={AXIS_TOOLTIP[axis]}>
+          <Tooltip text={t(`sidebar:header.${axisTipKey}`)}>
             <button
               onClick={() => onAxisChange(NEXT_AXIS[axis])}
               aria-pressed={axis !== "repo"}
-              aria-label={axis === "repo" ? AXIS_ARIA[axis] : `${AXIS_ARIA[axis]}, currently pressed`}
+              aria-label={
+                axis === "repo"
+                  ? t(`sidebar:header.${axisAriaKey}`)
+                  : `${t(`sidebar:header.${axisAriaKey}`)}${t("sidebar:header.axisPressedSuffix")}`
+              }
               data-testid="sidebar-axis-toggle"
               data-axis={axis}
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
@@ -3114,12 +3145,12 @@ export function WorkspaceSidebar({
             onPluginSortChange={onPluginSortChange}
           />
           {facetSpecs.length > 0 && (
-            <Tooltip text="Plugin facets">
+            <Tooltip text={t("sidebar:header.pluginFacets")}>
               <button
                 onClick={() => setFacetOpen((o) => !o)}
                 aria-haspopup="true"
                 aria-expanded={facetOpen}
-                aria-label="Plugin facet filters"
+                aria-label={t("sidebar:header.pluginFacetFilters")}
                 data-testid="sidebar-facet-toggle"
                 className={`relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
                   activeFacets.length > 0 || facetOpen ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
@@ -3132,13 +3163,13 @@ export function WorkspaceSidebar({
               </button>
             </Tooltip>
           )}
-          <Tooltip text="Filter">
+          <Tooltip text={t("sidebar:header.filter")}>
             <button
               onClick={toggleFilter}
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
                 filterOpen ? "text-text-secondary" : "text-text-dim hover:text-text-secondary"
               }`}
-              aria-label="Filter sessions"
+              aria-label={t("sidebar:header.filterSessions")}
             >
               <svg
                 width="14"
@@ -3154,12 +3185,12 @@ export function WorkspaceSidebar({
               </svg>
             </button>
           </Tooltip>
-          <Tooltip text={offline ? OFFLINE_TITLE : "New project session"}>
+          <Tooltip text={offline ? OFFLINE_TITLE : t("sidebar:header.newProjectSession")}>
             <button
               onClick={onNew}
               disabled={offline}
               className="w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-              aria-label="New project session"
+              aria-label={t("sidebar:header.newProjectSession")}
             >
               <svg
                 width="16"
@@ -3195,7 +3226,7 @@ export function WorkspaceSidebar({
               onKeyDown={(e) => {
                 if (e.key === "Escape") toggleFilter();
               }}
-              placeholder="Filter by name, branch, agent..."
+              placeholder={t("sidebar:header.filterPlaceholder")}
               data-testid="sidebar-filter-input"
               className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
@@ -3477,7 +3508,7 @@ export function WorkspaceSidebar({
                       strokeLinejoin="round"
                     />
                   </svg>
-                  <span>Snoozed &amp; archived ({sunkWorkspaces.length})</span>
+                  <span>{t("sidebar:footer.snoozedArchived", { count: sunkWorkspaces.length })}</span>
                 </button>
                 {sunkExpanded &&
                   sunkWorkspaces.map((v) => (
@@ -3517,14 +3548,14 @@ export function WorkspaceSidebar({
 
           {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{filterQuery}&rdquo;</p>
+              <p className="text-sm text-text-muted">{t("sidebar:empty.noMatches", { q: filterQuery })}</p>
             </div>
           )}
 
           {!hasResults && !hasFilter && (
             <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
-              <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
-              <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
+              <p className="text-sm font-medium text-text-secondary">{t("sidebar:empty.noSessionsYet")}</p>
+              <p className="mt-1 text-[13px] text-text-muted">{t("sidebar:empty.emptyHint")}</p>
               <button
                 onClick={onNew}
                 disabled={offline}
@@ -3543,7 +3574,7 @@ export function WorkspaceSidebar({
                   <line x1="12" y1="5" x2="12" y2="19" />
                   <line x1="5" y1="12" x2="19" y2="12" />
                 </svg>
-                New session
+                {t("sidebar:empty.newSession")}
               </button>
             </div>
           )}
@@ -3563,8 +3594,8 @@ export function WorkspaceSidebar({
             onClick={onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
             className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Settings"
-            aria-label="Settings"
+            title={t("sidebar:footer.settings")}
+            aria-label={t("sidebar:footer.settings")}
           >
             <svg
               width="16"
