@@ -1,4 +1,5 @@
 import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Command, defaultFilter } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
 import { CheatOverlay } from "./CheatOverlay";
@@ -50,6 +51,7 @@ interface Props {
 }
 
 export function CommandPalette({ open, onClose, actions, onSearchChange, searching }: Props) {
+  const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const [search, setSearch] = useState("");
@@ -166,14 +168,14 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Command palette"
+      aria-label={t("shell:palette.label")}
       className="fixed inset-0 z-[60] flex items-start justify-center bg-black/80 backdrop-blur-sm animate-fade-in pt-[15vh] px-3"
       onClick={onClose}
       onKeyDown={onKeyDown}
       data-testid="command-palette-backdrop"
     >
       <Command
-        label="Command palette"
+        label={t("shell:palette.label")}
         loop
         filter={(value, searchText) => scoreValue(value, searchText)}
         className="w-full max-w-[600px] bg-surface-800 border border-surface-700/50 rounded-lg shadow-2xl overflow-hidden animate-slide-up"
@@ -198,7 +200,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
             ref={inputRef}
             value={search}
             onValueChange={handleSearchChange}
-            placeholder="Search actions, sessions, settings…"
+            placeholder={t("shell:palette.placeholder")}
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />
           <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
@@ -209,7 +211,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
         {tabs.length > 2 && (
           <div
             role="tablist"
-            aria-label="Result categories"
+            aria-label={t("shell:palette.categories")}
             className="flex items-center gap-1 px-2 h-9 border-b border-surface-700/50"
           >
             {tabs.map((tab) => (
@@ -225,7 +227,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                     : "text-text-muted hover:text-text-primary hover:bg-surface-700/50"
                 }`}
               >
-                {tab}
+                {t(`shell:palette.tab.${tab}`, tab)}
               </button>
             ))}
             <span className="flex-1" />
@@ -236,7 +238,9 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
         )}
 
         <Command.List className="max-h-[50vh] overflow-y-auto p-1">
-          <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">No matches</Command.Empty>
+          <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">
+            {t("shell:palette.noMatches")}
+          </Command.Empty>
 
           {visibleGroups.map((groupName) => {
             const items = grouped.get(groupName) ?? [];
@@ -247,7 +251,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
             return (
               <Command.Group
                 key={groupName}
-                heading={groupName}
+                heading={t(`shell:palette.tab.${groupName}`, groupName)}
                 className="mb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-text-muted"
               >
                 {showSpinner && (
@@ -257,7 +261,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                     className="flex items-center gap-2 px-3 h-9 rounded-md text-sm text-text-muted"
                   >
                     <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-text-muted border-t-transparent" />
-                    <span>Searching conversations…</span>
+                    <span>{t("shell:palette.searchingConversations")}</span>
                   </Command.Item>
                 )}
                 {items.map((action) => {
@@ -291,9 +295,11 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
         </Command.List>
 
         <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
-          <span>↑↓ navigate · ↵ select · esc close</span>
+          <span>{t("shell:palette.footerHint")}</span>
           <span>
-            {visibleCount} action{visibleCount === 1 ? "" : "s"}
+            {visibleCount === 1
+              ? t("shell:palette.countOne", { count: visibleCount })
+              : t("shell:palette.countOther", { count: visibleCount })}
           </span>
         </div>
       </Command>
