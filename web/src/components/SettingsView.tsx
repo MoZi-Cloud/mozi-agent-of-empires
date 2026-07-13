@@ -118,6 +118,7 @@ interface Props {
   tab: string | null;
   onSelectTab: (tab: TabId) => void;
   onServerAboutRefresh: () => Promise<void> | void;
+  onSettingsRefresh?: () => Promise<void> | void;
   /** Profile to preselect, sourced from the `?profile=` query so the
    *  Profiles page can deep-link into a specific profile's section. */
   profile?: string | null;
@@ -188,6 +189,7 @@ export function SettingsView({
   tab,
   onSelectTab,
   onServerAboutRefresh,
+  onSettingsRefresh = () => {},
   profile,
   onSelectProfile,
   readOnly,
@@ -468,6 +470,9 @@ export function SettingsView({
                 focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
+                onAfterSave={(descriptor) => {
+                  if (descriptor.field === "row_tag") return onSettingsRefresh();
+                }}
                 advancedSubtitle={t("settings:subtitle.session")}
               />
             )}
