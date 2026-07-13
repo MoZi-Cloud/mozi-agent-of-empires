@@ -1,5 +1,6 @@
 //! Session CRUD, ensure-* lifecycle endpoints, and per-file diff handlers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -11,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
+use crate::session::config::SessionConfig;
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
 use super::validate_display_label;
@@ -487,14 +489,43 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 /// given profile-resolved map. Built-in capability is handled separately
 /// in the constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
-fn custom_agent_acp_capable(
-    agent_acp_cmd: &std::collections::HashMap<String, String>,
-    tool: &str,
-) -> bool {
+fn custom_agent_acp_capable(agent_acp_cmd: &HashMap<String, String>, tool: &str) -> bool {
     agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
+
+/// Resolve the [`SessionConfig`] for `(profile, project_path)` through the
+/// caller-owned per-request cache, resolving from disk on first miss only.
+/// See the `session_cfg_cache` declaration in `list_sessions` for the
+/// sharing rationale. See #2603.
+fn resolve_session_cfg<'a>(
+    cache: &'a mut HashMap<(String, String), SessionConfig>,
+    profile: &str,
+    project_path: &str,
+) -> &'a SessionConfig {
+    cache
+        .entry((profile.to_string(), project_path.to_string()))
+        .or_insert_with(|| {
+            #[cfg(test)]
+            LIST_SESSIONS_RESOLVER_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::session::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(project_path),
+            )
+            .session
+        })
+}
+
+/// Test seam for the shared per-request cache invariant (#2603): bumped
+/// exactly once per unique `(profile, project_path)` that resolves through
+/// [`resolve_session_cfg`]. Mirrors the module-static test seam pattern used
+/// by [`crate::session::FAIL_NEXT_LIST_PROFILES`]. Readers must hold
+/// `#[serial_test::serial]`: a concurrent `list_sessions` call between reset
+/// and load would leak bumps into the assertion.
+#[cfg(test)]
+pub(crate) static LIST_SESSIONS_RESOLVER_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(serde::Serialize)]
 pub struct RecentProjectsResponse {
@@ -571,28 +602,28 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         })
         .collect();
 
+    // Shared per-request cache of the resolved `SessionConfig` keyed by
+    // (profile, project_path). Both the ACP-capability overlay (serve-only)
+    // and the smart-rename indicator overlay below fetch through this one
+    // cache, halving the disk reads the 3s sidebar poll does when the same
+    // pair appears in more than one row. See #2603.
+    let mut session_cfg_cache: HashMap<(String, String), SessionConfig> = HashMap::new();
+
     // Overlay custom-agent ACP capability (built-ins were resolved in the
-    // constructor). Cache by (profile, project_path) since repo-local
-    // config can override agent_acp_cmd, so each distinct pair is
-    // resolved at most once.
+    // constructor). Distinct `(profile, project_path)` pairs each resolve
+    // once via the shared cache above.
     #[cfg(feature = "serve")]
     {
-        use std::collections::HashMap;
-        let mut acp_cmd_cache: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             if resp.acp_capable {
                 continue;
             }
-            let key = (inst.source_profile.clone(), inst.project_path.clone());
-            let map = acp_cmd_cache.entry(key).or_insert_with(|| {
-                crate::session::repo_config::resolve_config_with_repo_or_warn(
-                    &inst.source_profile,
-                    std::path::Path::new(&inst.project_path),
-                )
-                .session
-                .agent_acp_cmd
-            });
-            resp.acp_capable = custom_agent_acp_capable(map, &inst.tool);
+            let cfg = resolve_session_cfg(
+                &mut session_cfg_cache,
+                &inst.source_profile,
+                &inst.project_path,
+            );
+            resp.acp_capable = custom_agent_acp_capable(&cfg.agent_acp_cmd, &inst.tool);
         }
     }
 
@@ -650,15 +681,14 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
 
     // Overlay the smart-rename indicator. `Running` comes from the live
     // in-flight set; `Pending` from the shared eligibility predicate, so the
-    // indicator cannot drift from the runtime gate. Config resolved once per
-    // (profile, project_path) so repo-local overrides are honored.
+    // indicator cannot drift from the runtime gate. Config is projected from
+    // the shared `session_cfg_cache` above so a repo-local override resolves
+    // once per unique `(profile, project_path)` across both overlays.
     {
         use crate::session::smart_rename::{
-            check_eligible_resolved, resolve_smart_rename_config, SmartRenameConfig,
-            SmartRenameState,
+            check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
         };
-        use std::collections::{HashMap, HashSet};
-        use std::path::Path;
+        use std::collections::HashSet;
         let inflight: HashSet<String> = state
             .smart_rename_inflight
             .lock()
@@ -669,7 +699,6 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let mut cfg_cache: HashMap<(String, String), SmartRenameConfig> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
@@ -681,19 +710,21 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             if attempted.contains(&inst.id) {
                 continue;
             }
-            let key = (inst.source_profile.clone(), inst.project_path.clone());
-            let cfg = cfg_cache.entry(key).or_insert_with(|| {
-                resolve_smart_rename_config(&inst.source_profile, Path::new(&inst.project_path))
-            });
+            let session_cfg = resolve_session_cfg(
+                &mut session_cfg_cache,
+                &inst.source_profile,
+                &inst.project_path,
+            );
+            let cfg = resolve_smart_rename_config(session_cfg);
             let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 cfg.setting_on,
                 &inst.title,
                 &inst.tool,
-                &cfg.rename_agent,
+                cfg.rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                &cfg.overrides,
+                cfg.overrides,
             )
             .is_ok();
             if eligible {
@@ -3642,6 +3673,10 @@ pub struct CreateSessionBody {
     pub group: String,
     #[serde(default)]
     pub yolo_mode: bool,
+    /// Explicit worktree opt-in. When omitted or false, legacy callers that
+    /// send `worktree_branch` still opt into worktree mode.
+    #[serde(default)]
+    pub worktree_enabled: bool,
     pub worktree_branch: Option<String>,
     #[serde(default)]
     pub create_new_branch: bool,
@@ -3718,6 +3753,14 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
+}
+
+fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
+    body.worktree_enabled || body.worktree_branch.is_some()
+}
+
+fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
+    body.scratch && create_body_uses_worktree(body)
 }
 
 /// Resolve the one-shot fork seed for a `fork_from` create request. A
@@ -4028,12 +4071,12 @@ pub async fn create_session(
     // wrong model for them. Reject the combination before reaching the
     // builder so misbehaving clients get a clear 400 instead of a
     // less-specific builder bail surfaced as 500.
-    if body.scratch && body.worktree_branch.is_some() {
+    if create_body_combines_scratch_and_worktree(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "validation_failed",
-                "message": "Cannot combine scratch with worktree_branch"
+                "message": "Cannot combine scratch with worktree mode"
             })),
         )
             .into_response();
@@ -4168,6 +4211,8 @@ pub async fn create_session(
             .into_response();
     }
 
+    let worktree_enabled = create_body_uses_worktree(&body);
+
     // Importing an existing Claude session (#2276) is tightly scoped: it
     // resumes a specific on-disk session id in its original cwd via the claude
     // structured agent. Reject any request that pairs the id with a different
@@ -4197,7 +4242,7 @@ pub async fn create_session(
         {
             return bad("Importing a Claude session requires the built-in claude agent");
         }
-        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
+        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() {
             return bad(
                 "Importing a Claude session cannot use scratch, a worktree, or extra repos",
             );
@@ -4328,7 +4373,6 @@ pub async fn create_session(
         )?;
 
         let title = body.title.unwrap_or_default();
-        let worktree_enabled = body.worktree_branch.is_some();
         let worktree_branch = body
             .worktree_branch
             .map(|b| b.trim().to_string())
@@ -6097,18 +6141,11 @@ mod tests {
     // the session's artifact dir, sets nosniff, and never serves HTML inline.
     mod artifact_route {
         use super::*;
+        use crate::session::test_support::isolate_app_dir;
         use axum::body::to_bytes;
         use axum::extract::Path as AxumPath;
         use axum::http::header;
         use serial_test::serial;
-
-        fn isolate_app_dir() -> tempfile::TempDir {
-            let tmp = tempfile::tempdir().expect("temp home");
-            std::env::set_var("HOME", tmp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-            tmp
-        }
 
         #[tokio::test]
         #[serial]
@@ -6203,6 +6240,51 @@ mod tests {
         inst
     }
 
+    // Regression witness for #2603: the ACP-capability overlay and the
+    // smart-rename indicator overlay share ONE per-request cache of the
+    // resolved `SessionConfig` keyed by (profile, project_path). Three
+    // instances covering two unique pairs must trigger exactly two calls
+    // into `resolve_config_with_repo_or_warn`, not three (per row) and not
+    // four (two independent per-overlay caches, the pre-#2603 state).
+    // A non-built-in tool is used so the ACP overlay does not short-circuit
+    // on the built-in registry (`SessionResponse` sets `acp_capable=true`
+    // in the constructor for built-ins, which would skip the resolver
+    // lookup and hide any regression in the ACP overlay).
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_sessions_shares_config_resolution_across_overlays() {
+        use std::sync::atomic::Ordering;
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        // SAFETY: serialized by `#[serial]`, matches other HOME-swapping tests.
+        unsafe {
+            std::env::set_var("HOME", tmp_home.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
+        }
+
+        let mk = |profile: &str, project_path: &str| {
+            let mut inst = Instance::new("test-session", project_path);
+            inst.tool = "custom-tool-2603".to_string();
+            inst.source_profile = profile.to_string();
+            inst
+        };
+        let a = mk("default", "/tmp/repo-a-2603");
+        let a2 = mk("default", "/tmp/repo-a-2603");
+        let b = mk("default", "/tmp/repo-b-2603");
+
+        let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
+
+        LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
+        let _envelope = list_sessions(axum::extract::State(state.clone())).await;
+        let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
+
+        assert_eq!(
+            misses, 2,
+            "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
+        );
+    }
+
     #[test]
     fn fork_from_builds_terminal_seed_for_claude() {
         // A non-structured (terminal) fork resolves through the shared
@@ -6242,6 +6324,57 @@ mod tests {
 
     fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
         serde_json::from_value(value).expect("valid CreateSessionBody")
+    }
+
+    #[test]
+    fn worktree_enabled_true_opts_in_without_branch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_enabled": true,
+        }));
+
+        assert!(create_body_uses_worktree(&body));
+        assert!(body.worktree_branch.is_none());
+    }
+
+    #[test]
+    fn worktree_branch_preserves_legacy_worktree_opt_in() {
+        let explicit = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_branch": "feat/api",
+        }));
+        assert!(create_body_uses_worktree(&explicit));
+
+        let empty = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "worktree_branch": "",
+        }));
+        assert!(create_body_uses_worktree(&empty));
+    }
+
+    #[test]
+    fn worktree_defaults_off_without_flag_or_branch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+        }));
+
+        assert!(!create_body_uses_worktree(&body));
+    }
+
+    #[test]
+    fn worktree_enabled_conflicts_with_scratch() {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "",
+            "tool": "claude",
+            "scratch": true,
+            "worktree_enabled": true,
+        }));
+
+        assert!(create_body_combines_scratch_and_worktree(&body));
     }
 
     #[test]

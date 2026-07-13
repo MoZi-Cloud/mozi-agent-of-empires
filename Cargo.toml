@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.12.0"
+version = "1.12.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -61,6 +61,9 @@ nucleo-matcher = "0.3"
 
 # Shell-style splitting of custom-agent ACP command strings into argv
 shell-words = "1.1"
+
+# Insertion-ordered id → Instance map for HomeView.instances.
+indexmap = "2"
 
 # Error handling
 thiserror = "2.0"
@@ -268,6 +271,12 @@ codegen-units = 16
 # builds. Use the default `dev` profile when you want the isolated
 # `-dev` namespace.
 debug-assertions = false
+
+[[test]]
+# ACP runner is part of the serve / structured-view surface.
+name = "acp_runner_orphan"
+path = "tests/acp_runner_orphan.rs"
+required-features = ["serve"]
 
 [[test]]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry

@@ -5,7 +5,7 @@ use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -67,6 +67,11 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
+    /// Trusted global/profile agent runtime overrides. Repo config does not
+    /// merge this section, because hook installation writes durable agent files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentRuntimeConfig>,
+
     /// Environment variables injected into the host command line for every
     /// session spawned at global scope. Entries are `KEY=value`, `KEY=$VAR`
     /// (read VAR from the host env), `KEY=$$literal` (escape a `$`), or
@@ -94,6 +99,14 @@ pub struct Config {
     /// keys still fail loudly while plugin enable-state survives every save.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRuntimeConfig {
+    /// Per-agent hook event to AoE status mapping. Overrides built-in hook
+    /// defaults by event name when status hooks are installed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status_map: BTreeMap<String, crate::agents::HookStatus>,
 }
 
 /// Configuration for one plugin: whether it is enabled, its install source and
@@ -1112,9 +1125,9 @@ pub struct SessionConfig {
     #[setting(label = "Restart Wake Message", widget = "text")]
     pub restart_wake_message: String,
 
-    /// What to show next to each session title: Auto (profile in all-profiles
-    /// view), None, Profile (always), Sandbox (sb on sandboxed rows), or
-    /// Branch.
+    /// What to show next to each session title: Branch (default), Auto
+    /// (profile in all-profiles view), None, Profile (always), or Sandbox
+    /// (sb on sandboxed rows).
     #[serde(default)]
     #[setting(
         label = "Row Tag",
@@ -1362,16 +1375,13 @@ pub enum NewSessionAttachMode {
 
 /// What to render in the per-row tag slot next to the session title.
 ///
-/// Defaults to `None` so existing users see no behavior change. Power
-/// users opt in via Settings: pick `Auto` (profile tag in all-profiles
-/// view only), `Profile`, `Sandbox`, or `Branch`.
+/// Defaults to `Branch` to preserve worktree branch visibility. Users can pick
+/// `None` to hide the suffix, `Auto` for profile tags in all-profiles view,
+/// `Profile`, or `Sandbox`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowTagMode {
-    /// Never render a per-row tag. The historical behavior on `main`
-    /// before the row-tag feature landed; default so the feature is
-    /// fully opt-in.
-    #[default]
+    /// Never render suffix metadata next to the session title.
     None,
     /// Show the profile short code in all-profiles view, nothing in
     /// filtered views.
@@ -1380,8 +1390,8 @@ pub enum RowTagMode {
     Profile,
     /// Render `sb` on sandboxed sessions, nothing on host sessions.
     Sandbox,
-    /// Render the worktree branch name (last segment if `/`-namespaced,
-    /// truncated to 8 chars).
+    /// Render the worktree or workspace branch name, compacted into the row tag.
+    #[default]
     Branch,
 }
 
@@ -1931,11 +1941,6 @@ pub struct WorktreeConfig {
     )]
     pub auto_cleanup: bool,
 
-    /// Show the worktree branch name in the TUI session list.
-    #[serde(default = "default_true")]
-    #[setting(label = "Show Branch in TUI", widget = "toggle", advanced)]
-    pub show_branch_in_tui: bool,
-
     /// Also delete the git branch when deleting a worktree. Default: false
     /// (unchecked in the delete dialog).
     #[serde(default)]
@@ -2002,7 +2007,6 @@ impl Default for WorktreeConfig {
             path_template: default_worktree_template(),
             bare_repo_path_template: default_bare_repo_template(),
             auto_cleanup: true,
-            show_branch_in_tui: true,
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
             init_submodules: true,
@@ -2825,7 +2829,6 @@ mod tests {
         assert!(!wt.enabled);
         assert_eq!(wt.path_template, "../{repo-name}-worktrees/{branch}");
         assert!(wt.auto_cleanup);
-        assert!(wt.show_branch_in_tui);
         assert!(
             wt.init_submodules,
             "init_submodules must default to true to preserve #942 behavior"
@@ -2838,14 +2841,12 @@ mod tests {
             enabled = true
             path_template = "/custom/{branch}"
             auto_cleanup = false
-            show_branch_in_tui = false
             init_submodules = false
         "#;
         let wt: WorktreeConfig = toml::from_str(toml).unwrap();
         assert!(wt.enabled);
         assert_eq!(wt.path_template, "/custom/{branch}");
         assert!(!wt.auto_cleanup);
-        assert!(!wt.show_branch_in_tui);
         assert!(!wt.init_submodules);
     }
 
@@ -3013,6 +3014,22 @@ mod tests {
         let toml = "default_tool = \"claude\"\n";
         let session: SessionConfig = toml::from_str(toml).unwrap();
         assert!(session.show_tips);
+    }
+
+    #[test]
+    fn test_session_config_row_tag_defaults_to_branch() {
+        let session: SessionConfig = toml::from_str("").unwrap();
+        assert_eq!(session.row_tag, RowTagMode::Branch);
+    }
+
+    #[test]
+    fn test_session_config_row_tag_roundtrip() {
+        let session: SessionConfig = toml::from_str("row_tag = \"none\"\n").unwrap();
+        assert_eq!(session.row_tag, RowTagMode::None);
+
+        let serialized = toml::to_string(&session).unwrap();
+        let reparsed: SessionConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.row_tag, RowTagMode::None);
     }
 
     // Full config serialization roundtrip
@@ -3314,6 +3331,38 @@ mod tests {
             }),
             "acp_defaults should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn agent_status_map_roundtrips() {
+        let mut config = Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Stop".to_string(), crate::agents::HookStatus::Error);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[agents.claude.status_map]"));
+        assert!(serialized.contains("Stop = \"error\""));
+
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.agents["claude"].status_map.get("Stop"),
+            Some(&crate::agents::HookStatus::Error)
+        );
+    }
+
+    #[test]
+    fn agent_status_map_rejects_invalid_status() {
+        let toml = r#"
+            [agents.claude.status_map]
+            Stop = "stopped"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("stopped"));
     }
 
     #[test]

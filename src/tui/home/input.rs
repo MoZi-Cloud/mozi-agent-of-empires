@@ -2857,7 +2857,7 @@ impl HomeView {
     /// to borrow a path from), leaving the dialog on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
         self.instances
-            .iter()
+            .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
                 _ => {
@@ -3242,11 +3242,40 @@ impl HomeView {
         }
     }
 
+    fn jump_to_session_id(&mut self, id: &str) {
+        if let Some(idx) = self
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))
+        {
+            self.cursor = idx;
+            self.update_selected();
+            return;
+        }
+
+        let previous = self.selected_session.clone();
+        self.select_and_reveal_session(id);
+        if self.selected_session != previous {
+            self.preview_scroll_offset = 0;
+            self.manual_unread_hold = None;
+        }
+    }
+
     fn jump_to_next_waiting(&mut self) {
         let len = self.flat_items.len();
         if len == 0 {
             return;
         }
+
+        let visible_sessions: std::collections::HashSet<String> = self
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                Item::Group { .. } => None,
+            })
+            .collect();
+        let current_session = self.selected_session.clone();
 
         // Pass 1: forward-walk from cursor+1, wrapping, for the next Waiting
         // session OR a freshly-stopped Idle session (within
@@ -3262,15 +3291,39 @@ impl HomeView {
                 _ => continue,
             };
             if let Some(inst) = self.get_instance(&id) {
-                let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window)
-                    || (crate::session::unread_enabled() && inst.is_unread());
+                // Trashed rows are stopped and only surface under the collapsed
+                // Trash section; they never "need attention", so skip them even
+                // when a stale unread flag survived the trash (#2489).
+                let is_actionable = !inst.is_trashed()
+                    && (inst.status == Status::Waiting
+                        || matches!(inst.idle_age(), Some(age) if age < window)
+                        || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {
-                    self.cursor = idx;
-                    self.update_selected();
+                    self.jump_to_session_id(&id);
                     return;
                 }
             }
+        }
+
+        let hidden_actionable = self
+            .instances
+            .values()
+            .find(|inst| {
+                if visible_sessions.contains(&inst.id)
+                    || current_session.as_deref() == Some(inst.id.as_str())
+                    || inst.is_archived()
+                    || inst.is_trashed()
+                {
+                    return false;
+                }
+                inst.status == Status::Waiting
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread())
+            })
+            .map(|inst| inst.id.clone());
+        if let Some(id) = hidden_actionable {
+            self.jump_to_session_id(&id);
+            return;
         }
 
         // Pass 2: fall back to the most-recently-accessed Idle session, skipping
@@ -3288,6 +3341,9 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
+            if inst.is_trashed() {
+                continue;
+            }
             if inst.status != Status::Idle {
                 continue;
             }
@@ -3306,8 +3362,40 @@ impl HomeView {
         }
 
         if let Some((idx, _)) = best {
-            self.cursor = idx;
-            self.update_selected();
+            let id = match self.flat_items.get(idx) {
+                Some(Item::Session { id, .. }) => id.clone(),
+                _ => return,
+            };
+            self.jump_to_session_id(&id);
+            return;
+        }
+
+        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        for inst in self.instances.values() {
+            if visible_sessions.contains(&inst.id)
+                || current_session.as_deref() == Some(inst.id.as_str())
+                || inst.is_archived()
+                || inst.is_trashed()
+                || inst.status != Status::Idle
+            {
+                continue;
+            }
+            let ts = inst.last_accessed_at;
+            let beats = match best_hidden {
+                None => true,
+                Some((_, b)) => match (ts, b) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+            if beats {
+                best_hidden = Some((inst.id.clone(), ts));
+            }
+        }
+
+        if let Some((id, _)) = best_hidden {
+            self.jump_to_session_id(&id);
             return;
         }
 
@@ -4543,7 +4631,7 @@ impl HomeView {
             let prefix = format!("{}/", group_path);
             let session_count = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| {
                     (i.group_path == *group_path || i.group_path.starts_with(&prefix))
                         && owning_profile

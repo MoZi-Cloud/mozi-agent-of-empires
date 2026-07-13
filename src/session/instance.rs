@@ -293,11 +293,19 @@ fn default_true() -> bool {
     true
 }
 
-fn status_hook_env_prefix(instance_id: &str, agent: Option<&crate::agents::AgentDef>) -> String {
+fn status_hook_env_prefix(
+    profile: &str,
+    instance_id: &str,
+    agent: Option<&crate::agents::AgentDef>,
+) -> String {
     let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
-        format!("AOE_INSTANCE_ID={} ", instance_id)
+        format!(
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} ",
+            shell_escape(profile),
+            shell_escape(instance_id)
+        )
     } else {
         String::new()
     }
@@ -685,15 +693,21 @@ pub struct Instance {
     pub last_error_check: Option<std::time::Instant>,
     #[serde(skip)]
     pub last_start_time: Option<std::time::Instant>,
-    /// Last status a caller has actually observed live (as opposed to
-    /// whatever `status` happens to hold after a fresh disk load). `None`
-    /// means no live observation has happened yet for this in-memory
-    /// object, so `update_status_with_metadata` must not treat a mismatch
-    /// against a possibly-stale disk-loaded `status` as a real transition.
-    /// See #2690: comparing against disk `status` directly caused every
-    /// restart (TUI relaunch, daemon reload) to misdetect "disk hasn't
-    /// caught up yet" as "just transitioned now", clobbering
-    /// `idle_entered_at`/`last_accessed_at`.
+    /// Last status a caller has actually observed live, as distinct from
+    /// the disk-loaded `status` field. `None` means no live observation
+    /// exists yet for this in-memory object, so
+    /// [`Self::update_status_with_metadata`] seeds the baseline on its
+    /// first call without restamping. Every fresh disk load (TUI
+    /// relaunch, daemon tick) starts with `None` because of
+    /// `#[serde(skip)]`, and [`Instance::new`] also starts with `None` so
+    /// in-memory and disk-loaded paths have the same first-check
+    /// semantics. See #2690.
+    ///
+    /// The `#[serde(skip)]` + `Instance::new`-time `None` seed rely on
+    /// construction-ordering: [`Instance::new`] is called before the
+    /// instance enters any shared state (`state.instances`, `Storage`),
+    /// so a poll thread cannot observe it mid-construction. Safety here
+    /// is by construction-ordering, not by synchronization.
     #[serde(skip)]
     pub live_status_baseline: Option<Status>,
     #[serde(skip)]
@@ -1017,7 +1031,29 @@ fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, sessi
 /// [`Instance::merge_passive_status_patch`]. `pub(crate)`: this is an
 /// internal wire format between the pollers and `merge_passive_status_patch`,
 /// not a stable type for out-of-tree consumers.
-#[derive(Debug, Clone)]
+///
+/// ## Poller vocabulary (#2690 follow-up)
+///
+/// - **passive status**: a status transition detected by a background
+///   poller from tmux pane state or ACP overlay, not by an explicit user
+///   action.
+/// - **passive status patch**: a minimal `PassiveStatusPatch` carrying
+///   the fields a passive-status writer touches (`status`,
+///   `idle_entered_at`, `last_accessed_at`), applied on disk via
+///   [`Instance::merge_passive_status_patch`].
+/// - **live status baseline**: the last `Status` a caller has actually
+///   observed live for an in-memory `Instance`. Held on
+///   `Instance::live_status_baseline` (`#[serde(skip)]`). `None` means
+///   no live observation exists yet, so
+///   [`Instance::update_status_with_metadata`] seeds it on the first
+///   call without restamping.
+/// - **detected status**: the `Status` a poller reads from tmux / ACP /
+///   sandbox liveness on a single call. Distinct from the disk-loaded
+///   `Instance::status`, which can be stale by up to one tick.
+/// - **poller-authoritative status**: for plain-tmux sessions, the poller
+///   owns `Instance::status`. For structured/ACP sessions,
+///   `apply_acp_overlay_inplace` is the authority; see its docstring.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveStatusPatch {
     pub id: String,
     pub status: Status,
@@ -1027,15 +1063,14 @@ pub(crate) struct PassiveStatusPatch {
     /// rather than fabricating a stamp, or a session that transitions
     /// status before anyone ever attaches would gain a spurious
     /// `last_accessed_at` and break the "`None` = never touched" contract
-    /// idle-reap and the freshness sort rely on.
+    /// that idle-reap and the freshness sort rely on.
     pub last_accessed_at: Option<DateTime<Utc>>,
 }
 
 impl PassiveStatusPatch {
     /// Build a patch from the current state of `inst`, as observed by a
-    /// background poller. Single construction site for both the TUI and
-    /// daemon pollers, so the `last_accessed_at` None-preservation policy
-    /// lives in one place.
+    /// background poller. The `last_accessed_at` None-preservation
+    /// contract is on [`Self::last_accessed_at`].
     pub(crate) fn from_instance(inst: &Instance) -> Self {
         Self {
             id: inst.id.clone(),
@@ -1095,12 +1130,7 @@ impl Instance {
             fork_pending: None,
             last_error_check: None,
             last_start_time: None,
-            // A freshly constructed (not deserialized) Instance has a
-            // known-good live status right now: itself. Seeding the
-            // baseline here means the first real transition after
-            // creation restamps normally instead of being swallowed as
-            // a "no live history yet" seed.
-            live_status_baseline: Some(Status::Idle),
+            live_status_baseline: None,
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
@@ -1362,20 +1392,33 @@ impl Instance {
     /// sole authority on detected agent status, and gating them on the
     /// `last_accessed_at` comparison would let an unrelated peer touch
     /// strand a real status transition on disk until the next one. See
-    /// #2690, #2697.
+    /// #2690.
+    ///
+    /// The `>=` guard on `last_accessed_at` compares `chrono::Utc::now()`
+    /// values, which delegate to `SystemTime::now()` (wall clock, not
+    /// monotonic). Under an NTP rewind, a genuinely newer live observation
+    /// stamped after the rewind can compare less than a value stamped
+    /// before it and be silently dropped. Best-effort monotone, not a hard
+    /// guarantee; the next poll tick converges regardless.
+    ///
+    /// A `last_accessed_at` older-or-equal to disk is silently dropped
+    /// (the `>=` guard) with a `session.store` debug log at drop time,
+    /// while `status` and `idle_entered_at` still apply unconditionally.
+    /// Callers relying on the observable `last_accessed_at` change must
+    /// re-read the field after `merge_passive_status_patch` returns.
     pub(crate) fn merge_passive_status_patch(&mut self, patch: &PassiveStatusPatch) {
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
         let Some(incoming) = patch.last_accessed_at else {
             return;
         };
-        if self.last_accessed_at.is_some_and(|disk| disk > incoming) {
+        if self.last_accessed_at.is_some_and(|disk| disk >= incoming) {
             tracing::debug!(
                 target: "session.store",
                 session_id = %patch.id,
                 disk_ts = ?self.last_accessed_at,
-                patch_ts = ?patch.last_accessed_at,
-                "dropped stale passive status patch's last_accessed_at (status/idle_entered_at still applied)"
+                patch_ts = %incoming,
+                "dropped passive status patch's last_accessed_at as a no-op (disk value is at least as recent; status/idle_entered_at still applied)"
             );
             return;
         }
@@ -2537,7 +2580,13 @@ impl Instance {
                 sandbox,
                 std::path::Path::new(&self.project_path),
             );
-            let docker_args = format!("{} -e AOE_INSTANCE_ID={}", env_info.docker_args, self.id);
+            let profile = self.effective_profile();
+            let docker_args = format!(
+                "{} -e AOE_PROFILE={} -e AOE_INSTANCE_ID={}",
+                env_info.docker_args,
+                shell_escape(&profile),
+                shell_escape(&self.id)
+            );
             let env_part = format!("{} ", docker_args);
             let wrapped =
                 wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
@@ -2594,30 +2643,48 @@ impl Instance {
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
-        let session_cfg = super::profile_config::resolve_config_or_warn(&profile).session;
-        if !session_cfg.agent_status_hooks {
+        let config = super::profile_config::resolve_config_or_warn(&profile);
+        if !config.session.agent_status_hooks {
             return;
         }
-        if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
-            // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
-            // install into a host config file; sandbox install is handled by
-            // build_container_config. host_only agents (settl) are never
-            // sandboxed, so the gate is a no-op for them.
-            if !self.is_sandboxed() {
-                if let Some(home) = dirs::home_dir() {
-                    self.install_sidecar_host_hooks(sidecar, &home, &session_cfg);
-                }
-            }
-        } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-            if !self.is_sandboxed() {
-                match hook_cfg.format {
-                    crate::agents::HookFormat::CodexJson => self.install_codex_host_hooks(hook_cfg),
-                    crate::agents::HookFormat::JsonSettings => {
-                        self.install_json_host_hooks(hook_cfg)
+        if let Some(agent) = agent {
+            if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+                let events = match crate::agents::resolved_sidecar_hook_events(agent, &config) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
+                        return;
+                    }
+                };
+                // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
+                // install into a host config file; sandbox install is handled by
+                // build_container_config. host_only agents (settl) are never
+                // sandboxed, so the gate is a no-op for them.
+                if !self.is_sandboxed() {
+                    if let Some(home) = dirs::home_dir() {
+                        self.install_sidecar_host_hooks(sidecar, &home, &config.session, &events);
                     }
                 }
+            } else if let Some(hook_cfg) = agent.hook_config.as_ref() {
+                let events = match crate::agents::resolved_hook_events(agent, &config) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
+                        return;
+                    }
+                };
+                if !self.is_sandboxed() {
+                    match hook_cfg.format {
+                        crate::agents::HookFormat::CodexJson => {
+                            self.install_codex_host_hooks(&events)
+                        }
+                        crate::agents::HookFormat::JsonSettings => {
+                            self.install_json_host_hooks(hook_cfg, &events)
+                        }
+                    }
+                }
+                // Sandboxed sessions install via build_container_config.
             }
-            // Sandboxed sessions install via build_container_config.
         }
     }
 
@@ -2631,6 +2698,7 @@ impl Instance {
         sidecar: &'static crate::agents::SidecarHooks,
         home: &Path,
         session_cfg: &super::config::SessionConfig,
+        events: &[crate::agents::ResolvedHookEvent],
     ) {
         if session_cfg.merge_hooks_into_selected_agent {
             if let Some(sel) = sidecar.selected_agent_hooks.as_ref() {
@@ -2649,7 +2717,7 @@ impl Instance {
                             .unwrap_or(Path::new(".")),
                     );
                     let path = (sel.resolve_config_file)(&agents_dir, &name);
-                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host) {
+                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host, events) {
                         Ok(()) => tracing::info!(target: "session.store",
                             "Installed AoE status hooks into {} agent '{}' at {}", self.tool, name, path.display()),
                         Err(e) => tracing::warn!(target: "session.store",
@@ -2661,7 +2729,7 @@ impl Instance {
         }
 
         let config_path = home.join(sidecar.host_config_subpath);
-        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
+        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
             Ok(()) => {
                 tracing::info!(target: "session.store",
                     "Installed AoE status hooks for {} via standalone hooks agent", self.tool);
@@ -2674,24 +2742,30 @@ impl Instance {
         }
     }
 
-    fn install_codex_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+    fn install_codex_host_hooks(&self, events: &[crate::agents::ResolvedHookEvent]) {
         match crate::hooks::codex_hooks_json_path_for_host_environment(
             &self.profile_host_environment(),
         ) {
             Ok(hooks_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &hooks_path,
-                    hook_cfg.events,
+                    events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
-                    tracing::warn!("Failed to install codex hooks: {}", e);
+                    tracing::warn!(target: "session.store", "Failed to install codex hooks: {}", e);
                 }
             }
-            Err(e) => tracing::warn!("Failed to resolve codex hooks path: {}", e),
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to resolve codex hooks path: {}", e)
+            }
         }
     }
 
-    fn install_json_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+    fn install_json_host_hooks(
+        &self,
+        hook_cfg: &crate::agents::AgentHookConfig,
+        events: &[crate::agents::ResolvedHookEvent],
+    ) {
         // Install hooks in the agent's host settings file, honoring a
         // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
         // land where the agent actually reads them.
@@ -2702,7 +2776,7 @@ impl Instance {
             Ok(settings_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &settings_path,
-                    hook_cfg.events,
+                    events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
                     tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
@@ -2747,7 +2821,8 @@ impl Instance {
             }
         }
 
-        let mut env_prefix = status_hook_env_prefix(&self.id, agent);
+        let profile = self.effective_profile();
+        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -3134,7 +3209,7 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            container_config::refresh_agent_configs();
+            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             self.backfill_container_workdir(&container);
             return Ok(container);
         }
@@ -3143,7 +3218,7 @@ impl Instance {
             // Restart of a stopped container is a come-up: refresh so a
             // short-lived token is re-minted.
             self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs();
+            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
             container.start()?;
             self.backfill_container_workdir(&container);
             return Ok(container);
@@ -4106,28 +4181,22 @@ impl Instance {
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
     ///
     /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
-    /// status differs from `live_status_baseline`, the last status this
-    /// in-memory object actually observed live, NOT `self.status` as loaded.
-    /// `self.status` can be a stale disk snapshot right after a fresh load
-    /// (TUI relaunch, or every tick of the daemon's `status_poll_loop`,
-    /// which reloads instances from disk every cycle); comparing against it
-    /// misreads "disk hasn't caught up yet" as "just transitioned now" and
-    /// clobbers the timestamps every time disk and live detection disagree.
-    /// `live_status_baseline == None` means no live observation exists yet,
-    /// so the first check seeds the baseline without restamping. See #2690.
+    /// status differs from [`Self::live_status_baseline`]. The baseline
+    /// invariant lives on the field itself; this method's job is the
+    /// guard shape (baseline vs. newly detected). Every call re-seeds the
+    /// baseline at exit, so the next call compares against a value this
+    /// method itself wrote.
     pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
         let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata);
-        if let Some(prev_status) = baseline {
-            if self.status != prev_status {
-                let now = Utc::now();
-                self.last_accessed_at = Some(now);
-                self.idle_entered_at = if self.status == Status::Idle {
-                    Some(now)
-                } else {
-                    None
-                };
-            }
+        if baseline.is_some_and(|prev| prev != self.status) {
+            let now = Utc::now();
+            self.last_accessed_at = Some(now);
+            self.idle_entered_at = if self.status == Status::Idle {
+                Some(now)
+            } else {
+                None
+            };
         }
         self.live_status_baseline = Some(self.status);
     }
@@ -4711,8 +4780,8 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("abc123", agent),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", agent),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
     }
 
@@ -5659,7 +5728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_applies() {
+    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_is_a_noop() {
         let mut disk = Instance::new("session", "/tmp/test");
         let ts = Utc::now();
         disk.last_accessed_at = Some(ts);
@@ -5672,11 +5741,11 @@ mod tests {
         };
         disk.merge_passive_status_patch(&patch);
 
-        assert_eq!(
-            disk.last_accessed_at,
-            Some(ts),
-            "equal timestamps must apply (guard is strict >, not >=)"
-        );
+        // Guard is `>=`: equal timestamps are not a real advance, so the
+        // patch's last_accessed_at is dropped. The observable value stays
+        // equal to `ts` either way (disk == incoming), so the assertion
+        // does not change; the point of the guard is skipping the write.
+        assert_eq!(disk.last_accessed_at, Some(ts));
     }
 
     #[test]
@@ -5918,6 +5987,59 @@ mod tests {
             "second restamp must not be older than the first"
         );
         assert_eq!(inst.live_status_baseline, Some(Status::Idle));
+    }
+
+    #[test]
+    fn test_instance_new_seeds_live_status_baseline_none() {
+        // #2690 follow-up. A freshly constructed Instance has no live
+        // observation yet. Seeding `Some(Status::Idle)` here was the root
+        // cause of the false restamp on the first poll after
+        // `finalize_launch`: the baseline claimed "I saw Idle" while
+        // `finalize_launch` (and other post-construction status writers)
+        // advanced `status` to Starting without touching baseline, so the
+        // wrapper's next call read `baseline=Some(Idle) != status=Starting`
+        // and stamped `last_accessed_at` on a session no user ever
+        // touched. Uniform `None` matches the disk-load path (which is
+        // `None` because of `#[serde(skip)]`) so both paths seed on the
+        // first poll rather than restamping.
+        let inst = Instance::new("test", "/tmp/test");
+        assert_eq!(inst.live_status_baseline, None);
+    }
+
+    #[test]
+    fn test_first_poll_after_status_write_does_not_fabricate_last_accessed_at() {
+        // #2690 follow-up regression lock. Reproduces the pre-fix bug:
+        // `Instance::new` used to seed `live_status_baseline: Some(Idle)`,
+        // then a post-construction status writer (like `finalize_launch`)
+        // advanced `status` to Starting WITHOUT touching baseline. The
+        // very first poll then read a stale baseline, treated the
+        // detected-status mismatch as a "genuine transition", and stamped
+        // `last_accessed_at` for a session the user never touched.
+        //
+        // Under the fix (`Instance::new` seeds `None`), the first poll
+        // seeds baseline from the detected status and does NOT restamp;
+        // `last_accessed_at` stays `None` for a truly untouched session.
+        //
+        // The assertion is guard-only: whatever `update_status_with_metadata_inner`
+        // resolves `status` to (`Error` in the no-tmux path, could be a
+        // different value if `_inner` grows a new branch), the wrapper's
+        // `baseline.is_some_and(...)` guard at
+        // [`Self::update_status_with_metadata`] short-circuits on
+        // `baseline == None`, so no restamp path runs. A future refactor
+        // of `_inner` cannot silently weaken the lock; only a change to
+        // the wrapper's guard shape can.
+        let mut inst = Instance::new("test", "/tmp/test");
+        assert_eq!(inst.last_accessed_at, None, "fixture invariant");
+        // Simulate any post-construction status writer, `finalize_launch`
+        // being the canonical one (`src/session/instance.rs`).
+        inst.status = Status::Starting;
+
+        inst.update_status_with_metadata(None);
+
+        assert_eq!(
+            inst.last_accessed_at, None,
+            "first poll must not fabricate a `last_accessed_at` on an untouched session"
+        );
     }
 
     #[test]
@@ -7048,24 +7170,24 @@ mod tests {
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("hermes")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("settl")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("claude")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", crate::agents::get_agent("kiro")),
-            "AOE_INSTANCE_ID=abc123 "
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
     }
 

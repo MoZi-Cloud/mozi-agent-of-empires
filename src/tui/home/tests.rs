@@ -21,6 +21,10 @@ fn setup_test_home(temp: &TempDir) {
     std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 }
 
+fn seed_instances(view: &mut HomeView, insts: &[Instance]) {
+    view.instances = insts.iter().cloned().map(|i| (i.id.clone(), i)).collect();
+}
+
 struct TestEnv {
     _temp: TempDir,
     view: HomeView,
@@ -502,7 +506,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     use ratatui::Terminal;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
     env.view.view_mode = ViewMode::Structured;
     let theme = load_theme("empire");
@@ -580,7 +584,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     use ratatui::Terminal;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
     env.view.view_mode = ViewMode::Structured;
     env.view.show_preview_info = true;
@@ -617,7 +621,7 @@ fn unread_dot_yields_to_a_running_status() {
     use ratatui::Terminal;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     let theme = load_theme("empire");
 
     let render = |env: &mut TestEnv| -> String {
@@ -670,7 +674,7 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
 
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     let theme = load_theme("empire");
 
     let render = |env: &mut TestEnv| -> String {
@@ -757,7 +761,7 @@ fn unread_dwell_clears_after_threshold() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
         inst.mark_unread();
@@ -790,7 +794,7 @@ fn manual_unread_survives_same_visit_dwell() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
     });
@@ -824,8 +828,8 @@ fn manual_unread_clears_after_leave_and_return() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
-    let a = env.view.instances()[0].id.clone();
-    let b = env.view.instances()[1].id.clone();
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
     for id in [&a, &b] {
         env.view.mutate_instance(id, |inst| {
             inst.status = crate::session::Status::Idle;
@@ -871,7 +875,7 @@ fn manual_hold_released_on_engagement_lets_auto_clear() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances()[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
     });
@@ -909,8 +913,8 @@ fn unread_dwell_resets_on_selection_change() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
-    let a = env.view.instances()[0].id.clone();
-    let b = env.view.instances()[1].id.clone();
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
     for id in [&a, &b] {
         env.view.mutate_instance(id, |inst| {
             inst.status = crate::session::Status::Idle;
@@ -1106,12 +1110,45 @@ fn test_b_opens_project_session_picker_when_projects_exist() {
 
 #[test]
 #[serial]
-fn test_b_shows_info_dialog_when_no_projects() {
+fn test_b_opens_project_add_flow_when_no_projects() {
     let mut env = create_test_env_empty();
-    assert!(env.view.info_dialog.is_none());
+    let project_dir = env._temp.path().join("plain-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let profile = env.view.config_profile();
+
     env.view.handle_key(key(KeyCode::Char('b')), None);
-    assert!(env.view.info_dialog.is_some());
     assert!(env.view.project_session_picker_dialog.is_none());
+    assert!(env.view.info_dialog.is_none());
+    assert!(env.view.projects_dialog.is_some());
+
+    for ch in project_dir.to_string_lossy().chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    let canonical = project_dir
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let projects = crate::session::projects::load_merged(&profile).unwrap();
+    assert!(
+        projects.iter().any(|p| p.path == canonical),
+        "b empty-state add flow should register the typed path"
+    );
+}
+
+#[test]
+#[serial]
+fn test_b_empty_project_add_flow_escape_closes_dialog() {
+    let mut env = create_test_env_empty();
+
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.projects_dialog.is_some());
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.projects_dialog.is_none());
+    assert!(env.view.info_dialog.is_none());
 }
 
 #[test]
@@ -1983,7 +2020,7 @@ fn hovering_footer_tips_badge_sets_hover_state() {
 #[serial]
 fn earned_new_from_selection_tip_pops_after_repeated_n_with_selection() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id);
     let before = env.view.tips_unseen;
 
@@ -2024,7 +2061,7 @@ fn earned_tip_does_not_pop_when_tips_disabled() {
     use crate::tui::dialogs::TipsOutcome;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id);
     env.view.persist_tips_outcome(TipsOutcome {
         newly_seen: vec![],
@@ -2047,7 +2084,7 @@ fn earned_tip_does_not_pop_when_tips_disabled() {
 #[serial]
 fn using_n_suppresses_the_earned_tip() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id);
     // Earn the tip (badge showing) without queueing a pop.
     earn_tip(&mut env);
@@ -2150,7 +2187,7 @@ fn test_has_dialog_returns_true_for_rename_dialog() {
 #[serial]
 fn test_select_session_by_id() {
     let mut env = create_test_env_with_sessions(3);
-    let session_id = env.view.instances()[1].id.clone();
+    let session_id = env.view.instance_at(1).id.clone();
 
     assert_eq!(env.view.cursor, 0);
 
@@ -2541,6 +2578,53 @@ fn create_test_env_with_group_sessions() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+/// Trashing and restoring a session through the view's own actions keeps the
+/// group header count in step with the rows, since both are rebuilt from the
+/// same predicate. Guards against the count and the visible rows drifting.
+#[test]
+#[serial]
+fn group_header_count_tracks_trash_and_restore() {
+    let mut env = create_test_env_with_group_sessions();
+    env.view.trashed_section_collapsed = false;
+
+    let work_count = |env: &TestEnv| -> usize {
+        env.view
+            .flat_items
+            .iter()
+            .find_map(|i| match i {
+                Item::Group {
+                    path,
+                    session_count,
+                    ..
+                } if path == "work" => Some(*session_count),
+                _ => None,
+            })
+            .expect("work group header present")
+    };
+
+    // "work" holds two direct sessions plus one in the nested "work/projects".
+    assert_eq!(work_count(&env), 3);
+
+    let target = env
+        .view
+        .instances
+        .values()
+        .find(|i| i.group_path == "work")
+        .map(|i| i.id.clone())
+        .expect("a direct work session");
+
+    env.view.trash_session_by_id(&target);
+    assert_eq!(
+        work_count(&env),
+        2,
+        "trashed session drops out of the count"
+    );
+
+    env.view.select_session_by_id(&target);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert_eq!(work_count(&env), 3, "restored session returns to the count");
+}
+
 #[test]
 #[serial]
 fn test_group_has_managed_worktrees() {
@@ -2752,7 +2836,6 @@ fn test_archive_selected_group_widened_teardown_persists_synchronously() {
         let inst = env
             .view
             .instances()
-            .iter()
             .find(|i| &i.id == id)
             .expect("group member must still exist after archive");
         assert!(
@@ -2914,7 +2997,6 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     let deleting_count = env
         .view
         .instances()
-        .iter()
         .filter(|i| i.status == Status::Deleting)
         .count();
     // Should have 3 sessions in the work group marked as deleting
@@ -3231,7 +3313,8 @@ fn test_group_collapsed_state_saved_to_storage() {
         .unwrap()
         .load_with_groups()
         .unwrap();
-    let fresh_tree = GroupTree::new_with_groups(env.view.instances(), &groups);
+    let fresh_tree =
+        GroupTree::new_with_groups(&env.view.instances().cloned().collect::<Vec<_>>(), &groups);
     let all_groups = fresh_tree.get_all_groups();
 
     let saved_group = all_groups
@@ -3617,8 +3700,8 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
 
 /// Build a flat list of one Running and one Waiting session in the given mode.
 /// Returns the env plus the flat index of each so callers can park the cursor.
-/// Statuses are seeded in storage before construction so both `instances` and
-/// the `instance_map` that `get_instance`/`jump_to_next_waiting` read agree.
+/// Statuses are seeded in storage before construction so `instances` and
+/// what `get_instance`/`jump_to_next_waiting` read agree.
 fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     use crate::session::config::{GroupByMode, SortOrder};
     use crate::session::Status;
@@ -3667,6 +3750,54 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     (env, running, waiting)
 }
 
+fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let mut idle = Instance::new("idle", "/tmp/idle");
+    idle.status = Status::Idle;
+    let instances = vec![running, idle];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::Attention;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    let env = TestEnv { _temp: temp, view };
+
+    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    let running = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Running))
+        .expect("a Running session row");
+    let idle = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Idle))
+        .expect("an Idle session row");
+    (env, running, idle)
+}
+
 #[test]
 #[serial]
 fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
@@ -3695,6 +3826,99 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
         landed,
         Some(Status::Waiting),
         "`w` should land the cursor on the Waiting session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
+    use crate::session::Status;
+
+    let (mut env, running, _idle) = attention_env_running_then_idle();
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "`w` on a Running session must jump, not open the snooze dialog"
+    );
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    assert_eq!(
+        landed,
+        Some(Status::Idle),
+        "`w` should fall back to the available Idle session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort() {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut alpha_idle = Instance::new("alpha-idle", "/repos/alpha");
+    alpha_idle.status = Status::Idle;
+    let alpha_id = alpha_idle.id.clone();
+    let mut beta_running = Instance::new("beta-running", "/repos/beta");
+    beta_running.status = Status::Running;
+    let instances = vec![alpha_idle, beta_running];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Project;
+    view.sort_order = SortOrder::Attention;
+    view.project_group_collapsed
+        .insert("alpha".to_string(), true);
+    view.flat_items = view.build_flat_items();
+
+    let alpha_group = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { name, collapsed, .. } if name == "alpha" && *collapsed))
+        .expect("collapsed alpha project group");
+    assert!(
+        !view
+            .flat_items
+            .iter()
+            .any(|item| matches!(item, Item::Session { id, .. } if id == &alpha_id)),
+        "precondition: alpha idle session should be hidden by the collapsed group"
+    );
+    view.cursor = alpha_group;
+    view.update_selected();
+
+    view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert!(
+        view.snooze_duration_dialog.is_none(),
+        "`w` on a collapsed group must jump, not open the snooze dialog"
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(alpha_id.as_str()));
+    assert!(
+        view.flat_items
+            .iter()
+            .any(|item| matches!(item, Item::Session { id, .. } if id == &alpha_id)),
+        "jumping to a hidden idle session should reveal its project group"
     );
 }
 
@@ -4178,7 +4402,6 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     assert_eq!(view.instances().len(), 2);
     let profiles: Vec<&str> = view
         .instances()
-        .iter()
         .map(|i| i.source_profile.as_str())
         .collect();
     assert!(profiles.contains(&"alpha"));
@@ -4227,8 +4450,8 @@ fn test_filtered_view_loads_single_profile() {
     view.update_selected();
 
     assert_eq!(view.instances().len(), 1);
-    assert_eq!(view.instances()[0].title, "Alpha Session");
-    assert_eq!(view.instances()[0].source_profile, "alpha");
+    assert_eq!(view.instance_at(0).title, "Alpha Session");
+    assert_eq!(view.instance_at(0).source_profile, "alpha");
 }
 
 #[test]
@@ -4332,21 +4555,20 @@ fn rendered_row_text(view: &HomeView, item: &Item) -> String {
         .collect()
 }
 
-/// Default `RowTagMode::None` renders no tag in any view; existing users
-/// see no change from the row-tag feature being added.
-#[test]
-#[serial]
-fn test_default_row_tag_mode_renders_no_tag() {
+fn rendered_single_session_text(
+    inst: Instance,
+    row_tag_mode: crate::session::config::RowTagMode,
+) -> String {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let instances_a = vec![Instance::new("A1", "/tmp/a")];
-    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a
+    let storage = Storage::new_unwatched("alpha").unwrap();
+    let instances = vec![inst];
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage
         .update(|i, g| {
-            *i = instances_a.to_vec();
-            *g = group_tree_a.get_all_groups();
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
             Ok(())
         })
         .unwrap();
@@ -4354,19 +4576,40 @@ fn test_default_row_tag_mode_renders_no_tag() {
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = row_tag_mode;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    // Default `row_tag_mode` is `None`; no row should carry a bracketed tag.
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
-            assert!(
-                !text.contains('['),
-                "default RowTagMode::None must render no tag: {text:?}"
-            );
-        }
-    }
+    view.flat_items
+        .iter()
+        .find_map(|item| {
+            if let Item::Session { .. } = item {
+                Some(rendered_row_text(&view, item))
+            } else {
+                None
+            }
+        })
+        .expect("session row should render")
+}
+
+/// Default `RowTagMode::Branch` keeps worktree branch information visible.
+#[test]
+#[serial]
+fn test_default_row_tag_mode_renders_branch_tag() {
+    let mut inst = Instance::new("my-session", "/tmp/a");
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/foo".to_string(),
+        main_repo_path: "/tmp/a-main".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+
+    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::default());
+    assert!(
+        text.contains("[foo         ]"),
+        "default row tag mode should show the compact branch tag: {text:?}"
+    );
 }
 
 /// `RowTagMode::Auto` shows the profile short code in all-profiles view.
@@ -4525,20 +4768,11 @@ fn test_row_tag_profile_renders_in_filtered_view() {
     assert!(seen > 0);
 }
 
-/// `RowTagMode::Branch` complements the existing branch-on-divergence
-/// display rather than duplicating it: when `worktree.branch != title`
-/// the divergence display already shows the branch (in `theme.branch`
-/// color, earlier in the row), so the Branch tag suppresses itself to
-/// avoid showing the same information twice.
+/// `RowTagMode::Branch` owns the branch suffix. It renders a compact tag even
+/// when the title differs from the branch, with no raw hardcoded branch suffix.
 #[test]
 #[serial]
-fn test_row_tag_branch_dedups_with_divergence_display() {
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let storage = Storage::new_unwatched("alpha").unwrap();
-    // Title and branch DIFFER, so the existing divergence display
-    // would render the branch.
+fn test_row_tag_branch_renders_when_branch_differs_from_title() {
     let mut inst = Instance::new("my-session", "/tmp/a");
     inst.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feature/foo".to_string(),
@@ -4547,44 +4781,19 @@ fn test_row_tag_branch_dedups_with_divergence_display() {
         created_at: chrono::Utc::now(),
         base_branch: None,
     });
-    let instances = vec![inst];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
 
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // No bracketed `[...]` tag on this row: divergence display owns the
-    // branch label here. The plain `feature/foo` from the divergence
-    // display is still expected in the rendered text.
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
-            assert!(
-                !text.contains('['),
-                "Branch mode must suppress its tag when divergence display already shows the branch: {text:?}"
-            );
-            assert!(
-                text.contains("feature/foo"),
-                "the existing divergence display should still render: {text:?}"
-            );
-        }
-    }
+    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::Branch);
+    assert!(
+        text.contains("[foo         ]"),
+        "Branch mode should render the compact branch tag: {text:?}"
+    );
+    assert!(
+        !text.contains("feature/foo"),
+        "Branch mode should not render the old raw branch suffix: {text:?}"
+    );
 }
 
-/// `RowTagMode::Branch` DOES render the tag when title matches branch
-/// (the divergence display stays quiet, so the user would otherwise not
-/// know which branch this session is on).
+/// `RowTagMode::Branch` renders the tag when title matches branch.
 #[test]
 #[serial]
 fn test_row_tag_branch_renders_when_title_matches_branch() {
@@ -4618,11 +4827,11 @@ fn test_row_tag_branch_renders_when_title_matches_branch() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    // The tag uses the last `/`-segment of the branch, truncated to 8
-    // chars, so `feature/foo` becomes `foo` padded to width 8.
+    // The tag uses the last `/`-segment of the branch and pads to the branch
+    // tag width so the row layout stays stable.
     let rendered = super::render::RowTag {
         content: "foo".to_string(),
-        max_width: 8,
+        max_width: 12,
     }
     .rendered();
     for item in &view.flat_items {
@@ -4634,6 +4843,97 @@ fn test_row_tag_branch_renders_when_title_matches_branch() {
             );
         }
     }
+}
+
+#[test]
+#[serial]
+fn test_row_tag_none_hides_worktree_branch_suffix() {
+    let mut inst = Instance::new("my-session", "/tmp/a");
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/foo".to_string(),
+        main_repo_path: "/tmp/a-main".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+
+    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
+    assert!(
+        !text.contains("feature/foo") && !text.contains("[foo") && !text.contains('['),
+        "None mode should hide all worktree suffix metadata: {text:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_row_tag_none_hides_workspace_suffix() {
+    let mut inst = Instance::new("workspace-session", "/tmp/workspace");
+    inst.workspace_info = Some(crate::session::WorkspaceInfo {
+        branch: "feature/foo".to_string(),
+        workspace_dir: "/tmp/workspace".to_string(),
+        repos: vec![
+            crate::session::WorkspaceRepo {
+                name: "api".to_string(),
+                source_path: "/src/api".to_string(),
+                branch: "feature/foo".to_string(),
+                worktree_path: "/tmp/workspace/api".to_string(),
+                main_repo_path: "/src/api".to_string(),
+                managed_by_aoe: true,
+            },
+            crate::session::WorkspaceRepo {
+                name: "web".to_string(),
+                source_path: "/src/web".to_string(),
+                branch: "feature/foo".to_string(),
+                worktree_path: "/tmp/workspace/web".to_string(),
+                main_repo_path: "/src/web".to_string(),
+                managed_by_aoe: true,
+            },
+        ],
+        created_at: chrono::Utc::now(),
+        cleanup_on_delete: true,
+    });
+
+    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
+    assert!(
+        !text.contains("feature/foo") && !text.contains("repos") && !text.contains('['),
+        "None mode should hide all workspace suffix metadata: {text:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_row_tag_branch_renders_workspace_branch_repo_count() {
+    let mut inst = Instance::new("workspace-session", "/tmp/workspace");
+    inst.workspace_info = Some(crate::session::WorkspaceInfo {
+        branch: "feature/foo".to_string(),
+        workspace_dir: "/tmp/workspace".to_string(),
+        repos: vec![
+            crate::session::WorkspaceRepo {
+                name: "api".to_string(),
+                source_path: "/src/api".to_string(),
+                branch: "feature/foo".to_string(),
+                worktree_path: "/tmp/workspace/api".to_string(),
+                main_repo_path: "/src/api".to_string(),
+                managed_by_aoe: true,
+            },
+            crate::session::WorkspaceRepo {
+                name: "web".to_string(),
+                source_path: "/src/web".to_string(),
+                branch: "feature/foo".to_string(),
+                worktree_path: "/tmp/workspace/web".to_string(),
+                main_repo_path: "/src/web".to_string(),
+                managed_by_aoe: true,
+            },
+        ],
+        created_at: chrono::Utc::now(),
+        cleanup_on_delete: true,
+    });
+
+    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::Branch);
+    assert!(
+        text.contains("[foo+2       ]"),
+        "Branch mode should render compact workspace branch and repo count: {text:?}"
+    );
 }
 
 /// Legacy `Instance::new` left `source_profile` empty before the per-profile
@@ -4932,7 +5232,6 @@ fn test_delete_group_scoped_to_owning_profile() {
     // Alpha's instance should be ungrouped, beta's should still be in "work"
     let alpha_inst = view
         .instances()
-        .iter()
         .find(|i| i.source_profile == "alpha")
         .unwrap();
     assert_eq!(
@@ -4941,7 +5240,6 @@ fn test_delete_group_scoped_to_owning_profile() {
     );
     let beta_inst = view
         .instances()
-        .iter()
         .find(|i| i.source_profile == "beta")
         .unwrap();
     assert_eq!(
@@ -5063,7 +5361,7 @@ fn test_rename_profile_change_prunes_source_group() {
     // Move the session alpha -> beta, keeping the same group name.
     view.rename_selected("", None, Some("beta"), false).unwrap();
 
-    let moved = view.instances().iter().find(|i| i.id == id).unwrap();
+    let moved = view.get_instance(&id).unwrap();
     assert_eq!(moved.source_profile, "beta");
     assert_eq!(moved.group_path, "work");
     assert!(
@@ -5230,7 +5528,7 @@ fn test_session_context_menu_new_session_prefills_from_session() {
     let target_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.repo_path() == "/tmp/work")
         .map(|i| i.id.clone())
         .expect("work-project instance should exist");
@@ -5497,11 +5795,7 @@ fn test_session_context_menu_snooze_wakes_snoozed_session() {
     // Pre-snooze the session so the toggle takes the wake path.
     env.view.snooze_session_for(&id, 60).unwrap();
     assert!(
-        env.view
-            .instances
-            .iter()
-            .find(|i| i.id == id)
-            .is_some_and(|i| i.is_snoozed()),
+        env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
         "session should be snoozed before the toggle"
     );
 
@@ -5512,11 +5806,7 @@ fn test_session_context_menu_snooze_wakes_snoozed_session() {
         "waking a snoozed session must not open the duration picker"
     );
     assert!(
-        !env.view
-            .instances
-            .iter()
-            .find(|i| i.id == id)
-            .is_some_and(|i| i.is_snoozed()),
+        !env.view.instances.get(&id).is_some_and(|i| i.is_snoozed()),
         "context-menu Snooze on a snoozed session must wake it immediately"
     );
 }
@@ -5656,7 +5946,6 @@ fn test_rename_selected_group_path() {
     let work_session = env
         .view
         .instances()
-        .iter()
         .find(|i| i.title == "work-project")
         .unwrap();
     assert_eq!(work_session.group_path, "projects");
@@ -5705,14 +5994,12 @@ fn test_rename_selected_group_with_children() {
 
     let parent = view
         .instances()
-        .iter()
         .find(|i| i.title == "parent-session")
         .unwrap();
     assert_eq!(parent.group_path, "projects");
 
     let child = view
         .instances()
-        .iter()
         .find(|i| i.title == "child-session")
         .unwrap();
     assert_eq!(child.group_path, "projects/frontend");
@@ -5764,7 +6051,6 @@ fn test_rename_selected_group_noop_when_unchanged() {
     let work_session = env
         .view
         .instances()
-        .iter()
         .find(|i| i.title == "work-project")
         .unwrap();
     assert_eq!(work_session.group_path, "work");
@@ -6209,7 +6495,7 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
 #[serial]
 fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
     use crate::session::Status;
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6229,7 +6515,7 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         id: id.clone(),
         status: Status::Idle,
         last_error: None,
-        idle_entered_at: Some(now),
+        idle_entered_at: IdleIntent::Set(now),
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6240,12 +6526,9 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
     assert_eq!(inst.idle_entered_at, Some(now));
 }
 
-// #2690: a passively-detected status transition must land on disk
-// immediately, not just in memory, so the next reload (TUI relaunch, or
-// a peer like `aoe serve`) finds disk already caught up instead of
-// CodeRabbit follow-up to #2690: `update_status_with_metadata` compares
-// against `live_status_baseline`, but the background poller only ever
-// mutates a *clone* of the real `Instance` (see `status_poller.rs`). If
+// #2690: `update_status_with_metadata` compares against
+// `live_status_baseline`, but the background poller only ever mutates a
+// *clone* of the real `Instance` (see `status_poller.rs`). If
 // `StatusUpdate` doesn't carry the clone's freshly-seeded baseline back,
 // the real `Instance` in `self.instances` keeps `live_status_baseline ==
 // None` forever, so every poll looks like "no baseline yet" and no real
@@ -6288,11 +6571,59 @@ fn apply_status_update_propagates_live_status_baseline_from_poller() {
     );
 }
 
+// #2690: `IdleIntent::Keep` means the producer has no observation for
+// `idle_entered_at`. The consumer must not touch the field, or an
+// unseeded `attached_status_hooks` snapshot on attach exit would clobber
+// a real value the main-thread poller wrote during attach. The other two
+// variants (`Set(ts)`, `Clear`) are unambiguous and always apply.
+#[test]
+#[serial]
+fn apply_status_update_preserves_idle_entered_at_on_keep() {
+    use crate::session::Status;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // Seed a real `idle_entered_at` on the live instance, as if the
+    // main-thread poller had already observed an Idle transition.
+    let seeded = chrono::Utc::now() - chrono::Duration::minutes(30);
+    env.view.mutate_instance(&id, |inst| {
+        inst.idle_entered_at = Some(seeded);
+    });
+
+    // Then apply a `Keep` update, mirroring an `attached_status_hooks`
+    // snapshot from a watcher clone that never polled.
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: IdleIntent::Keep,
+        last_accessed_at: None,
+        pane_dead: false,
+        live_status_baseline: None,
+    });
+
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().idle_entered_at,
+        Some(seeded),
+        "`Keep` must not clobber an already-established `idle_entered_at`"
+    );
+}
+
+// #2690: a passively-detected status transition must land on disk
+// immediately, not just in memory, so the next reload (TUI relaunch, or
+// a peer like `aoe serve`) finds disk already caught up instead of
+// comparing against a stale snapshot and misreading it as a fresh
+// transition.
 #[test]
 #[serial]
 fn apply_status_update_persists_genuine_transition_to_disk() {
     use crate::session::{Status, Storage};
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6306,7 +6637,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         id: id.clone(),
         status: Status::Running,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Clear,
         last_accessed_at: Some(now),
         pane_dead: false,
         live_status_baseline: None,
@@ -6326,7 +6657,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
 #[serial]
 fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
     use crate::session::Status;
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6340,7 +6671,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         id: id.clone(),
         status: Status::Idle,
         last_error: None,
-        idle_entered_at: Some(stop_time),
+        idle_entered_at: IdleIntent::Set(stop_time),
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6358,7 +6689,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         id: id.clone(),
         status: Status::Running,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Clear,
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6438,7 +6769,7 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
 #[serial]
 fn apply_status_update_skips_terminal_states() {
     use crate::session::Status;
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6456,7 +6787,7 @@ fn apply_status_update_skips_terminal_states() {
         id: id.clone(),
         status: Status::Idle,
         last_error: None,
-        idle_entered_at: Some(stale_ts),
+        idle_entered_at: IdleIntent::Set(stale_ts),
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6512,7 +6843,7 @@ fn apply_stop_results_transitions_instance_to_stopped() {
 fn apply_status_update_runs_status_hook_on_transition() {
     use crate::session::Status;
     use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6532,7 +6863,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         id: id.clone(),
         status: Status::Waiting,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Clear,
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6579,7 +6910,7 @@ fn all_profiles_status_hook_lookup_uses_cache() {
 fn apply_status_update_does_not_run_status_hook_for_same_status() {
     use crate::session::Status;
     use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6598,7 +6929,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         id,
         status: Status::Idle,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Keep,
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
@@ -6612,7 +6943,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
 fn apply_status_updates_without_hooks_does_not_run_status_hook() {
     use crate::session::Status;
     use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6632,7 +6963,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             id: id.clone(),
             status: Status::Waiting,
             last_error: None,
-            idle_entered_at: None,
+            idle_entered_at: IdleIntent::Clear,
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
@@ -6992,7 +7323,7 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
 #[serial]
 fn pollable_instances_excludes_recovery_in_flight() {
     let mut env = create_test_env_with_sessions(3);
-    let id_skipped = env.view.instances[1].id.clone();
+    let id_skipped = env.view.instance_at(1).id.clone();
     env.view.recovery_in_flight.insert(id_skipped.clone());
 
     let pollable = env.view.pollable_instances();
@@ -7005,7 +7336,7 @@ fn pollable_instances_excludes_recovery_in_flight() {
 #[serial]
 fn pollable_instances_recovers_after_inflight_clear() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.recovery_in_flight.insert(id.clone());
     assert!(env.view.pollable_instances().is_empty());
 
@@ -7089,17 +7420,17 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
 #[serial]
 fn toggle_favorite_at_cursor_round_trip() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
     // Initial state: not favorited.
-    assert!(!env.view.instances[0].is_favorited());
+    assert!(!env.view.instance_at(0).is_favorited());
 
     env.view.toggle_favorite_at_cursor().unwrap();
-    assert!(env.view.instances[0].is_favorited());
+    assert!(env.view.instance_at(0).is_favorited());
 
     env.view.toggle_favorite_at_cursor().unwrap();
-    assert!(!env.view.instances[0].is_favorited());
+    assert!(!env.view.instance_at(0).is_favorited());
 }
 
 /// When no session is selected, the toggle is a silent no-op.
@@ -7120,21 +7451,21 @@ fn toggle_archive_at_cursor_round_trip() {
     let mut env = create_test_env_with_sessions(1);
     // Keep the Archived section expanded so the archived row stays reachable.
     env.view.archived_section_collapsed = false;
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
     // Initial state: not archived.
-    assert!(!env.view.instances[0].is_archived());
+    assert!(!env.view.instance_at(0).is_archived());
 
     env.view.toggle_archive_at_cursor().unwrap();
-    assert!(env.view.instances[0].is_archived());
+    assert!(env.view.instance_at(0).is_archived());
 
     // Archiving moved the selection off the row (it advances to the next
     // active session; here there is none). Navigate back onto the archived
     // row, as a user would, before toggling it back.
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
-    assert!(!env.view.instances[0].is_archived());
+    assert!(!env.view.instance_at(0).is_archived());
 }
 
 /// Trashing a session hides it from the active list and surfaces it under
@@ -7145,9 +7476,9 @@ fn trash_then_restore_round_trip() {
     let mut env = create_test_env_with_sessions(2);
     // Keep the Trash section expanded so the trashed row stays reachable.
     env.view.trashed_section_collapsed = false;
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    assert!(!env.view.instances[0].is_trashed());
+    assert!(!env.view.instance_at(0).is_trashed());
 
     env.view.trash_session_by_id(&id);
     assert!(
@@ -7172,6 +7503,78 @@ fn trash_then_restore_round_trip() {
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
+    );
+}
+
+/// Regression for #2489: trashing a session must not re-expand a Trash
+/// section the user has collapsed. Like single-row archive, the section
+/// header's count is the feedback; the collapse state is left untouched.
+#[test]
+#[serial]
+fn trashing_leaves_collapsed_trash_section_collapsed() {
+    let mut env = create_test_env_with_sessions(2);
+    assert!(
+        env.view.trashed_section_collapsed,
+        "Trash section defaults to collapsed"
+    );
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+    assert!(
+        env.view.trashed_section_collapsed,
+        "trashing must not re-expand a collapsed Trash section"
+    );
+}
+
+/// Regression for #2489: `w` (jump to next needing-attention) must skip
+/// trashed rows even when a stale unread flag survived the trash. A trashed
+/// session is stopped and only lives under the Trash section, so it never
+/// "needs attention".
+#[test]
+#[serial]
+fn w_skips_unread_trashed_session() {
+    use crate::session::Status;
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    // Non-strict so bare `w` routes to the jump handler, not the typing guard.
+    env.view.strict_hotkeys = false;
+    // Keep the Trash section expanded so the trashed row lands in `flat_items`;
+    // that is the only way `w`'s walk could reach it.
+    env.view.trashed_section_collapsed = false;
+
+    let trashed = env.view.instance_at(0).id.clone();
+    let active = env.view.instance_at(1).id.clone();
+    // The surviving active row is a plain idle session (the pass-2 fallback);
+    // the trashed row carries an unread flag, as it would after being trashed
+    // while unread.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&trashed, |inst| inst.mark_unread());
+    env.view.trash_session_by_id(&trashed);
+    assert!(env.view.get_instance(&trashed).unwrap().is_trashed());
+    assert!(
+        env.view.get_instance(&trashed).unwrap().is_unread(),
+        "the trashed row must still carry the unread flag for this regression"
+    );
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(trashed.as_str()),
+        "`w` must not land on a trashed session even when it is unread"
     );
 }
 
@@ -7490,14 +7893,14 @@ fn restart_selected_session_noop_with_no_selection() {
 #[serial]
 fn restart_selected_session_skips_archived_row() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
     let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
-        env.view.instances[0].is_archived(),
+        env.view.instance_at(0).is_archived(),
         "archive bit should still be set: restart must not unarchive"
     );
     assert!(
@@ -7512,7 +7915,7 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
@@ -7520,7 +7923,7 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
-        env.view.instances[0].is_snoozed(),
+        env.view.instance_at(0).is_snoozed(),
         "Attention sort: snooze is the user's explicit `don't revive`; restart must not clear it"
     );
     assert!(
@@ -7539,16 +7942,16 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.sort_order = SortOrder::Newest;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
-    assert!(env.view.instances[0].is_snoozed(), "pre-condition");
+    assert!(env.view.instance_at(0).is_snoozed(), "pre-condition");
 
     let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
-        !env.view.instances[0].is_snoozed(),
+        !env.view.instance_at(0).is_snoozed(),
         "Newest sort: restart on a snoozed row must clear the snooze so persisted state matches what's on screen"
     );
     // Restart cooldown gets set because the press wasn't dropped. Bare
@@ -7564,7 +7967,7 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
 #[serial]
 fn restart_selected_session_skips_creating_row() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
@@ -7586,7 +7989,7 @@ fn restart_selected_session_skips_creating_row() {
 #[serial]
 fn restart_selected_session_debounces_via_cooldown_map() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
     // Seed the cooldown so the next press is debounced. This stands in
@@ -7681,12 +8084,12 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
     use crate::session::StartOutcome;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.restart_in_flight.insert(id.clone());
-    env.view.instances[0].agent_session_id = Some("peer-fresh-sid".to_string());
-    env.view.instances[0].resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+    env.view.instance_at_mut(0).agent_session_id = Some("peer-fresh-sid".to_string());
+    env.view.instance_at_mut(0).resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
 
-    let mut worker = env.view.instances[0].clone();
+    let mut worker = env.view.instance_at(0).clone();
     worker.status = crate::session::Status::Error;
     worker.agent_session_id = Some("phase1-stale-sid".to_string());
     worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
@@ -7731,11 +8134,11 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
     use crate::session::StartOutcome;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.restart_in_flight.insert(id.clone());
-    env.view.instances[0].agent_session_id = Some("sid-before".to_string());
+    env.view.instance_at_mut(0).agent_session_id = Some("sid-before".to_string());
 
-    let before = env.view.instances[0].clone();
+    let before = env.view.instance_at(0).clone();
     let mut worker = before.clone();
     worker.agent_session_id = Some("sid-after".to_string());
     worker.status = crate::session::Status::Running;
@@ -7765,9 +8168,8 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
 #[serial]
 fn execute_send_message_missing_session_shows_send_failed() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
-    env.view.instances.retain(|inst| inst.id != id);
-    env.view.instance_map.remove(&id);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.instances.shift_remove(&id);
 
     env.view.execute_send_message(&id, "hello");
 
@@ -7788,7 +8190,7 @@ fn execute_send_message_missing_session_shows_send_failed() {
 #[serial]
 fn restart_selected_session_skips_when_already_in_flight() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
 
@@ -7799,7 +8201,7 @@ fn restart_selected_session_skips_when_already_in_flight() {
         "an in-flight restart must drop the press before any bookkeeping"
     );
     assert_ne!(
-        env.view.instances[0].status,
+        env.view.instance_at(0).status,
         crate::session::Status::Starting,
         "the row must not be re-flipped to Starting by a dropped duplicate press"
     );
@@ -7814,14 +8216,14 @@ fn delete_selected_refused_during_restart() {
     use crate::tui::dialogs::DeleteOptions;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
 
     let result = env.view.delete_selected(&DeleteOptions::default());
     assert!(result.is_ok());
     assert_ne!(
-        env.view.instances[0].status,
+        env.view.instance_at(0).status,
         crate::session::Status::Deleting,
         "delete must be refused while a restart is in flight"
     );
@@ -7934,7 +8336,7 @@ fn project_grouping_sorts_sessions_by_attention_within_group() {
             Item::Group { name, .. } => current_group = Some(name.clone()),
             Item::Session { id, .. } => {
                 if current_group.as_deref() == Some("alpha") {
-                    if let Some(inst) = env.view.instances.iter().find(|i| &i.id == id) {
+                    if let Some(inst) = env.view.instances.get(id) {
                         alpha_session_order.push(inst.title.clone());
                     }
                 }
@@ -7976,6 +8378,71 @@ fn project_groups_sort_by_top_attention_member() {
         group_order,
         vec!["alpha".to_string(), "beta".to_string()],
         "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+    );
+}
+
+/// Archiving a project header while in Attention sort must remove the project
+/// from the main flow once all of its live sessions are archived. The archived
+/// rows still appear under the synthetic Archived section's project sub-header.
+#[test]
+#[serial]
+fn project_attention_archive_selected_group_removes_empty_main_header() {
+    use crate::session::{
+        archived_project_sub_path,
+        config::{GroupByMode, SortOrder},
+        is_within_archived_section,
+    };
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.archived_section_collapsed = true;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                Item::Group { name, path, .. }
+                    if name == "beta" && !is_within_archived_section(path)
+            )
+        })
+        .expect("beta project header present");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
+
+    env.view.archive_selected_group().unwrap();
+
+    assert!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| super::project_group_name(i) == "beta")
+            .all(|i| i.is_archived()),
+        "all beta sessions must be archived"
+    );
+    assert!(
+        !env.view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group { name, path, .. }
+                if name == "beta" && !is_within_archived_section(path)
+        )),
+        "archived-only beta must not leave a main-flow project header; got flat_items: {:?}",
+        env.view.flat_items
+    );
+    let archived_beta = archived_project_sub_path("beta");
+    assert!(
+        env.view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group { path, name, session_count, .. }
+                if path == &archived_beta && name == "beta" && *session_count == 2
+        )),
+        "archived beta sessions must stay reachable under the Archived section; got flat_items: {:?}",
+        env.view.flat_items
     );
 }
 
@@ -8110,7 +8577,7 @@ fn unpin_archived_only_project_leaves_main_flow() {
     let beta_ids: Vec<String> = env
         .view
         .instances
-        .iter()
+        .values()
         .filter(|i| super::project_group_name(i) == "beta")
         .map(|i| i.id.clone())
         .collect();
@@ -8291,7 +8758,7 @@ fn pinned_project_survives_losing_last_session() {
     // entry keeps the header alive even with zero members.
     env.view
         .instances
-        .retain(|i| super::project_group_name(i) != "alpha");
+        .retain(|_, i| super::project_group_name(i) != "alpha");
     env.view.flat_items = env.view.build_flat_items();
 
     let alpha_header = env.view.flat_items.iter().find_map(|i| match i {
@@ -8330,7 +8797,7 @@ fn same_basename_repos_pin_independently() {
     .unwrap();
     let mut sess = Instance::new("api-sess", "/other/api");
     sess.source_profile = "test".to_string();
-    env.view.instances.push(sess);
+    env.view.instances.insert(sess.id.clone(), sess);
 
     env.view.group_by = GroupByMode::Project;
     env.view.refresh_registered_projects();
@@ -8677,7 +9144,7 @@ fn sort_order_toggle_preserves_selected_session() {
     let target_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "alpha-running")
         .map(|i| i.id.clone())
         .expect("fixture provides alpha-running");
@@ -8766,19 +9233,18 @@ fn prune_empty_group_drops_source_when_no_session_remains() {
     let mut moved = Instance::new("moved", "/tmp/moved");
     moved.source_profile = "alpha".to_string();
     moved.group_path = "work".to_string();
-    view.instances = vec![moved];
+    let insts = vec![moved];
+    seed_instances(&mut view, &insts);
     view.group_trees.clear();
-    view.group_trees.insert(
-        "alpha".to_string(),
-        GroupTree::new_with_groups(&view.instances, &[]),
-    );
+    view.group_trees
+        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
     view.group_trees
         .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
     assert!(view.group_trees["alpha"].group_exists("work"));
 
     // Simulate the move: re-tag source_profile, then prune the now-empty
     // source group.
-    view.instances[0].source_profile = "beta".to_string();
+    view.instance_at_mut(0).source_profile = "beta".to_string();
     view.prune_empty_group("alpha", "work");
 
     assert!(
@@ -8806,16 +9272,15 @@ fn prune_empty_group_keeps_source_when_sibling_session_remains() {
     let mut sibling = Instance::new("sibling", "/tmp/sibling");
     sibling.source_profile = "alpha".to_string();
     sibling.group_path = "work".to_string();
-    view.instances = vec![moved, sibling];
+    let insts = vec![moved, sibling];
+    seed_instances(&mut view, &insts);
     view.group_trees.clear();
-    view.group_trees.insert(
-        "alpha".to_string(),
-        GroupTree::new_with_groups(&view.instances, &[]),
-    );
+    view.group_trees
+        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
     view.group_trees
         .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
 
-    view.instances[0].source_profile = "beta".to_string();
+    view.instance_at_mut(0).source_profile = "beta".to_string();
     view.prune_empty_group("alpha", "work");
 
     assert!(
@@ -8843,16 +9308,15 @@ fn prune_empty_group_keeps_source_when_descendant_session_remains() {
     let mut nested = Instance::new("nested", "/tmp/nested");
     nested.source_profile = "alpha".to_string();
     nested.group_path = "work/frontend".to_string();
-    view.instances = vec![moved, nested];
+    let insts = vec![moved, nested];
+    seed_instances(&mut view, &insts);
     view.group_trees.clear();
-    view.group_trees.insert(
-        "alpha".to_string(),
-        GroupTree::new_with_groups(&view.instances, &[]),
-    );
+    view.group_trees
+        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
     view.group_trees
         .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
 
-    view.instances[0].source_profile = "beta".to_string();
+    view.instance_at_mut(0).source_profile = "beta".to_string();
     view.prune_empty_group("alpha", "work");
 
     assert!(
@@ -8879,16 +9343,17 @@ fn prune_empty_group_keeps_source_when_descendant_group_remains() {
     let mut moved = Instance::new("moved", "/tmp/moved");
     moved.source_profile = "alpha".to_string();
     moved.group_path = "work".to_string();
-    view.instances = vec![moved];
+    let insts = vec![moved];
+    seed_instances(&mut view, &insts);
     view.group_trees.clear();
-    let mut alpha_tree = GroupTree::new_with_groups(&view.instances, &[]);
+    let mut alpha_tree = GroupTree::new_with_groups(&insts, &[]);
     alpha_tree.create_group("work/anchor");
     view.group_trees.insert("alpha".to_string(), alpha_tree);
     view.group_trees
         .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
     assert!(view.group_trees["alpha"].group_exists("work/anchor"));
 
-    view.instances[0].source_profile = "beta".to_string();
+    view.instance_at_mut(0).source_profile = "beta".to_string();
     view.prune_empty_group("alpha", "work");
 
     assert!(
@@ -8925,26 +9390,26 @@ fn prune_empty_group_survives_save_and_reload() {
         .unwrap();
         let moved = {
             let mut inst = Instance::new("moved", "/tmp/moved");
+            inst.id = "moved".to_string();
             inst.source_profile = "alpha".to_string();
             inst.group_path = "work".to_string();
             inst
         };
-        view.instance_map.insert("moved".to_string(), moved.clone());
-        view.instances.push(moved);
+        view.instances.insert(moved.id.clone(), moved);
         view.pending_added
             .entry("alpha".to_string())
             .or_default()
             .insert("moved".to_string());
         view.group_trees.insert(
             "alpha".to_string(),
-            GroupTree::new_with_groups(&view.instances, &[]),
+            GroupTree::new_with_groups(&view.cloned_instances(), &[]),
         );
         view.save().unwrap();
 
         view.group_trees
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
-        let old_path = view.instance_map["moved"].group_path.clone();
+        let old_path = view.instances["moved"].group_path.clone();
         view.move_to_profile("moved", "beta", old_path.clone())
             .unwrap();
         view.prune_empty_group("alpha", &old_path);
@@ -8973,8 +9438,8 @@ fn favorite_decoration_gated_to_attention_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
-    let title = env.view.instances[0].title.clone();
+    let id = env.view.instance_at(0).id.clone();
+    let title = env.view.instance_at(0).title.clone();
     env.view.mutate_instance(&id, |inst| inst.favorite());
 
     // In Newest: row should NOT have the `* ` prefix or the bold/
@@ -9027,7 +9492,7 @@ fn snooze_decoration_gated_to_attention_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
     env.view.sort_order = SortOrder::Newest;
@@ -9073,7 +9538,7 @@ fn archived_section_pinned_to_bottom_in_every_sort() {
     use crate::session::{config::SortOrder, is_archived_section_path, ARCHIVED_SECTION_NAME};
 
     let mut env = create_test_env_with_sessions(3);
-    let id = env.view.instances[0].id.clone();
+    let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| inst.archive());
     env.view.archived_section_collapsed = true;
 
@@ -9154,14 +9619,14 @@ fn archived_section_nests_by_project_in_project_mode() {
     let alpha_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "alpha-running")
         .map(|i| i.id.clone())
         .unwrap();
     let beta_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "beta-error")
         .map(|i| i.id.clone())
         .unwrap();
@@ -9275,21 +9740,21 @@ fn archived_only_project_leaves_no_phantom_header() {
     let beta_error = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "beta-error")
         .map(|i| i.id.clone())
         .unwrap();
     let beta_running = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "beta-running")
         .map(|i| i.id.clone())
         .unwrap();
     env.view
         .apply_user_action(&beta_error, |inst| inst.archive())
         .unwrap();
-    env.view.instances.retain(|i| i.id != beta_running);
+    env.view.instances.shift_remove(&beta_running);
     env.view.flat_items = env.view.build_flat_items();
 
     // Count "beta" headers that live OUTSIDE the Archived section.
@@ -9323,7 +9788,7 @@ fn archived_section_collapsed_hides_project_sub_folders() {
     let alpha_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "alpha-running")
         .map(|i| i.id.clone())
         .unwrap();
@@ -9364,14 +9829,14 @@ fn archived_project_sub_folder_collapse_hides_only_its_sessions() {
     let alpha_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "alpha-running")
         .map(|i| i.id.clone())
         .unwrap();
     let beta_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "beta-error")
         .map(|i| i.id.clone())
         .unwrap();
@@ -9437,14 +9902,14 @@ fn archived_sub_folders_honor_sort_order() {
     let alpha_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "alpha-running")
         .map(|i| i.id.clone())
         .unwrap();
     let beta_id = env
         .view
         .instances
-        .iter()
+        .values()
         .find(|i| i.title == "beta-error")
         .map(|i| i.id.clone())
         .unwrap();
@@ -13819,12 +14284,12 @@ mod save_field_merge {
             .expect("save must not error on peer-deleted rows");
 
         assert!(
-            !view.instances().iter().any(|i| i.id == id),
+            !view.instances().any(|i| i.id == id),
             "peer-deleted row must be dropped from in-memory instances"
         );
         assert!(
             view.get_instance(&id).is_none(),
-            "peer-deleted row must be dropped from instance_map"
+            "peer-deleted row must be dropped from in-memory mirror"
         );
         let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
@@ -14747,12 +15212,7 @@ mod apply_session_id_updates {
         let poller = SessionPoller::new("test-session".to_string());
         poller.inject_test_update(instance_id, sid);
         let arc = Arc::new(Mutex::new(poller));
-        for i in &mut view.instances {
-            if i.id == instance_id {
-                i.session_id_poller = Some(arc.clone());
-            }
-        }
-        if let Some(i) = view.instance_map.get_mut(instance_id) {
+        if let Some(i) = view.instances.get_mut(instance_id) {
             i.session_id_poller = Some(arc);
         }
     }
@@ -14825,12 +15285,7 @@ mod apply_session_id_updates {
         let profile = "apply-excludes";
         let inst = fresh_instance(profile, "aer");
         let mut view = build_view_with_inst(profile, &inst);
-        for i in &mut view.instances {
-            if i.id == inst.id {
-                i.retroactive_capture_excludes.insert(NEW_SID.to_string());
-            }
-        }
-        if let Some(i) = view.instance_map.get_mut(&inst.id) {
+        if let Some(i) = view.instances.get_mut(&inst.id) {
             i.retroactive_capture_excludes.insert(NEW_SID.to_string());
         }
 
@@ -14851,8 +15306,7 @@ mod apply_session_id_updates {
         );
         let mem_sid = view
             .instances
-            .iter()
-            .find(|i| i.id == inst.id)
+            .get(&inst.id)
             .and_then(|i| i.agent_session_id.clone());
         assert!(
             mem_sid.is_none(),
@@ -14904,8 +15358,7 @@ mod apply_session_id_updates {
 
         let mem_sid = view
             .instances
-            .iter()
-            .find(|i| i.id == inst.id)
+            .get(&inst.id)
             .and_then(|i| i.agent_session_id.clone());
         assert_eq!(
             mem_sid.as_deref(),
@@ -14975,8 +15428,7 @@ mod apply_session_id_updates {
         );
         let mem_sid = view
             .instances
-            .iter()
-            .find(|i| i.id == inst.id)
+            .get(&inst.id)
             .and_then(|i| i.agent_session_id.clone());
         assert_eq!(
             mem_sid.as_deref(),
