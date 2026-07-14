@@ -8260,6 +8260,15 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         })
         .unwrap();
 
+    // A real prior conversation on disk so the restart drives the --resume
+    // cascade (and its ResumeFailed path). A stored sid with no transcript now
+    // launches fresh-pinned (`--session-id`), which would not surface here.
+    let claude_dir = temp.path().join(".claude").join("projects").join(
+        crate::session::capture::encode_claude_project_path("/tmp/x"),
+    );
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
+
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
         Some(profile.to_string()),
