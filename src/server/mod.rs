@@ -1575,6 +1575,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/settings/resolved", get(api::get_settings_resolved))
+        // Mobile terminal toolbar custom quick-button contents (the count is
+        // the schema-visible `web.mobile_quick_button_count` setting).
+        .route(
+            "/api/mobile-quick-buttons",
+            get(api::get_mobile_quick_buttons).put(api::put_mobile_quick_buttons),
+        )
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))

@@ -1611,6 +1611,22 @@ fn default_context_lines() -> usize {
     3
 }
 
+/// One user-customizable quick-send button on the mobile terminal toolbar.
+/// Tapping the button sends `text` to the PTTY as a bracketed paste,
+/// optionally followed by a carriage return when `auto_enter` is set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileQuickButton {
+    /// Short label rendered on the button. Empty falls back to `text{n}`.
+    #[serde(default)]
+    pub label: String,
+    /// Text sent to the terminal on tap. Capped at 20,000 chars by the API.
+    #[serde(default)]
+    pub text: String,
+    /// Append `\r` after `text` on tap.
+    #[serde(default)]
+    pub auto_enter: bool,
+}
+
 /// Web dashboard runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "web", category = "Web")]
@@ -1648,6 +1664,29 @@ pub struct WebConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
+
+    /// How many user-defined quick-send buttons the mobile terminal toolbar
+    /// shows (laid out in rows of up to 7). Defaults to 0. Buttons are
+    /// customized by long-pressing them on the mobile toolbar; their contents
+    /// live in `mobile_quick_buttons` and sync across devices with the config.
+    #[serde(default)]
+    #[setting(
+        label = "Mobile quick buttons",
+        widget = "number",
+        min = 0,
+        max = 28,
+        global_only
+    )]
+    pub mobile_quick_button_count: u8,
+
+    /// Per-button contents for the mobile toolbar's custom quick buttons, kept
+    /// in lockstep with `mobile_quick_button_count`. Skipped from the schema:
+    /// the count above is the visible knob, while contents are edited in-place
+    /// on the mobile toolbar via `PUT /api/mobile-quick-buttons`. Stored on
+    /// the global config so it syncs across devices.
+    #[serde(default)]
+    #[setting(skip)]
+    pub mobile_quick_buttons: Vec<MobileQuickButton>,
 }
 
 impl Default for WebConfig {
@@ -1658,6 +1697,8 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+            mobile_quick_button_count: 0,
+            mobile_quick_buttons: Vec::new(),
         }
     }
 }
