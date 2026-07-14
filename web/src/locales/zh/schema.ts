@@ -289,6 +289,10 @@ export const fields: Record<string, ZhFieldEntry | undefined> = {
     label: "计划唤醒时通知",
     desc: "默认：当 acp 会话的 ScheduleWakeup 计时器触发时（下一个 /loop turn 开始）发送推送。若 TUI 或 web dashboard 在最近 30 秒内活跃过则抑制。见 #1091。",
   },
+  "web.mobile_quick_button_count": {
+    label: "手机快捷按钮数",
+    desc: "手机终端工具栏显示的自定义快捷按钮数量（每行最多 7 个，最多 28 个）。长按某个按钮可编辑其标题、要发送的文本（≤2 万字符）以及是否在发送后自动加回车；按钮内容随服务器配置跨设备同步。",
+  },
 
   // ===== auth =====
   "auth.persist_sessions": {

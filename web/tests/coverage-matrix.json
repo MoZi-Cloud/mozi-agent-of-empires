@@ -10,6 +10,16 @@
       "components": ["web/src/components/PairedTerminal.tsx"]
     },
     {
+      "id": "terminal.mobile-toolbar",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileTerminalToolbar.test.tsx"],
+      "components": [
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/QuickButtonEditModal.tsx"
+      ]
+    },
+    {
       "id": "app-shell.docks",
       "kind": "vitest",
       "risk": "medium",

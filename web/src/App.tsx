@@ -76,6 +76,7 @@ import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
+import { MobileQuickButtonCountContext, parseMobileQuickButtonCount } from "./lib/mobileQuickButtons";
 import { toastBus, reportError } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -151,11 +152,13 @@ export default function App() {
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
+  const [mobileQuickButtonCount, setMobileQuickButtonCount] = useState(0);
 
   const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
+    setMobileQuickButtonCount(parseMobileQuickButtonCount(settings));
   }, []);
 
   const refreshAppSettings = useCallback(async () => {
@@ -231,13 +234,19 @@ export default function App() {
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
-          {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-              the plugin UI snapshot (usePluginPanes), so the provider can't live
-              inside its own return. */}
-          <PluginUiProvider>
-            <AppContent loginRequired={loginRequired} onLogout={handleLogout} onSettingsRefresh={refreshAppSettings} />
-          </PluginUiProvider>
-          <ElevationPrompt />
+          <MobileQuickButtonCountContext.Provider value={mobileQuickButtonCount}>
+            {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                the plugin UI snapshot (usePluginPanes), so the provider can't live
+                inside its own return. */}
+            <PluginUiProvider>
+              <AppContent
+                loginRequired={loginRequired}
+                onLogout={handleLogout}
+                onSettingsRefresh={refreshAppSettings}
+              />
+            </PluginUiProvider>
+            <ElevationPrompt />
+          </MobileQuickButtonCountContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>

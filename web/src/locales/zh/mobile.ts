@@ -1,0 +1,46 @@
+// 简体中文,`mobile` 命名空间。手机终端工具栏(系统快捷键、修饰键锁定、自定义
+// 快捷按钮)与长按编辑弹窗。
+export const mobile = {
+  toolbar: {
+    arrowUp: "上",
+    arrowDown: "下",
+    arrowLeft: "左",
+    arrowRight: "右",
+    tab: "Tab",
+    escape: "Esc",
+    enter: "回车",
+    shift: "Shift",
+    ctrl: "Ctrl",
+    alt: "Alt",
+    cmd: "Cmd",
+    fn: "~",
+    ctrlC: "Ctrl+C 中断",
+    copy: "复制选中文本",
+    paste: "从剪贴板粘贴",
+    activeSuffix: ",已启用",
+  },
+  copyToast: {
+    done: "已复制选中文本。",
+    empty: "没有选中的文本可复制。",
+    failed: "无法复制。请先在终端中选中文字。",
+  },
+  pasteToast: {
+    needsHttps: "粘贴需要 HTTPS。请运行 `aoe serve --remote` 获取 Tailscale 或 Cloudflare 的 HTTPS 地址。",
+    failed: "无法读取剪贴板。请重新复制,或在 Safari 中打开此控制台。",
+  },
+  editModal: {
+    title: "编辑快捷按钮",
+    buttonN: "按钮 {{n}}",
+    labelField: "标题",
+    labelPlaceholder: "按钮标题",
+    textField: "文本内容",
+    textPlaceholder: "要发送到终端的文本",
+    charCount: "{{n}} / 20000",
+    autoEnter: "发送后自动按回车",
+    save: "保存",
+    cancel: "取消",
+    labelTooLong: "标题不能超过 64 个字符。",
+    textTooLong: "文本不能超过 20000 个字符。",
+    saveFailed: "保存失败,请重试。",
+  },
+};

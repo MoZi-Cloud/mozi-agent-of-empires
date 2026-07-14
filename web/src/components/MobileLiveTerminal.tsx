@@ -4,6 +4,7 @@ import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
+import { encodePrintable, hasAnyModifier, type Modifiers } from "../lib/modifierKeys";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -97,9 +98,11 @@ export interface MobileLiveTerminalProps {
     col: number,
     row: number,
   ) => void;
-  /** Virtual Ctrl modifier from the mobile toolbar. */
-  ctrlActiveRef: RefObject<boolean>;
-  clearCtrl: () => void;
+  /** Mobile toolbar modifier latches (shift/ctrl/alt/cmd). One-shot: the next
+   *  keypress applies them, then they clear. The ref mirrors state so this
+   *  synchronous handler reads the live snapshot. */
+  modifiersRef: RefObject<Modifiers>;
+  clearModifiers: () => void;
   /** Hidden input element, exposed so the keyboard FAB / toolbar can
    *  focus and blur it. */
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -310,8 +313,8 @@ export function MobileLiveTerminal({
   uploadPastedImage,
   forwardWheel,
   forwardButton,
-  ctrlActiveRef,
-  clearCtrl,
+  modifiersRef,
+  clearModifiers,
   inputRef,
   onInputFocusChange,
   bottomAlign,
@@ -1136,17 +1139,38 @@ export function MobileLiveTerminal({
   const composingRef = useRef(false);
   const sendKeys = useCallback(
     (data: string) => {
-      if (ctrlActiveRef.current && data.length === 1) {
-        const code = data.toUpperCase().charCodeAt(0);
-        if (code >= 65 && code <= 90) {
-          sendData(String.fromCharCode(code - 64));
-          clearCtrl();
-          return;
+      const m = modifiersRef.current;
+      // Cmd (Mac shortcut) on the soft keyboard: c copies the current
+      // terminal selection, v pastes; anything else is swallowed because Mac
+      // terminals do not forward Cmd to the PTY.
+      if (m.cmd && data.length === 1) {
+        const k = data.toLowerCase();
+        if (k === "c") {
+          const text = window.getSelection()?.toString() ?? "";
+          if (text) void writeClipboard(text);
+        } else if (k === "v") {
+          // Best-effort paste; the toolbar's Paste button is the robust path
+          // for insecure (plain-HTTP) contexts.
+          navigator.clipboard
+            ?.readText?.()
+            .then((t) => {
+              if (t) sendData(t);
+            })
+            .catch(() => {});
         }
+        clearModifiers();
+        return;
       }
-      sendData(data);
+      if (data.length === 1) {
+        const code = data.toUpperCase().charCodeAt(0);
+        const encoded = encodePrintable(data, code, m);
+        sendData(encoded ?? data);
+      } else {
+        sendData(data);
+      }
+      if (hasAnyModifier(m)) clearModifiers();
     },
-    [sendData, ctrlActiveRef, clearCtrl],
+    [sendData, modifiersRef, clearModifiers],
   );
 
   // Native (not React-synthetic) beforeinput: React's onBeforeInput is

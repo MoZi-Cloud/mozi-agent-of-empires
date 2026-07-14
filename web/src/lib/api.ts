@@ -228,6 +228,39 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
+// --- Mobile terminal toolbar quick buttons ---
+// The count is the schema-visible `web.mobile_quick_button_count` setting;
+// these endpoints carry only the per-button contents (synced via config).
+
+export interface MobileQuickButton {
+  label: string;
+  text: string;
+  auto_enter: boolean;
+}
+
+export interface MobileQuickButtonsResponse {
+  count: number;
+  buttons: MobileQuickButton[];
+}
+
+export function fetchMobileQuickButtons(): Promise<MobileQuickButtonsResponse | null> {
+  return fetchJson<MobileQuickButtonsResponse>("/api/mobile-quick-buttons");
+}
+
+export async function putMobileQuickButtons(buttons: MobileQuickButton[]): Promise<MobileQuickButtonsResponse | null> {
+  try {
+    const res = await fetch("/api/mobile-quick-buttons", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ buttons }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as MobileQuickButtonsResponse;
+  } catch {
+    return null;
+  }
+}
+
 // The schema is static for the server's run, and the profile-settings write
 // guard (`updateProfileSettings`) derives its section allowlist from it, so we
 // cache the first successful fetch and reuse it instead of refetching on every

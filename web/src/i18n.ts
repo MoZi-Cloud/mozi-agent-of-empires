@@ -39,19 +39,26 @@ export function persistLanguage(lang: AppLang): void {
 if (!i18n.isInitialized) {
   void i18n.use(initReactI18next).init({
     resources: {
-      en: { common: en.common, settings: en.settings, shell: en.shell, sidebar: en.sidebar },
+      en: {
+        common: en.common,
+        settings: en.settings,
+        shell: en.shell,
+        sidebar: en.sidebar,
+        mobile: en.mobile,
+      },
       zh: {
         common: zh.common,
         settings: zh.settings,
         shell: zh.shell,
         sidebar: zh.sidebar,
         schema: zh.schema,
+        mobile: zh.mobile,
       },
     },
     lng: detectLanguage(),
     fallbackLng: "en",
     supportedLngs: ["en", "zh"],
-    ns: ["common", "settings", "shell", "sidebar"],
+    ns: ["common", "settings", "shell", "sidebar", "mobile"],
     defaultNS: "common",
     react: { useSuspense: false },
     interpolation: { escapeValue: false },
