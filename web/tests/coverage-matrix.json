@@ -14,10 +14,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/MobileTerminalToolbar.test.tsx"],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx",
-        "web/src/components/QuickButtonEditModal.tsx"
-      ]
+      "components": ["web/src/components/MobileTerminalToolbar.tsx", "web/src/components/QuickButtonEditModal.tsx"]
     },
     {
       "id": "app-shell.docks",
