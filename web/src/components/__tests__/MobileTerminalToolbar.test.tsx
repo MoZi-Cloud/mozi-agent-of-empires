@@ -7,7 +7,6 @@
 // custom quick-button rendering. The parent (a live terminal view) owns the
 // keyboard inset, so the strip carries none.
 
-import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MobileTerminalToolbar } from "../MobileTerminalToolbar";
