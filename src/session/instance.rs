@@ -91,6 +91,36 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// `last_error` the status poller stamps when the tmux server itself could
+/// not be reached for a sustained period (past `UNKNOWN_ERROR_WINDOW_*`),
+/// as distinct from `TMUX_SESSION_GONE_ERROR`'s "session confirmed absent"
+/// case. This is a connectivity failure, not evidence the session's pane
+/// was actually torn down, so consumers that treat `TMUX_SESSION_GONE_ERROR`
+/// as the calm "Stopped" case must not conflate the two.
+pub const TMUX_SERVER_UNREACHABLE_ERROR: &str =
+    "tmux server could not be reached. It may be busy or have crashed.";
+
+/// How long a session that has never once been confirmed alive
+/// (`Instance::ever_confirmed_present == false`) tolerates a continuous
+/// `tmux::SessionExistence::Unknown` before `update_status_with_metadata_inner`
+/// latches `Status::Error`. There is nothing that could be "blipping" for a
+/// session nobody has ever seen alive (e.g. `aoe add` without `--launch`, or
+/// a row whose tmux session failed to spawn), so this stays close to the
+/// pre-fix immediate-Error behavior rather than the long grace period below;
+/// a couple of `status_poll_loop` ticks (2s each) is enough to smooth over
+/// boot jitter without stalling the case a genuinely-dead server needs to
+/// surface quickly (see `web/tests/live/ensure-session-restart.spec.ts`,
+/// which waits up to 10s for exactly this transition).
+const UNKNOWN_ERROR_WINDOW_NEVER_PRESENT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long a session that HAS been confirmed alive tolerates a continuous
+/// `tmux::SessionExistence::Unknown` before latching `Status::Error`. Sized
+/// with real margin over the ~11s max tmux-server-unreachable blip observed
+/// in production debug logs, so a transient hiccup on an actually-running
+/// session never trips a false Error.
+const UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// The MVP palette for the per-session color label (#2383). Kept deliberately
 /// small and status-oriented: red = needs attention / blocked, amber =
 /// working / in progress, green = done / ready. `None`/absent clears the dot.
@@ -771,6 +801,28 @@ pub struct Instance {
     /// is by construction-ordering, not by synchronization.
     #[serde(skip)]
     pub live_status_baseline: Option<Status>,
+    /// Whether this in-memory `Instance` has ever observed
+    /// `tmux::SessionExistence::Present` since being loaded. `#[serde(skip)]`
+    /// like `live_status_baseline`, so it starts `false` on every fresh disk
+    /// load / daemon boot. Gates how long `update_status_with_metadata_inner`
+    /// tolerates a sustained `SessionExistence::Unknown` before latching
+    /// `Status::Error`: a session that was confirmed alive can be riding out
+    /// a transient tmux-server blip, but a session that has never once been
+    /// confirmed alive has nothing to "blip" from, so `Unknown` escalates
+    /// much sooner for it. See `UNKNOWN_ERROR_WINDOW_NEVER_PRESENT` and
+    /// `UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT`.
+    #[serde(skip)]
+    pub ever_confirmed_present: bool,
+    /// Instant this instance most recently entered a continuous streak of
+    /// `tmux::SessionExistence::Unknown`. `None` while the last known
+    /// existence was `Present`/`Absent`; set on the first `Unknown`
+    /// observation of a streak and cleared the moment a `Present` or
+    /// confirmed `Absent` reading breaks it. Compared against
+    /// `UNKNOWN_ERROR_WINDOW_NEVER_PRESENT` /
+    /// `UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT` to decide whether a
+    /// sustained-`Unknown` session should latch `Status::Error`.
+    #[serde(skip)]
+    pub unknown_since: Option<std::time::Instant>,
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
@@ -1192,6 +1244,8 @@ impl Instance {
             last_error_check: None,
             last_start_time: None,
             live_status_baseline: None,
+            ever_confirmed_present: false,
+            unknown_since: None,
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
@@ -1366,6 +1420,8 @@ impl Instance {
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.source_profile = std::mem::take(&mut self.source_profile);
+        disk.ever_confirmed_present = self.ever_confirmed_present;
+        disk.unknown_since = self.unknown_since;
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
         // (which runs before every launch) would wipe the host-minted cache and
@@ -4474,18 +4530,67 @@ impl Instance {
             }
         };
 
-        if !session.exists() {
-            tracing::trace!(target: "session.store",
-                "status '{}': session.exists()=false (tmux name={}), setting Error",
-                self.title,
-                tmux::Session::generate_name(&self.id, &self.title)
-            );
-            self.status = Status::Error;
-            if self.last_error.is_none() {
-                self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+        match session.existence() {
+            tmux::SessionExistence::Absent => {
+                tracing::trace!(target: "session.store",
+                    "status '{}': session.existence()=Absent (tmux name={}), setting Error",
+                    self.title,
+                    tmux::Session::generate_name(&self.id, &self.title)
+                );
+                self.unknown_since = None;
+                self.status = Status::Error;
+                if self.last_error.is_none() {
+                    self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+                }
+                self.last_error_check = Some(std::time::Instant::now());
+                return;
             }
-            self.last_error_check = Some(std::time::Instant::now());
-            return;
+            tmux::SessionExistence::Unknown => {
+                // The tmux server itself was unreachable (stale socket,
+                // refused connection), not a confirmed-absent session. This
+                // is NOT evidence of anything on its own: a session that has
+                // been confirmed alive rides out a bounded grace window
+                // (absorbing a transient hiccup, the false-alarm bug this
+                // branch exists to fix), but a session that has never once
+                // been confirmed alive has nothing to "blip" from and gets a
+                // much shorter one.
+                let window = if self.ever_confirmed_present {
+                    UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT
+                } else {
+                    UNKNOWN_ERROR_WINDOW_NEVER_PRESENT
+                };
+                let unknown_since = *self
+                    .unknown_since
+                    .get_or_insert_with(std::time::Instant::now);
+                if unknown_since.elapsed() < window {
+                    tracing::debug!(target: "session.store",
+                        "status '{}': tmux server unreachable for {:?} (< {:?} window, ever_confirmed_present={}), retaining status {:?}",
+                        self.title,
+                        unknown_since.elapsed(),
+                        window,
+                        self.ever_confirmed_present,
+                        self.status
+                    );
+                    return;
+                }
+                tracing::trace!(target: "session.store",
+                    "status '{}': tmux server unreachable for {:?} (>= {:?} window, ever_confirmed_present={}), setting Error",
+                    self.title,
+                    unknown_since.elapsed(),
+                    window,
+                    self.ever_confirmed_present
+                );
+                self.status = Status::Error;
+                if self.last_error.is_none() {
+                    self.last_error = Some(TMUX_SERVER_UNREACHABLE_ERROR.to_string());
+                }
+                self.last_error_check = Some(std::time::Instant::now());
+                return;
+            }
+            tmux::SessionExistence::Present => {
+                self.unknown_since = None;
+                self.ever_confirmed_present = true;
+            }
         }
 
         let is_dead = metadata
@@ -5194,6 +5299,220 @@ mod tests {
         inst.update_status_with_metadata(None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    /// Regression guard for the false-Error-latch bug: a confirmed-absent
+    /// session (tmux server reachable, session missing from its list) must
+    /// still latch `Status::Error` with `TMUX_SESSION_GONE_ERROR` exactly as
+    /// before. Proves the `Unknown` fix did not soften the real-death case.
+    #[test]
+    #[serial_test::serial]
+    fn test_confirmed_absent_session_still_latches_error() {
+        let mut inst = Instance::new("test-absent", "/tmp/test-absent");
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        // Fresh cache, server reachable, but this instance's tmux session
+        // name is not in it: a confirmed-absent session.
+        guard.force_present(&["some_other_session"]);
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
+        assert!(inst.last_error_check.is_some());
+    }
+
+    /// A tmux-server-unreachable probe (`SessionExistence::Unknown`) must not
+    /// touch status, last_error, or last_error_check at all: a transient
+    /// tmux hiccup must never look like every session died.
+    #[test]
+    #[serial_test::serial]
+    fn test_unreachable_tmux_server_retains_running_status() {
+        let mut inst = Instance::new("test-unknown", "/tmp/test-unknown");
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        // Fresh cache with no data: mirrors what `refresh_session_cache`
+        // writes when `list-sessions` itself fails (stale socket, refused
+        // connection), not a confirmed-absent session.
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.last_error, None);
+        assert_eq!(inst.last_error_check, None);
+    }
+
+    /// Same `Unknown` retain-behavior, but starting from an already-set
+    /// genuine `Status::Error`: an unreachable tmux server must not clear or
+    /// overwrite a real prior failure either. "Retain" means untouched in
+    /// both directions.
+    #[test]
+    #[serial_test::serial]
+    fn test_unreachable_tmux_server_does_not_clear_existing_error() {
+        let mut inst = Instance::new("test-unknown-error", "/tmp/test-unknown-error");
+        inst.status = Status::Error;
+        inst.last_error = Some("agent crashed".to_string());
+        // None (rather than a stale Instant) so the 30s Error-recheck
+        // throttle above this code path doesn't short-circuit before the
+        // probe we're testing ever runs.
+        inst.last_error_check = None;
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+        assert_eq!(inst.last_error_check, None);
+    }
+
+    /// A session that has never been confirmed alive (`ever_confirmed_present`
+    /// still `false`, e.g. `aoe add` without `--launch`) has nothing to
+    /// "blip" from, so `Unknown` escalates to `Error` well before the long
+    /// confirmed-present window; this is the case
+    /// `web/tests/live/ensure-session-restart.spec.ts` depends on to see
+    /// `Error` within its 10s wait.
+    #[test]
+    #[serial_test::serial]
+    fn test_never_confirmed_present_unknown_escalates_after_fast_window() {
+        let mut inst = Instance::new("test-never-present", "/tmp/test-never-present");
+        inst.status = Status::Idle;
+        inst.last_error = None;
+        inst.last_error_check = None;
+        assert!(!inst.ever_confirmed_present);
+        inst.unknown_since = Some(
+            std::time::Instant::now()
+                - UNKNOWN_ERROR_WINDOW_NEVER_PRESENT
+                - std::time::Duration::from_millis(1),
+        );
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(TMUX_SERVER_UNREACHABLE_ERROR)
+        );
+        assert!(inst.last_error_check.is_some());
+    }
+
+    /// The never-confirmed-present fast window must still absorb a fresh
+    /// `Unknown` streak (elapsed just under the window), otherwise every
+    /// freshly-added, not-yet-launched session would flap to `Error` on the
+    /// very first couple of poll ticks before tmux even has a chance to
+    /// answer.
+    #[test]
+    #[serial_test::serial]
+    fn test_never_confirmed_present_unknown_retains_status_below_fast_window() {
+        let mut inst = Instance::new("test-never-present-fresh", "/tmp/test-never-present-fresh");
+        inst.status = Status::Idle;
+        inst.last_error = None;
+        inst.last_error_check = None;
+        assert!(!inst.ever_confirmed_present);
+        inst.unknown_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(500));
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Idle);
+        assert_eq!(inst.last_error, None);
+        assert_eq!(inst.last_error_check, None);
+    }
+
+    /// The real production blip case: a session confirmed alive at some
+    /// point must ride out an `Unknown` streak up to the long window,
+    /// covering the ~11s max blip duration observed in production with
+    /// margin, before ever latching `Error`.
+    #[test]
+    #[serial_test::serial]
+    fn test_confirmed_present_unknown_retains_status_below_long_window() {
+        let mut inst = Instance::new("test-confirmed-present", "/tmp/test-confirmed-present");
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+        inst.ever_confirmed_present = true;
+        // 11s: the max blip duration observed in production. Must not latch.
+        inst.unknown_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.last_error, None);
+        assert_eq!(inst.last_error_check, None);
+    }
+
+    /// A session confirmed alive must still eventually latch `Error` once
+    /// the tmux server has been unreachable past the long bounded window;
+    /// the fix absorbs blips, it does not make a genuinely-dead server
+    /// invisible forever.
+    #[test]
+    #[serial_test::serial]
+    fn test_confirmed_present_unknown_escalates_after_long_window() {
+        let mut inst = Instance::new(
+            "test-confirmed-present-dead",
+            "/tmp/test-confirmed-present-dead",
+        );
+        inst.status = Status::Running;
+        inst.last_error = None;
+        inst.last_error_check = None;
+        inst.ever_confirmed_present = true;
+        inst.unknown_since = Some(
+            std::time::Instant::now()
+                - UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT
+                - std::time::Duration::from_millis(1),
+        );
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_unreachable();
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(TMUX_SERVER_UNREACHABLE_ERROR)
+        );
+        assert!(inst.last_error_check.is_some());
+    }
+
+    /// `Present` must clear a stale `unknown_since` and flip
+    /// `ever_confirmed_present` on, so a session that recovers from a real
+    /// outage is treated as confirmed-alive (long window) on its next
+    /// `Unknown` streak rather than falling back to the never-confirmed-present
+    /// fast window.
+    #[test]
+    #[serial_test::serial]
+    fn test_present_clears_unknown_since_and_marks_ever_confirmed_present() {
+        let mut inst = Instance::new("present-clears-unknown", "/tmp/present-clears-unknown");
+        inst.status = Status::Idle;
+        inst.unknown_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert!(!inst.ever_confirmed_present);
+        let name = tmux::Session::generate_name(&inst.id, &inst.title);
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[name.as_str()]);
+
+        inst.update_status_with_metadata_inner(None);
+
+        assert!(inst.ever_confirmed_present);
+        assert_eq!(inst.unknown_since, None);
     }
 
     #[test]
@@ -8455,6 +8774,57 @@ mod tests {
                 inst.sandbox_info.as_ref().unwrap().before_start_env,
                 vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())],
                 "live before_start_env must survive the pre-launch disk reload"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn reconcile_from_disk_preserves_unknown_streak_tracking() {
+            // `ever_confirmed_present` and `unknown_since` are both
+            // `#[serde(skip)]`, so the disk snapshot always has them at their
+            // defaults (`false` / `None`). reconcile_from_disk (run before
+            // every launch) must carry the live values forward, or a
+            // previously-confirmed-present session would lose its long
+            // tolerance window and drop back to the short never-present one
+            // on every relaunch.
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-unknown-since").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.source_profile = "reconcile-unknown-since".to_string();
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Stamp the runtime tracking state into the in-memory instance
+            // only, mirroring what a live poll tick would have set.
+            inst.ever_confirmed_present = true;
+            let unknown_since = std::time::Instant::now() - std::time::Duration::from_secs(5);
+            inst.unknown_since = Some(unknown_since);
+
+            inst.reconcile_from_disk();
+
+            assert!(
+                inst.ever_confirmed_present,
+                "ever_confirmed_present must survive the pre-launch disk reload"
+            );
+            assert_eq!(
+                inst.unknown_since,
+                Some(unknown_since),
+                "unknown_since must survive the pre-launch disk reload"
             );
         }
 

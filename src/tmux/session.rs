@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    refresh_session_cache,
+    probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
         append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
-    SESSION_PREFIX,
+    SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
@@ -212,6 +212,15 @@ impl Session {
 
     pub fn exists(&self) -> bool {
         crate::tmux::session_exists(&self.name)
+    }
+
+    /// Tri-state existence probe that distinguishes "the tmux server
+    /// confirmed this session is gone" from "the tmux server was
+    /// unreachable, so we don't actually know". See [`SessionExistence`].
+    /// Callers that would otherwise latch a destructive or error state on a
+    /// plain `false` from [`Self::exists`] should use this instead.
+    pub fn existence(&self) -> SessionExistence {
+        probe_session_existence(&self.name)
     }
 
     pub fn create(&self, working_dir: &str, command: Option<&str>) -> Result<()> {
