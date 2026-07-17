@@ -550,6 +550,13 @@ pub fn remove_managed_worktree(
                 }
             }
         }
+        // `prune` is repo-wide but lock-respecting: it reaps entries whose
+        // checkout is missing yet SKIPS locked ones, so an aoe-locked worktree
+        // whose checkout is invisible from here (a sibling sandbox, a container
+        // mount) is never wrongly reaped (#2414). If this session's own locked
+        // entry survives here because its stored path diverged from git's
+        // registered path, the scoped self-heal in `delete_branch` reaps it by
+        // the exact path git reports for this branch.
         if let Err(e) = git_wt.prune_worktrees() {
             errors.push(format!("Worktree: {}", e));
         }
