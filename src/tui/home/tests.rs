@@ -5082,6 +5082,7 @@ fn test_create_session_in_all_mode_is_findable() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -6390,6 +6391,7 @@ fn test_apply_creation_results_returns_session_id() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -14451,6 +14453,7 @@ mod new_session_attach_mode {
             command_override: String::new(),
             scratch: false,
             fork_seed: None,
+            structured: false,
         }
     }
 
@@ -14928,6 +14931,117 @@ mod default_attach_mode {
             matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
             "structured view rows must route to OpenStructuredView regardless of default_attach_mode, got {:?}",
             action
+        );
+    }
+
+    /// Render the whole home screen into a string for placeholder /
+    /// badge assertions.
+    fn render_home(env: &mut TestEnv) -> String {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn structured_session_env() -> (TestEnv, String) {
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "acp-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+        });
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        (env, id)
+    }
+
+    /// A selected structured session has no agent tmux pane; the preview
+    /// must show the explanatory placeholder instead of a blank capture.
+    #[test]
+    #[serial]
+    fn structured_session_preview_shows_placeholder() {
+        let (mut env, _id) = structured_session_env();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("Structured view"),
+            "placeholder heading missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structured transcript"),
+            "placeholder body missing:\n{screen}"
+        );
+    }
+
+    /// The switch-view context entry offers the opposite view: terminal for
+    /// a structured row, structured for a terminal row whose tool is
+    /// ACP-capable, and nothing for rows mid-lifecycle.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gates_by_view_and_state() {
+        let (mut env, id) = structured_session_env();
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal row with an ACP-capable tool (claude): offer structured.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), Some(false));
+        // Mid-lifecycle rows are excluded.
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Creating;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Accepting the switch-view confirm emits the action with the stashed
+    /// session id, mirroring the other confirm-carrying actions.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_confirm_dispatches_action_with_stashed_id() {
+        let (mut env, id) = structured_session_env();
+        env.view.prompt_switch_view_for_selected();
+        assert!(
+            env.view.confirm_dialog.is_some(),
+            "switch must confirm first (history is destroyed)"
+        );
+        let action = env.view.dispatch_confirm_submit("switch_view");
+        assert!(
+            matches!(action, Some(Action::SwitchSessionView(ref sid)) if *sid == id),
+            "expected SwitchSessionView({id}), got {action:?}"
+        );
+    }
+
+    /// The `[structured]` badge marks structured rows in the Terminal home
+    /// layout too (non-sandboxed rows have no container/host badge there),
+    /// so Enter opening the structured view is never a surprise.
+    #[test]
+    #[serial]
+    fn structured_badge_shows_in_terminal_view_mode() {
+        let (mut env, _id) = structured_session_env();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("[structured]"),
+            "badge missing in Terminal view mode:\n{screen}"
         );
     }
 
