@@ -1984,6 +1984,21 @@ impl Instance {
         (Utc::now() - since).to_std().ok()
     }
 
+    /// True iff this session should keep the machine awake: it is active
+    /// (`Running`, `Waiting`, `Starting`, or `Creating`), or it went idle less
+    /// than `window` ago. A session idle for `>= window` (or
+    /// Stopped/Error/Unknown/Deleting) returns false, so the sleep-inhibit
+    /// assertion may release. `Waiting` counts as active unconditionally, so a
+    /// session parked waiting for input holds sleep until it is answered; that
+    /// is intentional for the opt-in v1 (no `waiting_since` timestamp exists to
+    /// age it out).
+    pub fn has_recent_activity(&self, window: std::time::Duration) -> bool {
+        matches!(
+            self.status,
+            Status::Running | Status::Waiting | Status::Starting | Status::Creating
+        ) || matches!(self.idle_age(), Some(age) if age < window)
+    }
+
     /// Return the profile that should drive config resolution for this
     /// instance, falling back to the user's globally configured default
     /// when `source_profile` was never populated (e.g. legacy callers).
@@ -7073,6 +7088,69 @@ mod tests {
         // or treating the session as freshly stopped.
         inst.idle_entered_at = Some(Utc::now() + chrono::Duration::seconds(60));
         assert_eq!(inst.idle_age(), None);
+    }
+
+    #[test]
+    fn test_has_recent_activity_active_statuses_are_true() {
+        let window = std::time::Duration::from_secs(15 * 60);
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Starting,
+            Status::Creating,
+        ] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            assert!(
+                inst.has_recent_activity(window),
+                "{status:?} should keep the machine awake"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_recent_activity_inactive_statuses_are_false() {
+        let window = std::time::Duration::from_secs(15 * 60);
+        for status in [
+            Status::Stopped,
+            Status::Error,
+            Status::Unknown,
+            Status::Deleting,
+        ] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            assert!(
+                !inst.has_recent_activity(window),
+                "{status:?} must not hold the sleep-inhibit assertion"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_recent_activity_idle_within_window_is_true() {
+        let window = std::time::Duration::from_secs(15 * 60);
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        assert!(inst.has_recent_activity(window));
+    }
+
+    #[test]
+    fn test_has_recent_activity_idle_past_window_is_false() {
+        let window = std::time::Duration::from_secs(15 * 60);
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(30));
+        assert!(!inst.has_recent_activity(window));
+    }
+
+    #[test]
+    fn test_has_recent_activity_idle_without_timestamp_is_false() {
+        let window = std::time::Duration::from_secs(15 * 60);
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = None;
+        assert!(!inst.has_recent_activity(window));
     }
 
     #[test]

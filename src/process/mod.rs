@@ -233,6 +233,119 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     pid
 }
 
+/// An acquired OS assertion that prevents user-idle system sleep while agent
+/// sessions are active. The assertion is held by a subprocess whose lifetime
+/// is tied to the daemon, so it releases even when the daemon exits via
+/// `std::process::exit` or dies from a panic, OOM, or `kill -9` (paths where
+/// no `Drop` runs): the child terminates itself once the daemon is gone (macOS
+/// `caffeinate -w <daemon_pid>` watches the daemon PID; the Linux `cat` sees
+/// EOF on the stdin pipe the daemon held), and init then reaps it. The
+/// `server` status loop is the only consumer.
+#[cfg(feature = "serve")]
+pub trait SleepInhibit: Send {
+    /// Acquire the assertion by spawning and retaining the backing child.
+    fn acquire(&mut self) -> anyhow::Result<()>;
+    /// Release the assertion, terminating the backing child.
+    fn release(&mut self);
+    /// Whether the reconciler should treat the assertion as still held and skip
+    /// respawning. True while the backing child is alive, and when respawning
+    /// would be futile (backend latched unavailable, or an unsupported platform).
+    fn is_held_alive(&mut self) -> bool;
+}
+
+/// Build the platform sleep inhibitor: `caffeinate -i -w <daemon_pid>` on
+/// macOS, `systemd-inhibit --what=idle:sleep ... cat` on Linux, and a no-op
+/// on every other platform.
+#[cfg(feature = "serve")]
+pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::CaffeinateInhibitor::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::SystemdInhibitor::new())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Box::new(NoopInhibitor)
+    }
+}
+
+/// Sleep inhibitor for platforms with no supported backend: acquire and release
+/// are no-ops, and `is_held_alive` reports held to avoid pointless respawns.
+#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+struct NoopInhibitor;
+
+#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+impl SleepInhibit for NoopInhibitor {
+    fn acquire(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn release(&mut self) {}
+
+    fn is_held_alive(&mut self) -> bool {
+        // No backend exists on this platform, so there is nothing to respawn:
+        // report held to keep the reconciler at a steady-state no-op instead of
+        // rebuilding a fresh Noop every reconcile interval.
+        true
+    }
+}
+
+/// Latched once a sleep-inhibit backend is found unusable on this host: the
+/// helper binary is missing, or it spawns but exits without taking the lock
+/// (WSL2 or a container with no logind). Process-global because the reconciler
+/// builds a fresh inhibitor on every reacquire, so a per-instance guard could
+/// not remember across rebuilds; the backends read it to report the dead
+/// backend as held, which stops the reconciler respawning a doomed child.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+static SLEEP_INHIBIT_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn sleep_inhibit_unavailable() -> bool {
+    SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
+/// by the platform backends so the warn-once policy lives in one place while
+/// each backend keeps only its own spawn and liveness mechanics.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn latch_sleep_inhibit_unavailable(reason: &str) {
+    if !SLEEP_INHIBIT_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(target: "process.sleep_inhibit", "{reason}");
+    }
+}
+
+/// Report whether a spawned inhibitor's backing child should be treated as
+/// still holding the assertion. Shared by both platform backends because the
+/// exit-code discrimination is policy (like the warn-once latch), not per-OS
+/// mechanics, so the two copies cannot drift; only `exit_reason` differs.
+#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) -> bool {
+    if sleep_inhibit_unavailable() {
+        return true;
+    }
+    let Some(child) = child.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(None) => true,
+        // A nonzero exit code (not a signal) means the helper itself failed to
+        // hold the lock; latch so the reconciler stops respawning a doomed
+        // child. Death by signal (`code() == None`) is an external kill of a
+        // live holder, so report not-held and let it respawn.
+        Ok(Some(status)) if status.code().is_some_and(|c| c != 0) => {
+            latch_sleep_inhibit_unavailable(exit_reason);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Kill a process and all its descendants
 /// Sends SIGTERM first, then SIGKILL to any survivors
 pub fn kill_process_tree(pid: u32) {

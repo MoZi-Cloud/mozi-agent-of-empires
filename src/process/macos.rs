@@ -87,3 +87,61 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
 
     None
 }
+
+/// Prevents user-idle system sleep by holding a `caffeinate` child. `-i`
+/// inhibits system idle sleep only, so the display still sleeps normally.
+#[cfg(feature = "serve")]
+pub(super) struct CaffeinateInhibitor {
+    child: Option<std::process::Child>,
+}
+
+#[cfg(feature = "serve")]
+impl CaffeinateInhibitor {
+    pub(super) fn new() -> Self {
+        Self { child: None }
+    }
+}
+
+#[cfg(feature = "serve")]
+impl super::SleepInhibit for CaffeinateInhibitor {
+    fn acquire(&mut self) -> anyhow::Result<()> {
+        if super::sleep_inhibit_unavailable() {
+            return Ok(());
+        }
+        // `-w <daemon_pid>` makes caffeinate exit when the daemon exits, so
+        // the assertion is released even on `std::process::exit`, a panic,
+        // OOM, or `kill -9`, none of which run a `Drop`.
+        let child = match Command::new("caffeinate")
+            .args(["-i", "-w", &std::process::id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                super::latch_sleep_inhibit_unavailable(
+                    "caffeinate not found; OS sleep will not be inhibited on this host",
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.child = Some(child);
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn is_held_alive(&mut self) -> bool {
+        super::sleep_inhibit_child_held_alive(
+            &mut self.child,
+            "caffeinate exited unexpectedly; OS sleep will not be inhibited on this host",
+        )
+    }
+}

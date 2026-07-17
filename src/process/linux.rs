@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "serve")]
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// Collect `pid` and every descendant by walking `/proc` once to build a
 /// parent -> children map, then descending it. One `/proc` scan regardless of
@@ -109,6 +111,82 @@ fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
     let adjusted_idx = field_idx.checked_sub(2)?;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     fields.get(adjusted_idx)?.parse().ok()
+}
+
+/// Prevents user-idle system sleep by holding a `systemd-inhibit` block lock.
+/// `--what=idle:sleep` blocks idle sleep only (the display still sleeps).
+#[cfg(feature = "serve")]
+pub(super) struct SystemdInhibitor {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+}
+
+#[cfg(feature = "serve")]
+impl SystemdInhibitor {
+    pub(super) fn new() -> Self {
+        Self {
+            child: None,
+            stdin: None,
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+impl super::SleepInhibit for SystemdInhibitor {
+    fn acquire(&mut self) -> anyhow::Result<()> {
+        if super::sleep_inhibit_unavailable() {
+            return Ok(());
+        }
+        let mut child = match Command::new("systemd-inhibit")
+            .args([
+                "--what=idle:sleep",
+                "--mode=block",
+                "--who=Agent of Empires",
+                "--why=Active agent sessions",
+                "cat",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                super::latch_sleep_inhibit_unavailable(
+                    "systemd-inhibit not found; OS sleep will not be inhibited on this host",
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // Retain the piped stdin: `systemd-inhibit` holds the lock only while
+        // the wrapped `cat` runs, and `cat` runs until its stdin hits EOF.
+        // Dropping this handle early sends EOF and releases the lock at once,
+        // so it stays owned for the whole assertion.
+        self.stdin = child.stdin.take();
+        self.child = Some(child);
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        // Close our stdin fd (cat sees EOF), then SIGKILL as a guaranteed
+        // fallback: logind releases the lock on the holder's death by any
+        // cause, and an uncatchable kill means `wait` cannot wedge on a stuck
+        // child. Then reap.
+        self.stdin = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn is_held_alive(&mut self) -> bool {
+        super::sleep_inhibit_child_held_alive(
+            &mut self.child,
+            "systemd-inhibit exited without taking the lock (no logind?); \
+             OS sleep will not be inhibited on this host",
+        )
+    }
 }
 
 #[cfg(test)]
