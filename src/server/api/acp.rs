@@ -1613,6 +1613,50 @@ pub struct ViewSwitchResponse {
 /// History is destroyed in the swap: the tmux scrollback is dropped
 /// when the pane is killed; structured view starts with an empty conversation.
 /// The frontend warns the user before calling this endpoint.
+/// How a structured-view spawn seeds its transcript when the view is enabled.
+struct StructuredSeed {
+    stored_acp_session_id: Option<String>,
+    seed_history_replay: bool,
+}
+
+/// Decide the seed for an `acp_enable` spawn.
+///
+/// - An existing `acp_session_id` (a prior structured session, or a #2276
+///   import) is loaded; history replay is seeded only when `import_pending`.
+/// - Otherwise, #2252 direction B: a claude terminal session whose resumable
+///   transcript sits in `agent_session_id` is carried into a seeded
+///   `session/load`, so switching a terminal claude session into structured
+///   view continues the same conversation. `transcript_present` gates this so a
+///   stale id does not hard-fail the seeded spawn.
+/// - Failing both, the spawn starts a fresh `session/new`.
+fn resolve_structured_seed(
+    tool: &str,
+    acp_agent: &str,
+    acp_session_id: Option<&str>,
+    agent_session_id: Option<&str>,
+    import_pending: bool,
+    transcript_present: bool,
+) -> StructuredSeed {
+    if let Some(id) = acp_session_id {
+        return StructuredSeed {
+            stored_acp_session_id: Some(id.to_string()),
+            seed_history_replay: import_pending,
+        };
+    }
+    if crate::agents::acp_transcript_cli_resumable(tool, acp_agent) && transcript_present {
+        if let Some(id) = agent_session_id.filter(|s| !s.trim().is_empty()) {
+            return StructuredSeed {
+                stored_acp_session_id: Some(id.to_string()),
+                seed_history_replay: true,
+            };
+        }
+    }
+    StructuredSeed {
+        stored_acp_session_id: None,
+        seed_history_replay: import_pending,
+    }
+}
+
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1751,12 +1795,38 @@ pub async fn acp_enable(
     let supervisor = state.acp_supervisor.clone();
     let session_id = id.clone();
     let model = instance.agent_model.clone();
-    let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
-    // #2276: seed the transcript from the session/load replay when enabling
-    // the structured view on an imported session (import_pending, empty store).
-    let seed_history_replay = instance.import_pending == Some(true);
+    // #2252 direction B: a claude terminal session's resumable transcript lives
+    // in `agent_session_id`, not `acp_session_id`. When present on the host (the
+    // seeded `session/load` hard-fails on a missing id), carry it into the
+    // structured spawn so the conversation continues in structured view. The
+    // in-container transcript can't be probed from the host, so sandboxed
+    // sessions attempt the load unconditionally.
+    let transcript_present = instance.is_sandboxed()
+        || instance
+            .agent_session_id
+            .as_deref()
+            .map(|sid| {
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                )
+            })
+            .unwrap_or(false);
+    let seed = resolve_structured_seed(
+        &instance.tool,
+        &agent_name,
+        instance.acp_session_id.as_deref(),
+        instance.agent_session_id.as_deref(),
+        instance.import_pending == Some(true),
+        transcript_present,
+    );
+    let stored_acp_session_id = seed.stored_acp_session_id;
+    // #2276: seed the transcript from the session/load replay when enabling the
+    // structured view on an imported session, or on a direction-B keep-context
+    // switch (empty store, load an existing transcript).
+    let seed_history_replay = seed.seed_history_replay;
     // Structured fork: send session/fork against the parent id on first connect.
     let fork_from = instance.fork_pending.clone();
     let profile_for_spawn = profile.clone();
@@ -1825,9 +1895,14 @@ pub async fn acp_enable(
 /// Switch a structured view session back to tmux. Idempotent: a session that
 /// is already tmux-mode returns 200 with no work done.
 ///
-/// History is destroyed in the swap: the structured view conversation log
-/// (still in the broadcast replay buffer) is dropped, and tmux comes
-/// back with an empty pane that the agent fills as it runs.
+/// When the agent pairing shares a CLI-resumable transcript (claude, see
+/// `agents::acp_transcript_cli_resumable`) and an `acp_session_id` is set,
+/// the swap preserves context: the worker is shut down WITHOUT `session/delete`
+/// so the transcript survives, the ACP session id is carried into the terminal
+/// `agent_session_id` as a pinned resume target, and tmux comes back running
+/// `claude --resume <id>` on the same conversation (#2252). Otherwise history
+/// is destroyed: `session/delete` releases the transcript and tmux comes back
+/// with an empty pane the agent fills as it runs.
 pub async fn acp_disable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1863,12 +1938,34 @@ pub async fn acp_disable(
     // A real acp -> terminal transition is now committed (the idempotent
     // already-terminal case returned above).
 
-    // Tear down the acp worker. Disabling acp mode discards the
-    // conversation (we delete on-disk history and clear the stored ACP
-    // id below), so release the agent's persisted transcript too via
-    // session/delete. UnknownSession is fine, the supervisor may not
-    // have a worker if startup never completed. See #1710.
-    match state.acp_supervisor.shutdown_and_delete(&id).await {
+    // Decide whether this swap can preserve context. Resolve the ACTIVE
+    // structured-view adapter (switch_acp_agent can point agent_name away
+    // from the tool's default) and keep context only when it shares a
+    // CLI-resumable transcript with the terminal `<tool> --resume`, and an
+    // acp_session_id was actually captured. See #2252.
+    let acp_agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
+    let keep_context = crate::agents::acp_transcript_cli_resumable(&instance.tool, &acp_agent)
+        && instance.acp_session_id.is_some();
+
+    // Tear down the acp worker. `shutdown` preserves the agent's on-disk
+    // transcript (no session/delete) so the terminal can resume it;
+    // `shutdown_and_delete` releases it for the destructive path. UnknownSession
+    // is fine, the supervisor may not have a worker if startup never completed.
+    // See #1710.
+    let shutdown_result = if keep_context {
+        state.acp_supervisor.shutdown(&id).await
+    } else {
+        state.acp_supervisor.shutdown_and_delete(&id).await
+    };
+    match shutdown_result {
         Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
@@ -1880,42 +1977,61 @@ pub async fn acp_disable(
     // collide on a stale seq with the buffer entry from this
     // conversation, and the client-side dedupe would silently eat it.
     state.acp_supervisor.forget_session(&id);
-    // Drop on-disk history so the next acp_enable starts truly
-    // fresh — without this, the seq=1 first publish would collide
-    // with a row already on disk and INSERT OR IGNORE would silently
-    // drop it.
+    // Drop the structured-view event projection either way: on keep-context,
+    // the terminal `claude --resume` reprints the conversation itself, so the
+    // tmux pane does not need the AoE event replay, and terminal turns would
+    // otherwise leave it stale. See #2252.
     state.acp_event_store.delete_session(&id);
-    instance.view = crate::session::View::Terminal;
-    // Clear the stored ACP session id: the agent's transcript is
-    // tied to the structured view-mode lifecycle. If the user re-enables
-    // structured view later, the agent should start a fresh session/new
-    // rather than try to resume an id that's no longer relevant.
-    if instance.acp_session_id.is_some() {
+    if keep_context {
         tracing::debug!(
             target: "acp.switch",
             session = %id,
-            "clearing acp_session_id on disable"
+            "keeping context on disable: carrying acp_session_id into agent_session_id for claude --resume"
         );
-        instance.acp_session_id = None;
-        // Disabling structured view abandons any pending import (#2276).
-        instance.import_pending = None;
+        instance.switch_to_terminal_keep_context();
+    } else {
+        instance.view = crate::session::View::Terminal;
+        // Clear the stored ACP session id: the agent's transcript is
+        // tied to the structured view-mode lifecycle. If the user re-enables
+        // structured view later, the agent should start a fresh session/new
+        // rather than try to resume an id that's no longer relevant.
+        if instance.acp_session_id.is_some() {
+            tracing::debug!(
+                target: "acp.switch",
+                session = %id,
+                "clearing acp_session_id on disable"
+            );
+            instance.acp_session_id = None;
+            // Disabling structured view abandons any pending import (#2276).
+            instance.import_pending = None;
+        }
     }
 
     // Persist + start tmux. start() now no longer short-circuits for
     // structured_view, so it will create a fresh tmux session and run
     // the agent CLI in the pane.
     //
-    // The on-disk and in-memory updates mutate ONLY the structured view-specific
-    // fields (`structured_view = false`, `acp_session_id = None`).
+    // The on-disk and in-memory updates mutate ONLY the fields this handler
+    // owns (view, acp_session_id, import_pending, and on keep-context the
+    // resume target agent_session_id + resume_intent), copied from the
+    // mutated in-memory `instance` so all three copies stay in sync.
     // Wholesale replacement with a pre-lock snapshot would clobber
     // concurrent writes to other fields made by the status poll loop or
     // other handlers between the snapshot and the lock acquisition.
+    let persist_acp_session_id = instance.acp_session_id.clone();
+    let persist_import_pending = instance.import_pending;
+    let persist_agent_session_id = instance.agent_session_id.clone();
+    let persist_resume_intent = instance.resume_intent.clone();
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
-            slot.acp_session_id = None;
-            slot.import_pending = None;
+            slot.acp_session_id = persist_acp_session_id.clone();
+            slot.import_pending = persist_import_pending;
+            if keep_context {
+                slot.agent_session_id = persist_agent_session_id.clone();
+                slot.resume_intent = persist_resume_intent.clone();
+            }
         }
     }
     let id_for_save = id.clone();
@@ -1926,8 +2042,12 @@ pub async fn acp_disable(
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;
-                slot.acp_session_id = None;
-                slot.import_pending = None;
+                slot.acp_session_id = persist_acp_session_id.clone();
+                slot.import_pending = persist_import_pending;
+                if keep_context {
+                    slot.agent_session_id = persist_agent_session_id.clone();
+                    slot.resume_intent = persist_resume_intent.clone();
+                }
             }
             Ok(())
         })?;
@@ -2378,6 +2498,48 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn resolve_structured_seed_covers_import_direction_b_and_fresh() {
+        // Existing acp_session_id (prior structured / import): load it; replay
+        // only when import_pending.
+        let s = resolve_structured_seed(
+            "claude",
+            "claude",
+            Some("acp-1"),
+            Some("agent-1"),
+            true,
+            true,
+        );
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(s.seed_history_replay);
+        let s = resolve_structured_seed("claude", "claude", Some("acp-1"), None, false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(!s.seed_history_replay);
+
+        // Direction B: terminal claude, no acp id, resumable transcript present.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
+        assert!(s.seed_history_replay);
+
+        // Transcript confirmed absent: do not attempt the seeded load.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, false);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // Non-resumable pairing (adapter swapped away, or non-claude): fresh.
+        let s = resolve_structured_seed("claude", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+        let s = resolve_structured_seed("codex", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // No id anywhere: fresh session/new.
+        let s = resolve_structured_seed("claude", "claude", None, None, false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
     }
 
     #[test]
