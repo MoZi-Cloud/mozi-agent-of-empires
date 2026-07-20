@@ -102,6 +102,13 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
+/// Window captured while the user is off the live edge (reading scrollback):
+/// the full scrollback in one shot, rather than a window that tracks the offset
+/// and re-anchors to the advancing live edge on every capture. Matches tmux's
+/// default `history-limit` and the VT grid's `SCROLLBACK_LINES`, so the frozen
+/// snapshot spans the whole history a live pane could have accumulated.
+const READING_CAPTURE_LINES: u16 = 2000;
+
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
 /// `output` is the rect the captured pane text paints into; `visible_rows` is
@@ -145,9 +152,38 @@ fn map_live_preview_cursor(
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
 /// fresh capture on every wheel tick.
 fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
-    height
-        .saturating_add(scroll_offset)
-        .saturating_add(CAPTURE_BUFFER) as usize
+    // Off the live edge (reading scrollback): capture the whole scrollback once
+    // so the snapshot stays put. A window that grew by the scroll step each
+    // notch was re-anchored to the advancing live edge on every capture, so on a
+    // live pane the text under the reader was yanked toward the tail as output
+    // streamed. `scroll_exceeds_cache` still fires the single grow when reading
+    // begins; after that this wide window keeps covering the offset, so the
+    // cache is captured once and then held (the render path stops refreshing it
+    // while `preview_is_frozen`).
+    //
+    // Depth is at least `READING_CAPTURE_LINES` so a normal read is one capture,
+    // but grows with the offset past that: a pane whose tmux `history-limit`
+    // exceeds the baseline must still be readable to its top, not clamped at
+    // 2000 lines.
+    if scroll_offset > 0 {
+        let depth = (scroll_offset as usize).max(READING_CAPTURE_LINES as usize);
+        return (height as usize)
+            .saturating_add(depth)
+            .saturating_add(CAPTURE_BUFFER as usize);
+    }
+    (height as usize).saturating_add(CAPTURE_BUFFER as usize)
+}
+
+/// Whether the preview holds its captured snapshot instead of following live
+/// output. True when the user is reading scrollback (scrolled off the live
+/// edge, `scroll_offset > 0`) or has a text selection in flight (an active drag
+/// or a finalized highlight, `has_selection`). In both cases applying the
+/// worker's bottom-anchored live frames would shift the content out from under
+/// the user: the read position gets yanked toward the tail as output streams,
+/// or the drag anchors slide off their text. Frozen, wheel-scroll stays smooth
+/// and a drag-select tracks exactly the cells under the pointer.
+fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
+    scroll_offset > 0 || has_selection
 }
 
 /// Decide whether the cached capture window still covers the requested scroll.
@@ -158,6 +194,32 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
         .saturating_add(scroll_offset as usize)
         .saturating_add(CAPTURE_BUFFER as usize);
     needed > cache_captured_lines
+}
+
+/// Whether the cache must be re-captured this frame.
+///
+/// Live-follow (`!frozen`) keeps `scroll_exceeds_cache`'s `CAPTURE_BUFFER`
+/// headroom so a few notches of scroll pre-fetch instead of re-capturing each
+/// tick. While frozen we already hold a full-scrollback snapshot, so the
+/// headroom is dropped and the test is exact: only a viewport that genuinely
+/// runs past the captured content (`visible_rows + offset`) forces a refresh.
+/// Keeping the headroom while frozen re-forks `capture-pane` every frame at the
+/// physical top of history, where the offset is clamped to
+/// `captured_lines - visible_rows` and the extra buffer lines can never exist.
+/// `visible_rows` (the rendered body height) is what the offset is clamped
+/// against, so it, not the raw pane `height`, is the correct coverage bound.
+fn capture_window_stale(
+    frozen: bool,
+    cache_captured_lines: usize,
+    height: u16,
+    visible_rows: usize,
+    scroll_offset: u16,
+) -> bool {
+    if frozen {
+        visible_rows.saturating_add(scroll_offset as usize) > cache_captured_lines
+    } else {
+        scroll_exceeds_cache(cache_captured_lines, height, scroll_offset)
+    }
 }
 
 /// What the passive (non-live) preview sync should do this refresh for the
@@ -1793,13 +1855,19 @@ impl HomeView {
             return;
         };
         let scroll_offset = self.preview_scroll_offset;
+        let frozen = self.preview_is_frozen();
+        let visible_rows = self.preview_visible_rows;
 
         let cache = select(self);
         let needs_refresh = force
             || cache.session_id.as_ref() != Some(&id)
             || cache.dimensions != (width, height)
-            || scroll_exceeds_cache(cache.captured_lines, height, scroll_offset)
-            || cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
+            || capture_window_stale(frozen, cache.captured_lines, height, visible_rows, scroll_offset)
+            // While frozen (reading scrollback or holding a selection) the idle
+            // poll must not re-capture: a fresh bottom-anchored snapshot would
+            // shift the held content out from under the reader or the drag.
+            // Session change, resize, and the reading grow still refresh.
+            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
         if !needs_refresh {
             return;
         }
@@ -1906,6 +1974,13 @@ impl HomeView {
     /// to populate the cache once via the fork gate. Steady state across
     /// every view goes through here, so `tmux capture-pane` stays off the
     /// render thread.
+    /// Whether the preview holds its captured snapshot instead of following
+    /// live output. Decision lives in the pure [`preview_frozen`] helper so it
+    /// is unit-tested away from a live `HomeView`.
+    fn preview_is_frozen(&self) -> bool {
+        preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
+    }
+
     fn apply_worker_capture(
         &mut self,
         width: u16,
@@ -1915,6 +1990,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return false;
         };
+        // Frozen (reading scrollback, or a selection is in flight): don't apply
+        // the worker's live frames. Falling through leaves the held snapshot in
+        // place; `refresh_preview_cache_core` won't re-capture it either (its
+        // idle poll is gated on `!frozen`), so nothing shifts under the user.
+        if self.preview_is_frozen() {
+            return false;
+        }
         let scroll_offset = self.preview_scroll_offset;
         let capture_lines = capture_lines_for(height, scroll_offset);
         let Some(worker) = self.preview_capture_worker.as_ref() else {
@@ -4196,13 +4278,60 @@ mod tests {
     }
 
     #[test]
-    fn capture_lines_for_extends_by_scroll_offset() {
-        assert_eq!(capture_lines_for(30, 200), 250);
+    fn capture_lines_for_captures_full_scrollback_while_reading() {
+        // A non-zero offset within the baseline switches to the wide reading
+        // window so the snapshot spans the whole scrollback and is captured
+        // once, instead of a window that tracks (and re-anchors to) the live
+        // edge each notch.
+        let baseline = 30 + READING_CAPTURE_LINES as usize + CAPTURE_BUFFER as usize;
+        assert_eq!(capture_lines_for(30, 1), baseline);
+        assert_eq!(capture_lines_for(30, 200), baseline);
+        // Past the baseline the window grows with the offset so a pane whose
+        // tmux history-limit exceeds READING_CAPTURE_LINES stays readable to its
+        // top instead of clamping at 2000 lines.
+        let deep = READING_CAPTURE_LINES as usize + 3000;
+        assert_eq!(
+            capture_lines_for(30, deep as u16),
+            30 + deep + CAPTURE_BUFFER as usize
+        );
     }
 
     #[test]
-    fn capture_lines_for_saturates_instead_of_overflowing() {
-        assert_eq!(capture_lines_for(u16::MAX, u16::MAX), u16::MAX as usize);
+    fn preview_frozen_while_reading_or_selecting() {
+        // Live edge, no selection: follow live output.
+        assert!(!preview_frozen(0, false));
+        // Scrolled off the live edge: hold the snapshot so streaming output
+        // can't yank the read position.
+        assert!(preview_frozen(1, false));
+        // Selection in flight at the live edge: hold so the drag anchors
+        // (or a finalized highlight) don't slide off their text.
+        assert!(preview_frozen(0, true));
+        assert!(preview_frozen(5, true));
+    }
+
+    #[test]
+    fn capture_lines_for_grows_without_overflow() {
+        // usize arithmetic: an extreme offset extends the window past u16
+        // without wrapping (u16::MAX height + u16::MAX depth + buffer).
+        assert_eq!(
+            capture_lines_for(u16::MAX, u16::MAX),
+            u16::MAX as usize * 2 + CAPTURE_BUFFER as usize
+        );
+    }
+
+    #[test]
+    fn capture_window_stale_breaks_the_fork_loop_at_history_top() {
+        // Frozen: exact coverage test, no CAPTURE_BUFFER headroom. At the top
+        // the offset is clamped to captured - visible_rows, so the viewport is
+        // exactly covered and no re-capture fires (the per-frame capture-pane
+        // fork loop). Uses visible_rows, not the raw pane height.
+        assert!(!capture_window_stale(true, 100, /*height*/ 999, 20, 80));
+        // A viewport that genuinely runs past the captured content still
+        // refreshes so a deeper read can grow the window.
+        assert!(capture_window_stale(true, 100, 999, 20, 90));
+        // Not frozen: keeps scroll_exceeds_cache's buffered pre-fetch semantics.
+        assert!(!capture_window_stale(false, 60, 30, 20, 3));
+        assert!(capture_window_stale(false, 40, 30, 20, 3));
     }
 
     #[test]
