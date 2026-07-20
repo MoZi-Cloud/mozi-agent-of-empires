@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{header, StatusCode};
 use thiserror::Error;
 
@@ -22,9 +23,51 @@ use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Percent-encode set for a single URL path segment. A well-formed fqid
+/// (`plugin.<id>.<command>`, dotted lowercase) is left intact so it round-trips
+/// to the same string server-side, while structurally dangerous bytes (`/`,
+/// `?`, `#`, `%`, space, controls) are escaped so a malformed id can never
+/// break out of its path segment.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
     sessions: Vec<T>,
+}
+
+/// One active plugin command as the daemon reports it (`GET
+/// /api/plugins/commands`), the source of truth the structured view resolves
+/// keybinds against: for a session on a remote daemon the plugin may not be
+/// installed on the TUI's own machine, so its local registry cannot resolve or
+/// execute it. Mirrors the server's `PluginCommandView`; only the execution
+/// fields are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginCommandView {
+    pub fqid: String,
+    pub plugin_id: String,
+    #[serde(default)]
+    pub keybinds: Vec<String>,
+    #[serde(default)]
+    pub action: Option<aoe_plugin_api::ClientAction>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginCommandsEnvelope {
+    commands: Vec<PluginCommandView>,
 }
 
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
@@ -195,6 +238,39 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_global_status(res).await?;
         Ok(res.json::<UiSnapshot>().await?)
+    }
+
+    /// `GET /api/plugins/commands`. The daemon's active plugin commands with
+    /// their keybinds and client actions. The structured view resolves plugin
+    /// chords against this rather than the TUI's local registry, so a session on
+    /// a remote daemon can drive plugins installed only there. Global, like
+    /// `plugin_ui_state`.
+    pub async fn plugin_commands(&self) -> Result<Vec<PluginCommandView>, HttpError> {
+        let url = format!("{}/api/plugins/commands", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<PluginCommandsEnvelope>().await?.commands)
+    }
+
+    /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
+    /// plugin command to its worker as a fire-and-forget notification (the TUI
+    /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the
+    /// daemon validates the command and session. `fqid` has no slashes, so it
+    /// is a single path segment.
+    pub async fn invoke_plugin_command(
+        &self,
+        fqid: &str,
+        session_id: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/commands/{}/invoke",
+            self.endpoint.base_url,
+            utf8_percent_encode(fqid, PATH_SEGMENT)
+        );
+        let body = serde_json::json!({ "session_id": session_id });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        check_global_status(res).await?;
+        Ok(())
     }
 
     /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather

@@ -21,7 +21,7 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -34,8 +34,8 @@ use self::state::{
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
-    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
-    WsMessage, REPLAY_PAGE_SIZE,
+    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError,
+    PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
@@ -228,10 +228,18 @@ async fn offer_daemon_start(
 /// side-channel receivers (plugin UI snapshots, session path roots).
 /// Shared by the full-screen loop and the embedded (preview-pane)
 /// variant so the two cannot drift.
+/// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
+/// fetch succeeded, the active command list. `commands` is `None` on a transient
+/// command-fetch failure so the last-good set is kept rather than wiped.
+struct PluginPoll {
+    snapshot: UiSnapshot,
+    commands: Option<Vec<PluginCommandView>>,
+}
+
 struct ViewSetup {
     state: StructuredViewState,
     startup_toast: Option<String>,
-    plugin_rx: tokio::sync::mpsc::Receiver<UiSnapshot>,
+    plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
     path_roots_rx:
         tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionPathRoots, String>>,
 }
@@ -312,7 +320,7 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
     // Poll the daemon's plugin UI-state on its own task and stream snapshots
     // back over a channel, so a slow daemon stalls neither input nor render.
     // The task exits once the view returns and drops the receiver.
-    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
+    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<PluginPoll>(8);
     {
         let http = state.http.clone();
         tokio::spawn(async move {
@@ -320,18 +328,32 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                match http.plugin_ui_state().await {
-                    Ok(snapshot) => {
-                        if plugin_tx.send(snapshot).await.is_err() {
-                            break; // view exited; receiver gone.
-                        }
-                    }
+                let snapshot = match http.plugin_ui_state().await {
+                    Ok(snapshot) => snapshot,
                     // Transient or older-daemon-without-the-endpoint: keep the
                     // last good snapshot and retry on the next tick rather than
                     // toasting repeatedly.
                     Err(e) => {
                         tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
+                        continue;
                     }
+                };
+                // Command metadata comes from the daemon so a remote-daemon
+                // session resolves plugins it doesn't have locally. A failed
+                // fetch leaves the last-good set in place (`None`).
+                let commands = match http.plugin_commands().await {
+                    Ok(commands) => Some(commands),
+                    Err(e) => {
+                        tracing::debug!(target: "acp.tui", "plugin commands poll failed: {e}");
+                        None
+                    }
+                };
+                if plugin_tx
+                    .send(PluginPoll { snapshot, commands })
+                    .await
+                    .is_err()
+                {
+                    break; // view exited; receiver gone.
                 }
             }
         });
@@ -401,8 +423,11 @@ pub async fn run_for_endpoint(
                     }
                 }
             }
-            Some(snapshot) = plugin_rx.recv() => {
-                state.ingest_plugin_ui(snapshot);
+            Some(poll) = plugin_rx.recv() => {
+                if let Some(commands) = poll.commands {
+                    state.plugin_commands = commands;
+                }
+                state.ingest_plugin_ui(poll.snapshot);
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
             }
@@ -559,6 +584,12 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
         Tone::Warn | Tone::Danger => ToastKind::Error,
         _ => ToastKind::Info,
     };
+    // A notification carrying an href is a worker `ui.open_url`: the native TUI
+    // opens it directly the first (and only) time it is shown. The seq dedupe in
+    // `next_plugin_toast` guarantees one open per notification.
+    if let Some(href) = &n.href {
+        let _ = crate::tui::open_url::open_url(href);
+    }
     let text = match &n.body {
         Some(body) => format!("{}: {body}", n.title),
         None => n.title.clone(),
@@ -589,10 +620,39 @@ async fn handle_terminal_event(
                 browsing_queue: state.browsing_queue(),
                 queue_len: state.queue.len(),
                 choice_picker_open: state.choice.is_some(),
+                choice_numbered: matches!(
+                    state.choice.as_ref().map(|c| &c.purpose),
+                    Some(ChoicePurpose::OpenLink)
+                ),
                 has_modes: !state.transcript.available_modes.is_empty(),
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
-            input::dispatch(state.focus, &key, ctx)
+            let intent = input::dispatch(state.focus, &key, ctx);
+            // Plugin keybinds are a fallback: consult them only for a key the
+            // view did not claim (`Ignore`), or a Ctrl-modified chord the
+            // composer would otherwise swallow as text. Composer text entry and
+            // the universal chords keep priority, mirroring how the home view
+            // resolves core bindings before plugin ones. Chords resolve against
+            // the daemon's command list (not the TUI's local registry) so a
+            // remote-daemon session can drive plugins installed only there.
+            let try_plugin = matches!(intent, Intent::Ignore)
+                || matches!(&intent, Intent::Compose(k) if k.modifiers.contains(KeyModifiers::CONTROL));
+            if try_plugin {
+                if let Some(cmd) = state
+                    .plugin_commands
+                    .iter()
+                    .find(|c| {
+                        c.keybinds
+                            .iter()
+                            .any(|kb| crate::tui::home::bindings::keybind_matches(kb, &key))
+                    })
+                    .cloned()
+                {
+                    handle_plugin_command(state, cmd, toast_deadline).await;
+                    return Ok(false);
+                }
+            }
+            intent
         }
         // Bracketed paste lands as one event with the raw text; it goes
         // into the composer no matter which pane is focused (there is
@@ -881,6 +941,15 @@ async fn handle_terminal_event(
             }
             Ok(false)
         }
+        Intent::ChoicePick(idx) => {
+            match state.choice.as_mut() {
+                Some(picker) if idx < picker.options.len() => picker.selected = idx,
+                // A digit past the last row is a no-op, not a mis-pick.
+                _ => return Ok(false),
+            }
+            accept_choice(state, toast_deadline).await;
+            Ok(false)
+        }
         Intent::ChoiceCancel => {
             state.choice = None;
             Ok(false)
@@ -894,7 +963,7 @@ async fn handle_terminal_event(
                 "{}/sessions/{}/acp",
                 state.endpoint.base_url, state.session_id
             );
-            if let Err(e) = webbrowser::open(&url) {
+            if let Err(e) = crate::tui::open_url::open_url(&url) {
                 set_toast(
                     state,
                     toast_deadline,
@@ -1098,6 +1167,8 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
         return;
     };
     match picker.purpose {
+        // The plugin-link picker: `value` is the chosen URL.
+        ChoicePurpose::OpenLink => open_link(state, toast_deadline, &value),
         ChoicePurpose::Mode => match state.http.set_mode(&state.session_id, &value).await {
             Ok(()) => {
                 // Pessimistic like the web: the title chip updates when the
@@ -1155,6 +1226,89 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
             }
         }
     }
+}
+
+/// Execute a plugin command the structured view resolved from a keybind against
+/// the daemon's command list. An `open-ui-link` command opens the active
+/// session's link(s) from the plugin UI snapshot: one link opens directly,
+/// several open a numbered picker. An action-less command dispatches a
+/// fire-and-forget `plugin.command.invoke` to the worker over the daemon.
+async fn handle_plugin_command(
+    state: &mut StructuredViewState,
+    cmd: PluginCommandView,
+    toast_deadline: &mut Option<Instant>,
+) {
+    match cmd.action {
+        Some(aoe_plugin_api::ClientAction::OpenUiLink { slot, id }) => {
+            let links = state
+                .plugin_ui
+                .links_for(&cmd.plugin_id, slot, &id, &state.session_id);
+            match links.len() {
+                0 => set_toast(
+                    state,
+                    toast_deadline,
+                    "no link for this session yet".into(),
+                    ToastKind::Info,
+                ),
+                1 => {
+                    let href = links[0].0.clone();
+                    open_link(state, toast_deadline, &href);
+                }
+                _ => open_link_picker(state, links),
+            }
+        }
+        None => {
+            if let Err(e) = state
+                .http
+                .invoke_plugin_command(&cmd.fqid, &state.session_id)
+                .await
+            {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("command failed: {e}"),
+                    ToastKind::Error,
+                );
+            }
+        }
+    }
+}
+
+/// Open one resolved plugin link in the browser (through the test seam) and
+/// toast the outcome.
+fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
+    if let Err(e) = crate::tui::open_url::open_url(href) {
+        set_toast(
+            state,
+            toast_deadline,
+            format!("open failed: {e}"),
+            ToastKind::Error,
+        );
+    } else {
+        set_toast(
+            state,
+            toast_deadline,
+            "opened in browser".into(),
+            ToastKind::Info,
+        );
+    }
+}
+
+/// Open the numbered picker for a plugin command that resolved to several links
+/// (a multi-repo workspace with more than one open PR). `1`-`9` or Enter opens
+/// the chosen link; Esc closes.
+fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)>) {
+    let options = links
+        .into_iter()
+        .enumerate()
+        .map(|(i, (href, label))| (href, format!("{}. {}", i + 1, label)))
+        .collect();
+    state.choice = Some(ChoicePicker {
+        title: " Open link (1-9=open · Esc=close) ".to_string(),
+        options,
+        selected: 0,
+        purpose: ChoicePurpose::OpenLink,
+    });
 }
 
 /// Insert pasted text into the composer at the caret, normalizing CRLF /
@@ -1599,7 +1753,9 @@ mod tests {
                 assert!(remaining.is_empty());
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+                panic!("expected elicitation purpose")
+            }
         }
     }
 
@@ -1660,7 +1816,9 @@ mod tests {
                 assert_eq!(remaining.len(), 1);
                 assert_eq!(remaining[0].field_key, "question_1");
             }
-            ChoicePurpose::Mode => panic!("expected elicitation purpose"),
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+                panic!("expected elicitation purpose")
+            }
         }
     }
 }
