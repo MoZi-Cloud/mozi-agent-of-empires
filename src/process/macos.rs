@@ -76,6 +76,26 @@ pub(super) fn processes_matching(
     found
 }
 
+/// Per-boot identity from `kern.bootsessionuuid`: a UUID fixed for the boot's
+/// lifetime. Preferred over `kern.boottime`, which is recomputed as
+/// `now - uptime` and shifts on clock steps (NTP, sleep/wake), which would
+/// silently rotate the ledger mid-boot.
+pub(super) fn boot_id() -> Option<String> {
+    let out = Command::new("sysctl")
+        .args(["-n", "kern.bootsessionuuid"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Get the foreground process group leader for a shell PID
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     // Use ps to get the foreground process group

@@ -241,47 +241,11 @@ fn recovery_attempt_dir() -> Option<PathBuf> {
         .map(|d| d.join("recovery_attempts"))
 }
 
-/// Host boot identity, used to scope the recovery-attempt ledger to the current
-/// boot so a reboot (which genuinely kills every agent process) resets it and
-/// post-reboot recovery runs. Linux reads `/proc/sys/kernel/random/boot_id`;
-/// macOS uses `kern.boottime`. `None` disables the ledger (recovery falls back
-/// to the process-scan guard alone), which is safe: the scan still prevents
-/// duplication for identifiable agents.
-fn boot_id() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
 /// Path to the current boot's ledger file, or `None` if the app dir or boot id
 /// is unavailable. The boot id is reduced to a filesystem-safe filename.
 fn recovery_ledger_path() -> Option<PathBuf> {
     let dir = recovery_attempt_dir()?;
-    let boot = boot_id()?;
+    let boot = crate::process::boot_id()?;
     let safe: String = boot
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -1020,7 +984,7 @@ mod tests {
     fn recovery_attempt_ledger_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var(RECOVERY_ATTEMPT_DIR_ENV, dir.path());
-        if boot_id().is_none() {
+        if crate::process::boot_id().is_none() {
             std::env::remove_var(RECOVERY_ATTEMPT_DIR_ENV);
             return; // ledger disabled on this host; nothing to assert
         }

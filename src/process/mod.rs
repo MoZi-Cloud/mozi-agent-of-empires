@@ -259,6 +259,25 @@ pub fn processes_matching(env_needles: &[String], cmdline_needles: &[Option<Stri
     }
 }
 
+/// Host boot identity, constant for the current boot and immune to clock
+/// changes, used to scope the recovery-attempt ledger so a reboot resets it.
+/// `None` on unsupported platforms (the ledger then disables and recovery
+/// falls back to the process-scan guard).
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::boot_id()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::boot_id()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// Get the foreground process group leader PID for a given shell PID
 /// This finds the actual process that has the terminal foreground
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
@@ -529,6 +548,14 @@ mod tests {
     #[test]
     fn processes_matching_empty_input_is_empty() {
         assert!(processes_matching(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn boot_id_is_stable_within_a_boot() {
+        assert_eq!(boot_id(), boot_id());
+        if let Some(id) = boot_id() {
+            assert!(!id.is_empty());
+        }
     }
 
     /// A live process carrying a unique marker in its argv is matched by the

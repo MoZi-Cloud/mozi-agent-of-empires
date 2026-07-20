@@ -99,6 +99,15 @@ pub(super) fn processes_matching(
     found
 }
 
+/// Per-boot identity from `/proc/sys/kernel/random/boot_id`: constant for the
+/// boot's lifetime and immune to clock changes (the property the ledger needs).
+pub(super) fn boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Get the foreground process group leader for a shell PID
 /// Walks the process tree to find the actual foreground process
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
