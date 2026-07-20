@@ -6420,6 +6420,133 @@ mod tests {
         );
     }
 
+    /// Closes I1's patches-routing half from #2756: each profile's `patches`
+    /// bundle must merge onto that profile's own storage and nowhere else. The
+    /// two adjacent tests above already cover the `unread_ids` mirror, so this
+    /// test asserts only the `patches` write (status / last_accessed_at) and
+    /// its per-profile routing, never unread. Each profile is seeded with the
+    /// opposite status it is patched to, so a mis-routed bundle leaves a row at
+    /// its seeded status and fails the status assertion: that is the routing
+    /// discriminator. The instance-to-bundle assignment in `status_poll_loop`
+    /// (bundles.entry(inst.source_profile)) stays out of unit-test reach: it
+    /// needs an `AppState`, which has no test constructor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_routes_patches_per_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let old = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let new_ts = chrono::Utc::now();
+
+        let mut a1 = Instance::new("session-a", "/tmp/a");
+        a1.source_profile = "flush-a".to_string();
+        a1.status = Status::Running;
+        a1.last_accessed_at = Some(old);
+        let a1_id = a1.id.clone();
+
+        let mut b1 = Instance::new("session-b", "/tmp/b");
+        b1.source_profile = "flush-b".to_string();
+        b1.status = Status::Idle;
+        b1.last_accessed_at = Some(old);
+        let b1_id = b1.id.clone();
+
+        let seed_a = a1.clone();
+        crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_a];
+                Ok(())
+            })
+            .expect("seed write");
+        let seed_b = b1.clone();
+        crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_b];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry("flush-a".to_string())
+            .or_default()
+            .patches
+            .insert(
+                a1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Idle,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+        bundles
+            .entry("flush-b".to_string())
+            .or_default()
+            .patches
+            .insert(
+                b1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Running,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+
+        let mut instances = vec![a1, b1];
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        let disk_a = crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_a = disk_a
+            .iter()
+            .find(|i| i.id == a1_id)
+            .expect("a1 on flush-a disk");
+        assert_eq!(
+            row_a.status,
+            Status::Idle,
+            "profile A's patch must merge its status onto profile A's storage"
+        );
+        assert_eq!(
+            row_a.last_accessed_at,
+            Some(new_ts),
+            "profile A's patch must merge its last_accessed_at onto profile A's storage"
+        );
+
+        let disk_b = crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_b = disk_b
+            .iter()
+            .find(|i| i.id == b1_id)
+            .expect("b1 on flush-b disk");
+        assert_eq!(
+            row_b.status,
+            Status::Running,
+            "profile B's patch must merge its status onto profile B's storage"
+        );
+        assert_eq!(
+            row_b.last_accessed_at,
+            Some(new_ts),
+            "profile B's patch must merge its last_accessed_at onto profile B's storage"
+        );
+    }
+
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {
         let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
