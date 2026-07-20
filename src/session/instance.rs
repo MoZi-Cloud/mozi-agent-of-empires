@@ -501,6 +501,17 @@ pub struct OpClaim {
     pub at: DateTime<Utc>,
 }
 
+/// Create-idempotency record for a plugin-created session (#2897). `key` is
+/// the plugin-supplied idempotency key, unique within the creating plugin's
+/// sessions; `payload_hash` is the host-computed hash of the semantic create
+/// request, so a retried key with a different payload is rejected instead of
+/// silently returning a session that does not match the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCreateIdempotency {
+    pub key: String,
+    pub payload_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -666,6 +677,47 @@ pub struct Instance {
     /// older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+
+    /// Id of the plugin that created this session through the host session
+    /// service (#2897). `None` for user-created sessions, including every row
+    /// that predates the field. Turn delivery from a plugin is restricted to
+    /// sessions whose `created_by_plugin` matches the calling plugin.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_plugin: Option<String>,
+
+    /// Create-idempotency record for a plugin-created session, persisted
+    /// atomically with the row itself (same `Storage::update`). Scoped to
+    /// `created_by_plugin`; retention equals the lifetime of this session
+    /// record, so archive/snooze/trash keep deduplicating and a hard delete
+    /// releases the key. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// An initial prompt persisted with the session at create time and not
+    /// yet delivered to the agent (#2897). Written in the same
+    /// `Storage::update` that creates the row, so the create request and its
+    /// first turn are accepted atomically; the session service drains it
+    /// once the ACP worker is live (create fast path, and the reconciler
+    /// tick after a crash or restart) and clears it after a successful
+    /// publish + forward. Delivery is at-least-once: a crash between the
+    /// forward and this field's clear re-delivers on the next drain.
+    // ponytail: plain text, no attachments or dedup turn id; move to a typed
+    // record via a vNNN migration if either becomes necessary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_initial_turn: Option<String>,
+
+    /// Explicit ACP approval-mode id this session should run under (#2897),
+    /// applied via `session/set_mode` after every worker (re)spawn, taking
+    /// precedence over the legacy `yolo_mode` bool (which stays authoritative
+    /// for sessions without an explicit mode; unification is a follow-up).
+    /// Set by the plugin host session-create path after the host classified
+    /// the mode; also re-asserted before each plugin-delivered turn so a
+    /// mode-application failure blocks unattended prompt delivery. Additive:
+    /// absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_mode_id: Option<String>,
 
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
@@ -1282,6 +1334,10 @@ impl Instance {
             pre_trash_project_path: None,
             op_claim: None,
             plugin_meta: std::collections::BTreeMap::new(),
+            created_by_plugin: None,
+            plugin_create_idempotency: None,
+            pending_initial_turn: None,
+            acp_mode_id: None,
             scratch: false,
             worktree_info: None,
             workspace_info: None,
