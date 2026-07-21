@@ -169,6 +169,7 @@ pub struct SmartRenameConfig<'a> {
     pub setting_on: bool,
     pub rename_agent: &'a str,
     pub overrides: &'a HashMap<String, String>,
+    pub rename_model: &'a HashMap<String, String>,
 }
 
 /// Input for a one-shot title call. `context` is what the agent summarizes
@@ -216,6 +217,7 @@ pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig
         setting_on: session.smart_rename,
         rename_agent: &session.smart_rename_agent,
         overrides: &session.agent_command_override,
+        rename_model: &session.smart_rename_model,
     }
 }
 
@@ -247,24 +249,79 @@ pub fn build_prompt(user_message: &str) -> String {
     format!("{INSTRUCTION}\n\nTask:\n{capped}")
 }
 
-/// Build the argv for a one-shot title call, or `None` when the agent has no
-/// known one-shot mode. Shape is `[binary, oneshot_token, extra.., prompt,
-/// trailing..]`: the prompt is a single argv element passed straight to the
-/// process, never interpolated into a shell string, so untrusted user text
-/// cannot inject arguments. `oneshot_trailing_args` is only populated for
-/// flag-value one-shots (e.g. copilot `-p`), where the CLI binds the prompt to
-/// the flag, so trailing flags after it stay unambiguous.
-pub fn build_oneshot_argv(agent: &agents::AgentDef, prompt: &str) -> Option<Vec<String>> {
+/// What a one-shot argv targets. `Title(model_args)` is a throwaway
+/// smart-rename title: it injects the already-resolved model selector tokens
+/// (empty = the CLI's own model). `CliDefault` is a whole-transcript
+/// conversation summary that always runs the agent's normal (bigger) model. It
+/// deliberately has no zero-value, so every call site states its intent: a
+/// title cannot silently bill the frontier model and a summary cannot silently
+/// be downgraded to the cheap tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneshotModel {
+    Title(Vec<String>),
+    CliDefault,
+}
+
+/// Resolve the model-selector tokens (`[flag, model_id]` or empty) for a title
+/// one-shot from the per-agent `smart_rename_model` map. Three-state: an absent
+/// key uses the agent's built-in cheap default (claude pins `haiku`); an empty
+/// value forces the CLI default (opt out of the cheap alias); a non-empty value
+/// pins that model. An agent with no model flag (or no default and no override)
+/// yields no tokens, i.e. the CLI default. This is the sole entry point for the
+/// title-vs-CLI-default decision, so a caller must pass the raw map through: the
+/// empty-string state must not be collapsed in the call chain (e.g. by stripping
+/// empty values before this call). The web widget cannot emit an empty value (it
+/// removes the key on clear), so that state is reachable only via the TUI or
+/// config.toml.
+pub fn resolve_title_model_args(
+    agent: &agents::AgentDef,
+    models: &HashMap<String, String>,
+) -> Vec<String> {
+    let Some(flag) = agent.oneshot_model_flag() else {
+        return Vec::new();
+    };
+    let model = match models.get(agent.name).map(|m| m.trim()) {
+        Some("") => return Vec::new(),
+        Some(id) => id.to_string(),
+        None => match agent.oneshot_cheap_model() {
+            Some(default) => default.to_string(),
+            None => return Vec::new(),
+        },
+    };
+    vec![flag.to_string(), model]
+}
+
+/// Build the argv for a one-shot title or summary call, or `None` when the
+/// agent has no known one-shot mode. Shape is `[binary, oneshot_token, model..,
+/// extra.., prompt, trailing..]`, where `model..` (for a `Title`) sits before
+/// the prompt for a positional-prompt flag but AFTER the prompt for a
+/// value-binding flag (copilot, gemini, kimi `-p`, whose value is the prompt),
+/// so the flag can never bind the model selector as the prompt. The prompt is a
+/// single argv element passed straight to the process, never interpolated into
+/// a shell string, so untrusted user text cannot inject arguments.
+/// `oneshot_trailing_args` is only populated for value-binding one-shots, where
+/// the CLI has already bound the prompt to the flag, so trailing flags stay
+/// unambiguous.
+pub fn build_oneshot_argv(
+    agent: &agents::AgentDef,
+    prompt: &str,
+    model: OneshotModel,
+) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
     let mut argv = vec![agent.binary.to_string(), token.to_string()];
-    // Static per-agent flags (e.g. codex `--skip-git-repo-check`) go between the
-    // one-shot token and the prompt; the prompt stays directly after them so
-    // untrusted user text can never be read as an argument.
+    let model_args = match model {
+        OneshotModel::Title(args) => args,
+        OneshotModel::CliDefault => Vec::new(),
+    };
+    let binds_prompt = agent.oneshot_flag_binds_prompt();
+    if !binds_prompt {
+        argv.extend(model_args.iter().cloned());
+    }
     argv.extend(agent.oneshot_extra_args().iter().map(|s| s.to_string()));
     argv.push(prompt.to_string());
-    // Static trailing flags (e.g. copilot `-s --allow-all-tools --no-ask-user`)
-    // follow the prompt for flag-value one-shots; the CLI has already bound the
-    // prompt to the one-shot flag, so these parse as options, not the prompt.
+    if binds_prompt {
+        argv.extend(model_args.iter().cloned());
+    }
     argv.extend(agent.oneshot_trailing_args().iter().map(|s| s.to_string()));
     Some(argv)
 }
@@ -796,7 +853,8 @@ pub async fn run_terminal_rename(profile: &str, session_id: &str) -> anyhow::Res
 
     let baseline = extract_echo_baseline(&context);
     let prompt = build_prompt(&context);
-    let Some(argv) = build_oneshot_argv(agent, &prompt) else {
+    let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
+    let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
         return Ok(());
     };
     let Some(raw) = run_oneshot(session_id, &argv, &project_path, ONESHOT_TIMEOUT).await else {
@@ -952,7 +1010,8 @@ mod serve {
         }
 
         let prompt = build_prompt(&input.context);
-        let Some(argv) = build_oneshot_argv(agent, &prompt) else {
+        let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
+        let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
             return;
         };
 
@@ -1242,16 +1301,23 @@ mod tests {
         agents::get_agent("claude").expect("claude agent exists")
     }
 
+    /// A title one-shot with no user override: the agent's built-in default
+    /// (claude pins `haiku`, others none), reproducing the pre-tunable behavior.
+    fn title_default(agent: &agents::AgentDef) -> OneshotModel {
+        OneshotModel::Title(resolve_title_model_args(agent, &HashMap::new()))
+    }
+
     #[test]
     fn argv_is_binary_token_prompt() {
-        let argv = build_oneshot_argv(claude(), "hello").expect("claude has one-shot");
-        assert_eq!(argv, vec!["claude", "-p", "hello"]);
+        let argv = build_oneshot_argv(claude(), "hello", title_default(claude()))
+            .expect("claude one-shot");
+        assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "hello"]);
     }
 
     #[test]
     fn argv_none_for_agent_without_oneshot() {
         let cursor = agents::get_agent("cursor").expect("cursor agent exists");
-        assert!(build_oneshot_argv(cursor, "hello").is_none());
+        assert!(build_oneshot_argv(cursor, "hello", OneshotModel::CliDefault).is_none());
     }
 
     #[test]
@@ -1309,16 +1375,20 @@ mod tests {
         // codex `exec` refuses to run outside a git repo without this flag, so a
         // scratch-session one-shot would exit non-zero. The flag goes between
         // the token and the prompt; the prompt stays the final element.
-        let argv = build_oneshot_argv(agents::get_agent("codex").unwrap(), "name this")
-            .expect("codex one-shot");
+        // codex has no built-in cheap alias, so with no override it takes no
+        // model args: still [binary, flag, skip-git-repo-check, prompt].
+        let codex = agents::get_agent("codex").unwrap();
+        let argv =
+            build_oneshot_argv(codex, "name this", title_default(codex)).expect("codex one-shot");
         assert_eq!(
             argv,
             vec!["codex", "exec", "--skip-git-repo-check", "name this"]
         );
-        // claude takes no extra args: still [binary, flag, prompt].
+        // claude pins the cheap `haiku` alias between the flag and the prompt;
+        // the prompt stays the final element.
         assert_eq!(
-            build_oneshot_argv(claude(), "name this").unwrap(),
-            vec!["claude", "-p", "name this"]
+            build_oneshot_argv(claude(), "name this", title_default(claude())).unwrap(),
+            vec!["claude", "-p", "--model", "haiku", "name this"]
         );
     }
 
@@ -1328,7 +1398,8 @@ mod tests {
         // silent flags follow the prompt. Without them a non-interactive title
         // call can block on a permission prompt or print stats that pollute the
         // title; with them stdout is just the final answer.
-        let argv = build_oneshot_argv(agents::get_agent("copilot").unwrap(), "name this")
+        let copilot = agents::get_agent("copilot").unwrap();
+        let argv = build_oneshot_argv(copilot, "name this", title_default(copilot))
             .expect("copilot one-shot");
         assert_eq!(
             argv,
@@ -1340,6 +1411,203 @@ mod tests {
                 "--allow-all-tools",
                 "--no-ask-user"
             ]
+        );
+    }
+
+    #[test]
+    fn argv_claude_injects_cheap_model_before_prompt() {
+        let argv = build_oneshot_argv(claude(), "name this", title_default(claude()))
+            .expect("claude one-shot");
+        let model_idx = argv.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(argv[model_idx + 1], "haiku");
+        let prompt_idx = argv.iter().position(|a| a == "name this").expect("prompt");
+        assert!(
+            model_idx < prompt_idx,
+            "model args must precede the prompt, got {argv:?}"
+        );
+        assert_eq!(
+            prompt_idx,
+            argv.len() - 1,
+            "prompt must be the last element"
+        );
+    }
+
+    #[test]
+    fn argv_summary_model_uses_cli_default() {
+        // conversation_summary reads the whole transcript and may need a bigger
+        // model turn, so OneshotModel::CliDefault must NOT inject any model
+        // selector: the argv is exactly the pre-tunable CLI-default shape.
+        let argv = build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault)
+            .expect("claude one-shot");
+        assert!(!argv.iter().any(|a| a == "--model" || a == "haiku"));
+        assert_eq!(argv, vec!["claude", "-p", "name this"]);
+    }
+
+    #[test]
+    fn argv_cli_default_omits_only_the_resolved_model_args() {
+        // Across every one-shot agent, CliDefault yields exactly the built-in
+        // Title argv minus the resolved model slot: the model selector is the
+        // only difference between the two intents.
+        for agent in agents::AGENTS.iter().filter(|a| a.oneshot_flag.is_some()) {
+            let default_args = resolve_title_model_args(agent, &HashMap::new());
+            let title = build_oneshot_argv(
+                agent,
+                "name this",
+                OneshotModel::Title(default_args.clone()),
+            )
+            .expect("one-shot");
+            let cli =
+                build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
+            assert!(!cli.iter().any(|a| a == "--model" || a == "-m"));
+            assert_eq!(cli.len(), title.len() - default_args.len());
+        }
+    }
+
+    #[test]
+    fn argv_agents_without_cheap_default_take_no_model_args() {
+        // With no user override, only claude has a built-in cheap alias; every
+        // other one-shot agent runs the CLI default (no model flag).
+        for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
+            let agent = agents::get_agent(name).unwrap();
+            let argv = build_oneshot_argv(agent, "name this", title_default(agent))
+                .unwrap_or_else(|| panic!("{name} one-shot"));
+            assert!(
+                !argv.iter().any(|a| a == "--model" || a == "-m"),
+                "{name} has no built-in cheap alias, so its default argv carries no model flag: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_user_model_override_positioned_by_flag_binding() {
+        // A positional-prompt agent (codex `exec`) gets the model selector
+        // before the prompt; a value-binding agent (copilot `-p`) gets it after
+        // the prompt so the flag never swallows `--model` as its value.
+        let mut models = HashMap::new();
+        models.insert("codex".to_string(), "gpt-5".to_string());
+        models.insert("copilot".to_string(), "claude-haiku-4.5".to_string());
+
+        let codex = agents::get_agent("codex").unwrap();
+        let codex_argv = build_oneshot_argv(
+            codex,
+            "name this",
+            OneshotModel::Title(resolve_title_model_args(codex, &models)),
+        )
+        .expect("codex one-shot");
+        assert_eq!(
+            codex_argv,
+            vec![
+                "codex",
+                "exec",
+                "-m",
+                "gpt-5",
+                "--skip-git-repo-check",
+                "name this"
+            ]
+        );
+
+        let copilot = agents::get_agent("copilot").unwrap();
+        let copilot_argv = build_oneshot_argv(
+            copilot,
+            "name this",
+            OneshotModel::Title(resolve_title_model_args(copilot, &models)),
+        )
+        .expect("copilot one-shot");
+        assert_eq!(
+            copilot_argv,
+            vec![
+                "copilot",
+                "-p",
+                "name this",
+                "--model",
+                "claude-haiku-4.5",
+                "-s",
+                "--allow-all-tools",
+                "--no-ask-user"
+            ]
+        );
+
+        // gemini and kimi `-p` are value-binding (verified), so the model
+        // selector must trail the prompt, exactly like copilot.
+        let mut vb_models = HashMap::new();
+        vb_models.insert("gemini".to_string(), "gemini-2.5-flash".to_string());
+        vb_models.insert("kimi".to_string(), "moonshot-v1-8k".to_string());
+        let gemini = agents::get_agent("gemini").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                gemini,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(gemini, &vb_models)),
+            )
+            .expect("gemini one-shot"),
+            vec!["gemini", "-p", "name this", "-m", "gemini-2.5-flash"]
+        );
+        let kimi = agents::get_agent("kimi").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                kimi,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(kimi, &vb_models)),
+            )
+            .expect("kimi one-shot"),
+            vec!["kimi", "-p", "name this", "-m", "moonshot-v1-8k"]
+        );
+
+        // opencode `run` takes a positional prompt, so its model selector goes
+        // before the prompt.
+        let mut oc_models = HashMap::new();
+        oc_models.insert(
+            "opencode".to_string(),
+            "anthropic/claude-haiku-4-5".to_string(),
+        );
+        let opencode = agents::get_agent("opencode").unwrap();
+        assert_eq!(
+            build_oneshot_argv(
+                opencode,
+                "name this",
+                OneshotModel::Title(resolve_title_model_args(opencode, &oc_models)),
+            )
+            .expect("opencode one-shot"),
+            vec![
+                "opencode",
+                "run",
+                "-m",
+                "anthropic/claude-haiku-4-5",
+                "name this"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_title_model_args_precedence() {
+        let claude = claude();
+        let codex = agents::get_agent("codex").unwrap();
+        let mut models = HashMap::new();
+        // Absent key -> built-in default (claude pins haiku; codex has none).
+        assert_eq!(
+            resolve_title_model_args(claude, &models),
+            vec!["--model", "haiku"]
+        );
+        assert!(resolve_title_model_args(codex, &models).is_empty());
+        // Non-empty override -> that model via the agent's flag.
+        models.insert("claude".to_string(), "opus".to_string());
+        models.insert("codex".to_string(), "gpt-5".to_string());
+        assert_eq!(
+            resolve_title_model_args(claude, &models),
+            vec!["--model", "opus"]
+        );
+        assert_eq!(
+            resolve_title_model_args(codex, &models),
+            vec!["-m", "gpt-5"]
+        );
+        // Empty (or whitespace) value -> force CLI default (opt out of haiku).
+        models.insert("claude".to_string(), "  ".to_string());
+        assert!(resolve_title_model_args(claude, &models).is_empty());
+        // A padded non-empty value is trimmed before it is pinned.
+        models.insert("claude".to_string(), "  opus  ".to_string());
+        assert_eq!(
+            resolve_title_model_args(claude, &models),
+            vec!["--model", "opus"]
         );
     }
 
@@ -1481,15 +1749,30 @@ mod tests {
     #[test]
     fn argv_per_agent_tokens() {
         assert_eq!(
-            build_oneshot_argv(agents::get_agent("codex").unwrap(), "x").unwrap()[1],
+            build_oneshot_argv(
+                agents::get_agent("codex").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
             "exec"
         );
         assert_eq!(
-            build_oneshot_argv(agents::get_agent("opencode").unwrap(), "x").unwrap()[1],
+            build_oneshot_argv(
+                agents::get_agent("opencode").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
             "run"
         );
         assert_eq!(
-            build_oneshot_argv(agents::get_agent("gemini").unwrap(), "x").unwrap()[1],
+            build_oneshot_argv(
+                agents::get_agent("gemini").unwrap(),
+                "x",
+                OneshotModel::CliDefault
+            )
+            .unwrap()[1],
             "-p"
         );
     }

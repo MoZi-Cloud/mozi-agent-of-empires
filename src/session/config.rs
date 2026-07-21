@@ -872,6 +872,25 @@ pub struct SessionConfig {
     )]
     pub smart_rename_agent: String,
 
+    /// Per-agent model for the throwaway smart-rename title one-shot, keyed by
+    /// agent name (e.g. `claude` = `haiku`). A three-to-five-word title should
+    /// not bill the CLI's default frontier model. An absent key uses the
+    /// agent's built-in default (claude pins its cheap alias, others the CLI
+    /// default); an empty value forces the CLI default (opt out of the built-in
+    /// pin); a non-empty value pins that model via the agent's model flag
+    /// (`--model` / `-m`). Free-form: AoE pins no CLI version, so ids are not
+    /// validated, and an id the CLI rejects simply keeps the generated name.
+    /// Does not affect the conversation summary, which always uses the CLI
+    /// default. Only agents with a one-shot mode are tunable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Smart Rename Model",
+        widget = "custom:smart-rename-model",
+        web = "elevation:pins the model argv token for the rename one-shot CLI call",
+        category = "Agents"
+    )]
+    pub smart_rename_model: HashMap<String, String>,
+
     /// Periodically generate a "summary of the conversation so far" for a
     /// structured-view (ACP) session by running the session's own agent
     /// one-shot over the transcript (agent-agnostic, like smart rename).
@@ -1385,6 +1404,7 @@ impl Default for SessionConfig {
             conversation_summary: false,
             smart_rename: true,
             smart_rename_agent: String::new(),
+            smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,
             opencode_preassign_session_id: false,
             mouse_capture: true,

@@ -20,7 +20,9 @@
 
 use crate::acp::state::Event;
 use crate::agents;
-use crate::session::smart_rename::{resolve_rename_tool, strip_ansi, truncate_bytes, SkipReason};
+use crate::session::smart_rename::{
+    resolve_rename_tool, strip_ansi, truncate_bytes, OneshotModel, SkipReason,
+};
 use std::collections::HashMap;
 
 /// Only one summary one-shot runs at a time process-wide. A summary reads the
@@ -371,7 +373,14 @@ mod serve {
         }
 
         let prompt = build_summary_prompt(previous.as_deref(), &delta);
-        let Some(argv) = crate::session::smart_rename::build_oneshot_argv(agent, &prompt) else {
+        // A summary reads the whole transcript and can run a bigger model turn
+        // (see SUMMARY_TIMEOUT), so it uses the CLI default model rather than
+        // the cheap alias smart-rename titles pin.
+        let Some(argv) = crate::session::smart_rename::build_oneshot_argv(
+            agent,
+            &prompt,
+            OneshotModel::CliDefault,
+        ) else {
             return;
         };
 

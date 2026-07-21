@@ -12,6 +12,7 @@ import {
   DefaultToolWidget,
   LoggingTargetsWidget,
   SmartRenameAgentWidget,
+  SmartRenameModelWidget,
   SoundVolumeWidget,
   ThemeNameWidget,
 } from "../customWidgets";
@@ -166,6 +167,54 @@ describe("SmartRenameAgentWidget", () => {
     // Empty selection persists as "" (use session agent), not null.
     fireEvent.change(selectByLabel("Smart-rename agent"), { target: { value: "" } });
     expect(save).toHaveBeenCalledWith("");
+  });
+});
+
+describe("SmartRenameModelWidget", () => {
+  function inputByLabel(label: string): HTMLInputElement {
+    const el = Array.from(document.querySelectorAll("label")).find((l) => l.textContent === label);
+    return el?.parentElement?.querySelector("input") as HTMLInputElement;
+  }
+
+  it("renders a row per installed one-shot agent and sets a model override", async () => {
+    const save = vi.fn(() => Promise.resolve(true));
+    render(
+      <SmartRenameModelWidget
+        descriptor={descriptor({ field: "smart_rename_model", label: "Smart-rename model" })}
+        value={{}}
+        save={save}
+      />,
+    );
+    // Only installed one-shot-capable agents get a row (claude, codex);
+    // gemini (not installed) and cursor (no one-shot) are filtered out.
+    await waitFor(() => expect(inputByLabel("codex")).toBeTruthy());
+    expect(inputByLabel("claude")).toBeTruthy();
+    expect(inputByLabel("gemini")).toBeFalsy();
+    expect(inputByLabel("cursor")).toBeFalsy();
+
+    const input = inputByLabel("claude");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "haiku" } });
+    fireEvent.blur(input);
+    expect(save).toHaveBeenCalledWith({ claude: "haiku" });
+  });
+
+  it("clears an override to fall back to the built-in default", async () => {
+    const save = vi.fn(() => Promise.resolve(true));
+    render(
+      <SmartRenameModelWidget
+        descriptor={descriptor({ field: "smart_rename_model", label: "Smart-rename model" })}
+        value={{ claude: "haiku", codex: "gpt-5" }}
+        save={save}
+      />,
+    );
+    await waitFor(() => expect(inputByLabel("claude")).toBeTruthy());
+    const input = inputByLabel("claude");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.blur(input);
+    // Clearing removes the key (built-in default), keeping the other override.
+    expect(save).toHaveBeenCalledWith({ codex: "gpt-5" });
   });
 });
 

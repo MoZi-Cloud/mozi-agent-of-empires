@@ -205,3 +205,54 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
     </div>
   );
 }
+
+/** Per-agent model for the smart-rename title one-shot. The `smart_rename_model`
+ *  field is an `{ agent: model }` map; one free-text row per installed
+ *  one-shot-capable agent. Clearing a row removes the key, so the agent falls
+ *  back to its built-in default (claude pins `haiku`, others the CLI default).
+ *  The third "force CLI default" state (an explicit empty-string value, opting
+ *  out of the built-in pin) is only meaningful for claude and is settable via
+ *  the TUI or config.toml, not this widget. Ids are free-form because AoE pins
+ *  no CLI version. */
+export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  useEffect(() => {
+    fetchAgents()
+      .then(setAgents)
+      .catch(() => setAgents([]));
+  }, []);
+  const models = (value ?? {}) as Record<string, string>;
+  const saveModel = (agent: string, model: string) => {
+    const next = { ...models };
+    const trimmed = model.trim();
+    if (trimmed === "") {
+      delete next[agent];
+    } else {
+      next[agent] = trimmed;
+    }
+    save(next);
+  };
+  const tunable = agents.filter((a) => a.installed && a.oneshot_capable);
+  return (
+    <div className="space-y-4">
+      <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>
+      {descriptor.description && <p className="text-xs text-text-dim">{descriptor.description}</p>}
+      {tunable.length === 0 ? (
+        <p className="text-xs text-text-dim">No one-shot-capable agents installed.</p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {tunable.map((a) => (
+            <TextField
+              key={a.name}
+              label={a.name}
+              value={models[a.name] ?? ""}
+              onChange={(v) => saveModel(a.name, v)}
+              placeholder="Built-in default"
+              mono
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

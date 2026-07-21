@@ -276,22 +276,23 @@ impl SettingField {
             {
                 validate_snooze_duration(*n)
             }
-            // acp_defaults is edited as raw JSON; require a JSON object so a
-            // typo is rejected at commit instead of wiping the map.
+            // acp_defaults and smart_rename_model are edited as raw JSON; require
+            // a JSON object so a typo is rejected at commit instead of wiping the
+            // map.
             (
                 FieldKind::Schema {
                     widget: WidgetKind::Custom { id },
                     ..
                 },
                 FieldValue::Text(s),
-            ) if id == "acp-defaults" => {
+            ) if id == "acp-defaults" || id == "smart-rename-model" => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return Ok(());
                 }
                 match serde_json::from_str::<Value>(trimmed) {
                     Ok(v) if v.is_object() => Ok(()),
-                    Ok(_) => Err("Must be a JSON object (agent -> {model, effort})".to_string()),
+                    Ok(_) => Err("Must be a JSON object (agent -> value)".to_string()),
                     Err(e) => Err(format!("Invalid JSON: {e}")),
                 }
             }
@@ -528,6 +529,19 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             };
             FieldValue::Text(text)
         }
+        "smart-rename-model" => {
+            // A per-agent {agent: model} map, edited as raw JSON in the TUI
+            // (the web has a structured per-agent widget). This raw-JSON path is
+            // the only surface that can set the empty-string "force CLI default"
+            // value; the web widget removes a key on clear. Commit validation
+            // requires a JSON object so a typo cannot wipe the map.
+            let text = if current.is_null() {
+                "{}".to_string()
+            } else {
+                serde_json::to_string(current).unwrap_or_else(|_| "{}".to_string())
+            };
+            FieldValue::Text(text)
+        }
         // logging-targets is expanded into per-target rows during build and
         // never lands here.
         _ => FieldValue::Text(String::new()),
@@ -638,6 +652,18 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             .map(|s| json!(volume_from_option(s)))
             .unwrap_or(Value::Null),
         ("acp-defaults", FieldValue::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return json!({});
+            }
+            // Commit-time validation guarantees a valid object here; fall back
+            // to an empty map rather than corrupt the leaf if it ever slips.
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(v) if v.is_object() => v,
+                _ => json!({}),
+            }
+        }
+        ("smart-rename-model", FieldValue::Text(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
                 return json!({});
@@ -1206,6 +1232,38 @@ mod tests {
         // an empty map rather than writing a string/array into the field.
         assert_eq!(
             custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
+            json!({}),
+        );
+    }
+
+    #[test]
+    fn smart_rename_model_custom_widget_round_trips_json() {
+        let current = json!({"claude": "haiku", "codex": "gpt-5"});
+        let fv = custom_value_from_json("smart-rename-model", &current);
+        let FieldValue::Text(s) = &fv else {
+            panic!("smart-rename-model must build a Text field");
+        };
+        assert_eq!(
+            custom_value_to_json("smart-rename-model", &FieldValue::Text(s.clone())),
+            current,
+        );
+
+        // Empty text and a null current both resolve to an empty map.
+        assert_eq!(
+            custom_value_to_json("smart-rename-model", &FieldValue::Text(String::new())),
+            json!({}),
+        );
+        assert!(matches!(
+            custom_value_from_json("smart-rename-model", &Value::Null),
+            FieldValue::Text(t) if t == "{}"
+        ));
+
+        // Non-object JSON degrades to an empty map rather than corrupting the leaf.
+        assert_eq!(
+            custom_value_to_json(
+                "smart-rename-model",
+                &FieldValue::Text("\"oops\"".to_string())
+            ),
             json!({}),
         );
     }
