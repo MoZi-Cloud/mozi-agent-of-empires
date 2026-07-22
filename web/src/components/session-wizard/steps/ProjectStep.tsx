@@ -563,7 +563,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
               )}
 
               {cloning && (
-                <div className="px-3 py-2 bg-brand-950/25 border border-brand-700/30 rounded-md text-sm text-text-secondary">
+                <div className="px-3 py-2 bg-brand-900/25 border border-brand-700/30 rounded-md text-sm text-text-secondary">
                   {cloneElapsedSeconds < 10
                     ? "Connecting to the remote repository…"
                     : cloneElapsedSeconds < 5 * 60
