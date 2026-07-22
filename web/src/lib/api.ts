@@ -1780,13 +1780,14 @@ export async function createSession(body: CreateSessionRequest): Promise<{
 
 export async function cloneRepo(
   url: string,
-  opts?: { destination?: string; shallow?: boolean; bare?: boolean },
+  opts?: { destination?: string; shallow?: boolean; bare?: boolean; proxy?: string },
 ): Promise<{ ok: boolean; path?: string; error?: string }> {
   try {
     const body: Record<string, unknown> = { url };
     if (opts?.destination) body.destination = opts.destination;
     if (opts?.shallow) body.shallow = true;
     if (opts?.bare) body.bare = true;
+    if (opts?.proxy) body.proxy = opts.proxy;
     const res = await fetch("/api/git/clone", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2196,6 +2197,24 @@ export async function startSession(id: string): Promise<SessionResponse | null> 
       headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a terminal session's proxy. A live terminal must then be restarted
+ *  so its tmux process receives the new environment. Pass null to clear it. */
+export async function setSessionProxy(id: string, proxy: string | null): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/proxy`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proxy }),
+    });
+    if (!res.ok) {
+      return null;
+    }
     return (await res.json()) as SessionResponse;
   } catch {
     return null;

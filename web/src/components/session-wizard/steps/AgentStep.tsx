@@ -15,6 +15,7 @@ interface WizardData {
   advancedEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  hostProxy: string;
   customInstruction: string;
   extraArgs: string;
   commandOverride: string;

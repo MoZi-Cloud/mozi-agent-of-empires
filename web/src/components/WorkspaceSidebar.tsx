@@ -78,7 +78,10 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
   renameSession,
+  setSessionProxy,
   setSessionNotifications,
+  startSession,
+  stopSession,
   setWorktreeName,
   smartRenameSession,
   updateSessionGroup,
@@ -1294,6 +1297,45 @@ export const SessionRow = memo(function SessionRow({
   // mid-lifecycle has nothing to stop, so hide the action for those.
   const canStop = !["Stopped", "Deleting", "Creating"].includes(sessionStatus);
 
+  // A terminal agent's environment is fixed when tmux launches it. Restrict
+  // injection to its prompt-waiting states, then restart through the normal
+  // stop/start API so the saved agent session id is resumed safely.
+  const canInjectProxy =
+    !readOnly &&
+    firstSession?.view === "terminal" &&
+    !firstSession.is_sandboxed &&
+    ["Waiting", "Idle", "Stopped"].includes(sessionStatus);
+
+  const handleInjectProxy = async () => {
+    setContextMenu(null);
+    if (!sessionId || !firstSession) return;
+    const value = window.prompt(
+      "Proxy server for this terminal session (leave blank to clear)",
+      firstSession.host_proxy ?? "",
+    );
+    if (value === null) return;
+    const updated = await setSessionProxy(sessionId, value.trim() || null);
+    if (!updated) {
+      reportError("Failed to update session proxy. The session must be waiting or stopped.");
+      return;
+    }
+    if (sessionStatus === "Stopped") {
+      reportInfo("Session proxy updated. Start the session when ready.");
+      return;
+    }
+    const stopped = await stopSession(sessionId);
+    if (!stopped) {
+      reportError("Proxy was saved, but the session could not be stopped for restart.");
+      return;
+    }
+    const started = await startSession(sessionId);
+    if (!started) {
+      reportError("Proxy was saved, but the session could not be resumed. Use Start to retry.");
+      return;
+    }
+    reportInfo("Session proxy injected and the terminal session resumed.");
+  };
+
   const handleStart = () => {
     setContextMenu(null);
     onStart?.(workspace.id);
@@ -1638,6 +1680,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <CircleStop className="h-3.5 w-3.5 shrink-0" />
                     {t("sidebar:ctx.stop")}
+                  </button>
+                )}
+                {canInjectProxy && (
+                  <button
+                    onClick={() => void handleInjectProxy()}
+                    data-testid="sidebar-context-menu-inject-proxy"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+                    Inject proxy
                   </button>
                 )}
                 {!readOnly && canStart && (

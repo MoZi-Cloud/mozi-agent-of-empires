@@ -169,9 +169,12 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
   // Clone state
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneDestination, setCloneDestination] = useState("");
+  const [cloneProxy, setCloneProxy] = useState("");
   const [shallowClone, setShallowClone] = useState(false);
   const [bareClone, setBareClone] = useState(false);
   const [cloning, setCloning] = useState(false);
+  const [cloneStartedAt, setCloneStartedAt] = useState<number | null>(null);
+  const [cloneElapsedSeconds, setCloneElapsedSeconds] = useState(0);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -193,6 +196,14 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
       },
     );
   }, [initialTab]);
+
+  useEffect(() => {
+    if (!cloning || cloneStartedAt === null) return;
+    const updateElapsed = () => setCloneElapsedSeconds(Math.floor((Date.now() - cloneStartedAt) / 1000));
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(interval);
+  }, [cloning, cloneStartedAt]);
 
   const filteredRecent = useMemo(() => {
     if (!data.path) return recent;
@@ -230,18 +241,23 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
     const url = cloneUrl.trim();
     if (!url) return;
     setCloning(true);
+    setCloneStartedAt(Date.now());
+    setCloneElapsedSeconds(0);
     setCloneError(null);
     const dest = cloneDestination.trim() || undefined;
     const result = await cloneRepo(url, {
       destination: dest,
       shallow: shallowClone,
       bare: bareClone,
+      proxy: cloneProxy.trim() || undefined,
     });
     setCloning(false);
+    setCloneStartedAt(null);
     if (result.ok && result.path) {
       onChange("path", result.path);
       setCloneUrl("");
       setCloneDestination("");
+      setCloneProxy("");
       setActiveTab("recent");
     } else {
       setCloneError(result.error || "Clone failed");
@@ -489,6 +505,26 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
                       disabled={cloning}
                     />
                   </div>
+                  <div>
+                    <label htmlFor="clone-proxy" className="block text-[12px] text-text-dim mb-1">
+                      Proxy server (optional)
+                    </label>
+                    <input
+                      id="clone-proxy"
+                      type="text"
+                      value={cloneProxy}
+                      onChange={(e) => {
+                        setCloneProxy(e.target.value);
+                        setCloneError(null);
+                      }}
+                      placeholder="http://127.0.0.1:10808"
+                      className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+                      disabled={cloning}
+                    />
+                    <p className="mt-1 text-[11px] text-text-dim">
+                      Used only while cloning. HTTPS uses the proxy directly; SSH uses HTTP CONNECT (GitHub uses port 443).
+                    </p>
+                  </div>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="checkbox"
@@ -522,6 +558,16 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
               {cloneError && (
                 <div className="px-3 py-2 bg-red-900/20 border border-red-700/30 rounded-md">
                   <p className="text-sm text-red-400">{cloneError}</p>
+                </div>
+              )}
+
+              {cloning && (
+                <div className="px-3 py-2 bg-brand-950/25 border border-brand-700/30 rounded-md text-sm text-text-secondary">
+                  {cloneElapsedSeconds < 10
+                    ? "Connecting to the remote repository…"
+                    : cloneElapsedSeconds < 5 * 60
+                      ? `Cloning in progress — ${Math.floor(cloneElapsedSeconds / 60)}m ${cloneElapsedSeconds % 60}s elapsed.`
+                      : "Checking for a large repository. Clones with 100,000+ checked-out files continue for up to 20 minutes."}
                 </div>
               )}
 

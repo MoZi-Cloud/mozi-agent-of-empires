@@ -1526,6 +1526,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_unread),
         )
         .route("/api/sessions/{id}/stop", post(api::stop_session))
+        .route("/api/sessions/{id}/proxy", patch(api::update_session_proxy))
         .route(
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),

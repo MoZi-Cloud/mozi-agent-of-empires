@@ -5,11 +5,182 @@ use std::path::Path;
 use super::error::{GitError, Result};
 use super::open_repo_at;
 
+const NORMAL_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const LARGE_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const LARGE_REPOSITORY_FILE_THRESHOLD: usize = 100_000;
+
+/// Count checked-out repository files up to `limit`, deliberately skipping
+/// Git's object database. This runs only at the normal timeout boundary, so
+/// it does not slow ordinary clones. A generic Git remote cannot disclose its
+/// full tree count before tree objects are fetched; this is the earliest
+/// reliable, transport-agnostic signal without cloning the repository twice.
+fn checked_out_file_count_at_least(root: &Path, limit: usize) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    let mut count = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => stack.push(path),
+                Ok(file_type) if file_type.is_file() => {
+                    count += 1;
+                    if count >= limit {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Configure a clone subprocess with its private proxy environment. HTTP(S)
+/// remotes use libcurl's standard variables. SSH remotes use OpenSSH's
+/// `ProxyCommand` through the system OpenBSD netcat, which supports HTTP
+/// CONNECT without adding another package. GitHub is sent to ssh.github.com
+/// on port 443 because many HTTP proxies reject CONNECT to port 22.
+fn apply_proxy_environment(
+    command: &mut std::process::Command,
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<()> {
+    let Some(proxy) = proxy.map(str::trim).filter(|proxy| !proxy.is_empty()) else {
+        return Ok(());
+    };
+    for key in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        command.env(key, proxy);
+    }
+    if is_ssh_url(url) {
+        let proxy_address = parse_http_proxy_address(proxy)?;
+        let github_options =
+            if ssh_host(url).is_some_and(|host| host.eq_ignore_ascii_case("github.com")) {
+                " -o HostName=ssh.github.com -o Port=443 -o HostKeyAlias=github.com"
+            } else {
+                ""
+            };
+        // `proxy_address` is parsed as a host:port using a conservative
+        // character set before it reaches this command string. The remaining
+        // text is static, so a proxy value cannot inject SSH options or shell
+        // syntax through GIT_SSH_COMMAND.
+        command.env(
+            "GIT_SSH_COMMAND",
+            format!(
+                "ssh{github_options} -o \"ProxyCommand=nc -X connect -x {proxy_address} %h %p\""
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn is_ssh_url(url: &str) -> bool {
+    url.starts_with("ssh://") || (url.contains('@') && url.contains(':') && !url.contains("://"))
+}
+
+/// Extract the SSH host from the two forms accepted by Git: `ssh://user@host`
+/// and `user@host:path`.
+fn ssh_host(url: &str) -> Option<&str> {
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let authority = rest.split('/').next()?;
+        let host_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return Some(
+            host_port
+                .trim_matches(['[', ']'])
+                .split(':')
+                .next()
+                .unwrap_or(host_port),
+        );
+    }
+    let (_, host_path) = url.split_once('@')?;
+    let (host, _) = host_path.split_once(':')?;
+    Some(host)
+}
+
+/// Return a safe `host:port` value for OpenBSD netcat's `-x` option. HTTP
+/// CONNECT proxies are deliberately the only accepted form for SSH URLs:
+/// supporting an HTTPS proxy would require a TLS wrapper, and credentials
+/// would require a separate, auditable authentication strategy.
+fn parse_http_proxy_address(proxy: &str) -> Result<String> {
+    let authority = proxy.strip_prefix("http://").ok_or_else(|| {
+        GitError::CloneFailed("SSH clone proxy must use http://host:port".to_string())
+    })?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return Err(GitError::CloneFailed(
+            "SSH clone proxy must be an HTTP host and port (for example http://127.0.0.1:10808)"
+                .to_string(),
+        ));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| GitError::CloneFailed("SSH clone proxy must include a port".to_string()))?;
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']'))
+        || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
+    {
+        return Err(GitError::CloneFailed(
+            "SSH clone proxy must be a valid HTTP host and port".to_string(),
+        ));
+    }
+    Ok(authority.to_string())
+}
+
+/// Git can fork ssh and its ProxyCommand. Put the clone in its own process
+/// group so a timeout cannot leave a blocked ssh/nc chain alive after the git
+/// parent is gone.
+fn configure_clone_process_group(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn terminate_clone_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // A negative PID targets the process group created above. Ignore an
+        // ESRCH race: the child may have just exited between polling and kill.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Clone a git repository as a bare repo with worktree setup, following the
 /// workflow-guide structure. Returns the path to the created worktree
 /// (`<destination>/main`). Cleans up `<destination>` on failure.
 #[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url)))]
 pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
+    clone_bare_repo_with_proxy(url, destination, None)
+}
+
+/// Clone a bare repository with an optional, process-local proxy.  The proxy
+/// is deliberately supplied as environment data (rather than interpolated
+/// into a shell command), so it only affects this one git invocation.
+pub fn clone_bare_repo_with_proxy(
+    url: &str,
+    destination: &Path,
+    proxy: Option<&str>,
+) -> Result<String> {
     if destination.exists() {
         return Err(GitError::CloneFailed(format!(
             "Destination already exists: {}",
@@ -29,7 +200,10 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         args = ?["clone", "--bare", &redacted_url, bare_str],
         "spawning git clone --bare"
     );
-    let mut child = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    apply_proxy_environment(&mut command, url, proxy)?;
+    configure_clone_process_group(&mut command);
+    let mut child = command
         .args(["clone", "--bare", url, bare_str])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -37,7 +211,8 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         .spawn()
         .map_err(|e| GitError::CloneFailed(format!("Failed to run git clone --bare: {e}")))?;
 
-    let timeout = std::time::Duration::from_secs(300);
+    let mut timeout = NORMAL_CLONE_TIMEOUT;
+    let mut extended_for_large_repo = false;
     let poll_interval = std::time::Duration::from_millis(200);
     let start = std::time::Instant::now();
 
@@ -61,12 +236,28 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if !extended_for_large_repo
+                        && checked_out_file_count_at_least(
+                            destination,
+                            LARGE_REPOSITORY_FILE_THRESHOLD,
+                        )
+                    {
+                        extended_for_large_repo = true;
+                        timeout = LARGE_CLONE_TIMEOUT;
+                        tracing::info!(
+                            target: "git.fetch",
+                            path = %destination.display(),
+                            threshold = LARGE_REPOSITORY_FILE_THRESHOLD,
+                            "large repository detected; extending bare clone timeout to 20 minutes"
+                        );
+                        continue;
+                    }
+                    terminate_clone_process_tree(&mut child);
                     let _ = std::fs::remove_dir_all(destination);
-                    return Err(GitError::CloneFailed(
-                        "Bare clone timed out after 5 minutes".to_string(),
-                    ));
+                    return Err(GitError::CloneFailed(format!(
+                        "Bare clone timed out after {} minutes",
+                        timeout.as_secs() / 60
+                    )));
                 }
                 std::thread::sleep(poll_interval);
             }
@@ -80,7 +271,9 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
     }
 
     let run_in_bare = |args: &[&str]| -> Result<std::process::Output> {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        apply_proxy_environment(&mut command, url, proxy)?;
+        let output = command
             .args(args)
             .current_dir(&bare_dir)
             .stdin(std::process::Stdio::null())
@@ -226,6 +419,17 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
 /// minutes to prevent indefinite hangs (unresponsive remotes, SSH prompts).
 #[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url), shallow))]
 pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
+    clone_repo_with_proxy(url, destination, shallow, None)
+}
+
+/// Clone a repository with an optional, process-local proxy. See
+/// [`clone_bare_repo_with_proxy`] for why this is environment based.
+pub fn clone_repo_with_proxy(
+    url: &str,
+    destination: &Path,
+    shallow: bool,
+    proxy: Option<&str>,
+) -> Result<()> {
     if destination.exists() {
         return Err(GitError::CloneFailed(format!(
             "Destination already exists: {}",
@@ -255,7 +459,10 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
         args = ?redacted_args,
         "spawning git clone"
     );
-    let mut child = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    apply_proxy_environment(&mut command, url, proxy)?;
+    configure_clone_process_group(&mut command);
+    let mut child = command
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -264,7 +471,8 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
         .map_err(|e| GitError::CloneFailed(format!("Failed to run git clone: {e}")))?;
 
     // Poll with a 5-minute timeout to avoid blocking the thread pool forever.
-    let timeout = std::time::Duration::from_secs(300);
+    let mut timeout = NORMAL_CLONE_TIMEOUT;
+    let mut extended_for_large_repo = false;
     let poll_interval = std::time::Duration::from_millis(200);
     let start = std::time::Instant::now();
 
@@ -283,22 +491,40 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                let _ = std::fs::remove_dir_all(destination);
                 return Err(GitError::CloneFailed(stderr));
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if !extended_for_large_repo
+                        && checked_out_file_count_at_least(
+                            destination,
+                            LARGE_REPOSITORY_FILE_THRESHOLD,
+                        )
+                    {
+                        extended_for_large_repo = true;
+                        timeout = LARGE_CLONE_TIMEOUT;
+                        tracing::info!(
+                            target: "git.fetch",
+                            path = %destination.display(),
+                            threshold = LARGE_REPOSITORY_FILE_THRESHOLD,
+                            "large repository detected; extending clone timeout to 20 minutes"
+                        );
+                        continue;
+                    }
+                    terminate_clone_process_tree(&mut child);
                     if destination.exists() {
                         let _ = std::fs::remove_dir_all(destination);
                     }
-                    return Err(GitError::CloneFailed(
-                        "Clone timed out after 5 minutes".to_string(),
-                    ));
+                    return Err(GitError::CloneFailed(format!(
+                        "Clone timed out after {} minutes",
+                        timeout.as_secs() / 60
+                    )));
                 }
                 std::thread::sleep(poll_interval);
             }
             Err(e) => {
+                let _ = std::fs::remove_dir_all(destination);
                 return Err(GitError::CloneFailed(format!(
                     "Failed waiting for git clone: {e}"
                 )));

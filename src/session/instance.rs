@@ -439,6 +439,10 @@ pub struct Instance {
     pub detect_as: String,
     #[serde(default)]
     pub yolo_mode: bool,
+    /// Proxy URL for this terminal session. Expanded into standard proxy
+    /// environment variables immediately before the tmux command is launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_proxy: Option<String>,
     #[serde(default)]
     pub status: Status,
     pub created_at: DateTime<Utc>,
@@ -1095,6 +1099,7 @@ impl Instance {
             tool: "claude".to_string(),
             detect_as: String::new(),
             yolo_mode: false,
+            host_proxy: None,
             status: Status::Idle,
             created_at: Utc::now(),
             last_accessed_at: None,
@@ -1754,7 +1759,26 @@ impl Instance {
     /// falling back to the global list when the profile has no override.
     fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
-        super::profile_config::resolve_config_or_warn(&profile).environment
+        let mut environment = super::profile_config::resolve_config_or_warn(&profile).environment;
+        if !self.is_sandboxed() {
+            if let Some(proxy) = self
+                .host_proxy
+                .as_deref()
+                .filter(|proxy| !proxy.trim().is_empty())
+            {
+                for key in [
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                ] {
+                    environment.push(format!("{key}={proxy}"));
+                }
+            }
+        }
+        environment
     }
 
     pub fn is_sub_session(&self) -> bool {

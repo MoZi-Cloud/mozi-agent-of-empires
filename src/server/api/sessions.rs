@@ -54,6 +54,10 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
     pub is_sandboxed: bool,
+    /// Host-side proxy applied only when starting a non-sandbox terminal
+    /// session. Omitted when the session inherits the server environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_proxy: Option<String>,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
     /// `<app_dir>/scratch/<id>/` that the deletion path removes. The web
@@ -340,6 +344,7 @@ impl SessionResponse {
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
             is_sandboxed: inst.is_sandboxed(),
+            host_proxy: inst.host_proxy.clone(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
             urgent: inst.is_urgent(),
@@ -2811,6 +2816,122 @@ pub async fn stop_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+/// Set the per-session host proxy for a terminal session. The caller must
+/// restart a live session after this returns; `start_session` uses the stored
+/// agent session id and therefore resumes rather than starting a new chat.
+#[derive(Deserialize)]
+pub struct UpdateSessionProxyBody {
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+pub async fn update_session_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateSessionProxyBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let proxy = body
+        .proxy
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message": "Session not found"})),
+            )
+                .into_response();
+        };
+        #[cfg(feature = "serve")]
+        let structured = instance.is_structured();
+        #[cfg(not(feature = "serve"))]
+        let structured = false;
+        if structured || instance.is_sandboxed() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "terminal_session_required",
+                    "message": "A proxy can only be injected into a non-sandbox terminal session"
+                })),
+            )
+                .into_response();
+        }
+        if !matches!(
+            instance.status,
+            Status::Waiting | Status::Idle | Status::Stopped
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_not_waiting",
+                    "message": "Wait until the terminal session is idle before changing its proxy"
+                })),
+            )
+                .into_response();
+        }
+        instance.source_profile.clone()
+    };
+
+    let persist_id = id.clone();
+    let persist_proxy = proxy.clone();
+    if persist_session_update(
+        profile,
+        "update session proxy",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                instance.host_proxy = persist_proxy;
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let response = {
+        let mut instances = state.instances.write().await;
+        match instances.iter_mut().find(|instance| instance.id == id) {
+            Some(instance) => {
+                instance.host_proxy = proxy;
+                SessionResponse::from_instance(
+                    instance,
+                    crate::claude_settings::read_tui_fullscreen(),
+                )
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"message": "Session not found"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
 /// Start (resume) a stopped session, the inverse of [`stop_session`]. Plain
 /// sessions are restarted exactly like `ensure_session` (kill any corpse pane,
 /// then `start_with_resume_fallback`); structured sessions are un-parked by
@@ -3695,6 +3816,8 @@ pub struct CreateSessionBody {
     #[serde(default)]
     pub extra_env: Vec<String>,
     #[serde(default)]
+    pub host_proxy: Option<String>,
+    #[serde(default)]
     pub extra_repo_paths: Vec<String>,
     #[serde(default)]
     pub command_override: String,
@@ -4398,6 +4521,7 @@ pub async fn create_session(
             sandbox_image,
             yolo_mode: body.yolo_mode,
             extra_env: body.extra_env,
+            host_proxy: body.host_proxy,
             extra_args: body.extra_args,
             command_override: body.command_override,
             extra_repo_paths,

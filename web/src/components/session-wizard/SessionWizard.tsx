@@ -296,6 +296,12 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       sandbox: d.sandboxEnabled,
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
       extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
+      host_proxy:
+        !d.sandboxEnabled && !selectedAgentAcpCapable && d.hostProxy.trim()
+          ? d.hostProxy.trim()
+          : !d.sandboxEnabled && !d.useStructuredView && d.hostProxy.trim()
+            ? d.hostProxy.trim()
+            : undefined,
       extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
