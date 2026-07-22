@@ -8809,6 +8809,7 @@ mod workspace_ordering_tests {
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
         SessionResponse {
             id: id.to_string(),
+            host_proxy: None,
             title: id.to_string(),
             project_path: project_path.to_string(),
             artifact_dir: String::new(),

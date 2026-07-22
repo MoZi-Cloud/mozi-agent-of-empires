@@ -1865,6 +1865,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: vec![],
             scratch: false,
+            host_proxy: None,
             fork_seed: Some(ForkSeed::Terminal {
                 parent_agent_session_id: "parent-uuid".into(),
                 child_session_id: "child-uuid".into(),
@@ -1907,6 +1908,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: vec![],
             scratch: false,
+            host_proxy: None,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),
