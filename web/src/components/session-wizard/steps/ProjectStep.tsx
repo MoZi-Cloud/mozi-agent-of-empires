@@ -522,7 +522,8 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
                       disabled={cloning}
                     />
                     <p className="mt-1 text-[11px] text-text-dim">
-                      Used only while cloning. HTTPS uses the proxy directly; SSH uses HTTP CONNECT (GitHub uses port 443).
+                      Used only while cloning. HTTPS uses the proxy directly; SSH uses HTTP CONNECT (GitHub uses port
+                      443).
                     </p>
                   </div>
                   <label className="flex items-center gap-2 cursor-pointer">
