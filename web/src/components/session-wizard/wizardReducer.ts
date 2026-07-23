@@ -31,6 +31,8 @@ export interface WizardData {
   sandboxEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  /** Proxy URL injected only into this terminal session's tmux process. */
+  hostProxy: string;
   /** Additional repo paths to include in the multi-repo workspace.
    *  Free-text paths and registered project paths flow into the same list. */
   extraRepoPaths: string[];
@@ -129,6 +131,7 @@ export const initialData: WizardData = {
   sandboxEnabled: false,
   sandboxImage: "",
   extraEnv: [],
+  hostProxy: "",
   extraRepoPaths: [],
   advancedEnabled: false,
   profileDirty: false,

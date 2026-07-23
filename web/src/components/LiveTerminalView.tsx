@@ -8,6 +8,7 @@ import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
+import { type Modifiers, NO_MODIFIERS } from "../lib/modifierKeys";
 import {
   FOCUS_TERMINAL_EVENT,
   consumePendingTerminalFocus,
@@ -68,11 +69,19 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const { keyboardHeight } = useMobileKeyboard();
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const [ctrlActive, setCtrlActive] = useState(false);
-  const ctrlActiveRef = useRef(false);
+  // Mobile toolbar modifier latches (Shift/Ctrl/Alt/Cmd). One-shot: the next
+  // input (toolbar tap or soft-keyboard key) applies them, then they clear.
+  // The ref mirrors state so the keydown handler reads the live snapshot
+  // synchronously (state would be stale within one keypress).
+  const [modifiers, setModifiers] = useState<Modifiers>(NO_MODIFIERS);
+  const modifiersRef = useRef(modifiers);
   useEffect(() => {
-    ctrlActiveRef.current = ctrlActive;
-  }, [ctrlActive]);
+    modifiersRef.current = modifiers;
+  }, [modifiers]);
+  const toggleModifier = useCallback((key: keyof Modifiers) => {
+    setModifiers((m) => ({ ...m, [key]: !m[key] }));
+  }, []);
+  const clearModifiers = useCallback(() => setModifiers(NO_MODIFIERS), []);
 
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
@@ -284,8 +293,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
-          ctrlActiveRef={ctrlActiveRef}
-          clearCtrl={() => setCtrlActive(false)}
+          modifiersRef={modifiersRef}
+          clearModifiers={clearModifiers}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}
@@ -298,8 +307,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           sendData={live.sendData}
           inputElRef={inputRef}
           keyboardOpen={inputFocused}
-          ctrlActive={ctrlActive}
-          onCtrlToggle={() => setCtrlActive((v) => !v)}
+          modifiers={modifiers}
+          onToggleModifier={toggleModifier}
+          onClearModifiers={clearModifiers}
         />
       )}
     </div>

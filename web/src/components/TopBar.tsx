@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
@@ -70,16 +71,17 @@ export function TopBar({
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
+  const { t } = useTranslation();
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
-      { label: "Help", onClick: onOpenHelp },
-      { label: "Show tutorial", onClick: onStartTutorial },
-      { label: "Tips", onClick: onOpenTips },
-      { label: "About", onClick: onOpenAbout },
+      { label: t("shell:topbar.overflow.help"), onClick: onOpenHelp },
+      { label: t("shell:topbar.overflow.tutorial"), onClick: onStartTutorial },
+      { label: t("shell:topbar.overflow.tips"), onClick: onOpenTips },
+      { label: t("shell:topbar.overflow.about"), onClick: onOpenAbout },
     ];
-    if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
+    if (loginRequired) items.push({ label: t("shell:topbar.overflow.signOut"), onClick: onLogout });
     return items;
-  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
+  }, [t, onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
@@ -94,8 +96,8 @@ export function TopBar({
         <button
           onClick={onToggleSidebar}
           className="w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
-          title="Toggle sidebar"
-          aria-label="Toggle sidebar"
+          title={t("shell:topbar.toggleSidebar")}
+          aria-label={t("shell:topbar.toggleSidebar")}
         >
           <svg
             width="16"
@@ -115,7 +117,7 @@ export function TopBar({
         <button
           onClick={onGoDashboard}
           className="flex items-center gap-1.5 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
-          aria-label="Go to dashboard"
+          aria-label={t("shell:topbar.goDashboard")}
         >
           <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm" />
           <span className="font-mono text-xs leading-none">aoe</span>
@@ -142,8 +144,8 @@ export function TopBar({
         {isDevBuild && (
           <span
             className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30"
-            title="Debug build (cfg!(debug_assertions)); distinguishes the dev instance from a concurrent release build. See issue #1055."
-            aria-label="Debug build"
+            title={t("shell:topbar.devTitle")}
+            aria-label={t("shell:topbar.devTitle")}
           >
             DEV
           </span>
@@ -151,10 +153,10 @@ export function TopBar({
         {isOffline && (
           <span
             className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-error/10 text-status-error flex items-center gap-1.5"
-            title="Disconnected from backend"
+            title={t("shell:topbar.offlineTitle")}
           >
             <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse" />
-            offline
+            {t("shell:topbar.offline")}
           </span>
         )}
 
@@ -167,8 +169,8 @@ export function TopBar({
             <button
               onClick={onToggleDiff}
               className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
-              title="Toggle panels"
-              aria-label="Toggle panels"
+              title={t("shell:topbar.togglePanels")}
+              aria-label={t("shell:topbar.togglePanels")}
             >
               <svg
                 width="16"

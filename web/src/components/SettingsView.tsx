@@ -1,6 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import { useTranslation } from "react-i18next";
+import { useServerDown } from "../lib/connectionState";
+import i18n from "../i18n";
+import { useLocalizedSchema } from "../hooks/useLocalizedSchema";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
 import { NotificationSettings } from "./NotificationSettings";
@@ -192,6 +195,7 @@ export function SettingsView({
   readOnly,
 }: Props) {
   const offline = useServerDown();
+  const { t } = useTranslation();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -226,7 +230,6 @@ export function SettingsView({
     [onSelectProfile],
   );
   const sidebar = buildSidebar();
-  const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
   const activeTab: TabId = isTabId(tab) ? tab : "session";
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   // Settings schema (single source of truth, #1692). The generic SchemaSection
@@ -235,6 +238,11 @@ export function SettingsView({
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Localize the schema for the current language: overlays zh field
+  // labels/descriptions/options/categories (see useLocalizedSchema), so both
+  // the generic renderer and the settings search index see translated text.
+  // A pass-through (same array) in en, preserving referential stability.
+  const localizedSchema = useLocalizedSchema(schema);
   // Set when a settings-search hit is chosen: switch to the hit's tab and ask
   // the matching SchemaSection to scroll the field into view and highlight it.
   // The nonce bumps on every jump so re-selecting the same field (or jumping to
@@ -262,12 +270,12 @@ export function SettingsView({
     try {
       const s = await getSettingsSchema();
       if (!s) {
-        setSchemaError("Failed to load settings schema.");
+        setSchemaError(i18n.t("settings:loadSchemaError"));
         return;
       }
       setSchema(s);
     } catch {
-      setSchemaError("Failed to load settings schema.");
+      setSchemaError(i18n.t("settings:loadSchemaError"));
     } finally {
       setSchemaLoading(false);
     }
@@ -325,7 +333,7 @@ export function SettingsView({
       });
       setSaving(false);
       if (!ok) {
-        setSaveError("Failed to save, please try again");
+        setSaveError(i18n.t("settings:saveError"));
         loadSettings();
       }
       return ok;
@@ -378,7 +386,7 @@ export function SettingsView({
       const ok = await updateTheme({ [field]: value });
       setSaving(false);
       if (!ok) {
-        setSaveError("Failed to save, please try again");
+        setSaveError(i18n.t("settings:saveError"));
         loadSettings();
       }
       return ok;
@@ -399,14 +407,14 @@ export function SettingsView({
       activeTab !== "plugins" &&
       activeTab !== "telemetry"
     ) {
-      return <div className="text-sm text-text-dim">Loading settings...</div>;
+      return <div className="text-sm text-text-dim">{t("settings:loading")}</div>;
     }
 
     // The spinner/retry shown in place of a SchemaSection while the schema
     // loads or after it fails. Returns null once the schema is ready.
     const schemaGuard = () => {
       if (schemaLoading) {
-        return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        return <div className="text-sm text-text-dim">{t("settings:loadingSchema")}</div>;
       }
       if (schemaError) {
         return (
@@ -417,7 +425,7 @@ export function SettingsView({
               onClick={() => void loadSchema()}
               className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
             >
-              Retry
+              {t("settings:retry")}
             </button>
           </div>
         );
@@ -444,8 +452,8 @@ export function SettingsView({
             {/* Non-schema row: choosing the default profile is a profile-
                 management action, not a config field. */}
             <SelectField
-              label="Default profile"
-              description="Profile used for new sessions"
+              label={t("settings:defaultProfile")}
+              description={t("settings:defaultProfileDesc")}
               value={defaultProfile}
               onChange={(v) => handleSetDefault(v)}
               options={profiles.map((p) => ({ value: p.name, label: p.name }))}
@@ -458,14 +466,14 @@ export function SettingsView({
             {schemaGuard() ?? (
               <SchemaSection
                 section="session"
-                schema={schema}
+                schema={localizedSchema}
                 focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
                 onAfterSave={(descriptor) => {
                   if (descriptor.field === "row_tag") return onSettingsRefresh();
                 }}
-                advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
+                advancedSubtitle={t("settings:subtitle.session")}
               />
             )}
           </div>
@@ -475,11 +483,11 @@ export function SettingsView({
         return (
           <SchemaSection
             section="sandbox"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={sandbox}
             onSaveField={saveSubField}
-            advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
+            advancedSubtitle={t("settings:subtitle.sandbox")}
           />
         );
 
@@ -487,11 +495,11 @@ export function SettingsView({
         return (
           <SchemaSection
             section="worktree"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={worktree}
             onSaveField={saveSubField}
-            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+            advancedSubtitle={t("settings:subtitle.worktree")}
             fieldAnchor={{ field: "path_template", anchor: TOUR_ANCHORS.settingsWorktree }}
           />
         );
@@ -500,7 +508,7 @@ export function SettingsView({
         return (
           <SchemaSection
             section="theme"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
@@ -512,7 +520,7 @@ export function SettingsView({
         return (
           <SchemaSection
             section="sound"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={(settings?.sound ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
@@ -522,7 +530,7 @@ export function SettingsView({
         return (
           <SchemaSection
             section="tmux"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={(settings?.tmux ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
@@ -532,7 +540,7 @@ export function SettingsView({
         return (
           <SchemaSection
             section="updates"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={(settings?.updates ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
@@ -544,11 +552,11 @@ export function SettingsView({
         return (
           <SchemaSection
             section="logging"
-            schema={schema}
+            schema={localizedSchema}
             focusRequest={focusRequest}
             values={(settings?.logging ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
-            advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
+            advancedSubtitle={t("settings:subtitle.logging")}
           />
         );
 
@@ -556,7 +564,9 @@ export function SettingsView({
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
             <PluginsSettings />
-            {schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />}
+            {schemaGuard() ?? (
+              <PluginSettingsSections schema={localizedSchema} settings={settings} onSaved={loadSettings} />
+            )}
           </div>
         );
 
@@ -566,15 +576,15 @@ export function SettingsView({
             {/* Browser-push controls render regardless of schema state. */}
             <NotificationSettings />
             <div className="space-y-4">
-              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Server Defaults</h4>
-              <p className="text-xs text-text-dim">
-                Controls which session events trigger push notifications on the server.
-              </p>
+              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">
+                {t("settings:serverDefaults")}
+              </h4>
+              <p className="text-xs text-text-dim">{t("settings:serverDefaultsDesc")}</p>
               {schemaGuard() ??
                 (settings && (
                   <SchemaSection
                     section="web"
-                    schema={schema}
+                    schema={localizedSchema}
                     focusRequest={focusRequest}
                     values={web}
                     onSaveField={saveSubField}
@@ -594,7 +604,7 @@ export function SettingsView({
         return <McpServers />;
       case "structured-view": {
         if (!settings) {
-          return <div className="text-sm text-text-dim">Loading settings...</div>;
+          return <div className="text-sm text-text-dim">{t("settings:loading")}</div>;
         }
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
@@ -604,13 +614,11 @@ export function SettingsView({
                 react-joyride never has to scroll a far-down, async-growing
                 target into view (which made it loop and never advance). */}
             <p className="text-xs text-text-dim" {...tourAnchor(TOUR_ANCHORS.settingsAgentDefaults)}>
-              Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, how much
-              history is replayed on reconnect, and the per-agent model, mode, and thinking defaults below. These apply
-              when a session renders in the structured view instead of a raw terminal.
+              {t("settings:acpIntro")}
             </p>
             <SchemaSection
               section="acp"
-              schema={schema}
+              schema={localizedSchema}
               focusRequest={focusRequest}
               values={acp}
               onSaveField={saveSubField}
@@ -618,7 +626,7 @@ export function SettingsView({
               // ToolCards and the composer read live; refresh it after any acp
               // save so those surfaces pick up the change without a reload.
               onAfterSave={() => onServerAboutRefresh()}
-              advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
+              advancedSubtitle={t("settings:subtitle.acp")}
             />
           </div>
         );
@@ -626,7 +634,7 @@ export function SettingsView({
     }
   };
 
-  const currentTabLabel = tabs.find((t) => t.id === activeTab)?.label ?? "";
+  const currentTabLabel = t(`settings:tab.${activeTab}`);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-surface-900">
@@ -636,7 +644,7 @@ export function SettingsView({
         saveError={saveError}
         selectedProfile={selectedProfile}
         onSelectProfile={handleSelectProfile}
-        schema={schema}
+        schema={localizedSchema}
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
       />
@@ -658,7 +666,7 @@ export function SettingsView({
                 }`}
               >
                 {item.icon}
-                {item.label}
+                {t(`settings:tab.${item.id}`)}
               </button>
             ),
           )}
@@ -675,7 +683,7 @@ export function SettingsView({
                 key={item.label}
                 className={`px-4 pt-3 pb-1 text-[10px] font-mono uppercase tracking-widest text-text-dim ${i > 0 ? "mt-2 border-t border-surface-700/40" : ""}`}
               >
-                {item.label}
+                {t(`settings:divider.${item.label}`)}
               </div>
             ) : (
               <button
@@ -688,7 +696,7 @@ export function SettingsView({
                 }`}
               >
                 {item.icon}
-                {item.label}
+                {t(`settings:tab.${item.id}`)}
               </button>
             ),
           )}
@@ -701,7 +709,7 @@ export function SettingsView({
 
             {offline && (
               <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">
-                {OFFLINE_TITLE}: toggles will not save while disconnected.
+                {t("settings:offlineMessage")}
               </div>
             )}
             {/* Keying on tab + profileEpoch remounts the content subtree on a

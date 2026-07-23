@@ -10,6 +10,13 @@
       "components": ["web/src/components/PairedTerminal.tsx"]
     },
     {
+      "id": "terminal.mobile-toolbar",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileTerminalToolbar.test.tsx"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx", "web/src/components/QuickButtonEditModal.tsx"]
+    },
+    {
       "id": "app-shell.docks",
       "kind": "vitest",
       "risk": "medium",
@@ -371,6 +378,17 @@
       "risk": "medium",
       "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
       "components": ["web/src/components/settings/customWidgets.tsx"]
+    },
+    {
+      "id": "settings.i18n",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/useLocalizedSchema.test.ts",
+        "src/components/settings/__tests__/LanguageToggle.test.tsx",
+        "src/components/settings/__tests__/schema-catalog-drift.test.ts"
+      ],
+      "components": ["web/src/components/settings/LanguageToggle.tsx"]
     },
     {
       "id": "settings.acp-defaults",

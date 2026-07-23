@@ -1,4 +1,6 @@
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
 import { type TourAnchorId, tourAnchor } from "../../lib/tourSteps";
 import {
@@ -44,15 +46,14 @@ interface Props {
 
 /** Client-side list-entry validator derived from the server's validation rule,
  *  purely a UX nicety; the server is authoritative either way. */
-function listValidator(validation: SettingsValidation): ((value: string) => string | null) | undefined {
+function listValidator(validation: SettingsValidation, t: TFunction): ((value: string) => string | null) | undefined {
   switch (validation.rule) {
     case "volume_list":
-      return (v) => (v.includes(":") ? null : "Must contain ':' (host:container)");
+      return (v) => (v.includes(":") ? null : t("settings:validate.volume"));
     case "env_list":
-      return (v) =>
-        /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v) ? null : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
+      return (v) => (/^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v) ? null : t("settings:validate.env"));
     case "port_mapping_list":
-      return (v) => (/^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)");
+      return (v) => (/^\d+:\d+$/.test(v) ? null : t("settings:validate.port"));
     default:
       return undefined;
   }
@@ -60,20 +61,19 @@ function listValidator(validation: SettingsValidation): ((value: string) => stri
 
 /** Global-only fields are shown but not profile-overridable; surface that so a
  *  per-profile edit does not look profile-scoped when it is not. */
-function describe(d: SettingsFieldDescriptor): string {
+function describe(d: SettingsFieldDescriptor, t: TFunction): string {
   if (d.profile_overridable) return d.description;
-  const note = "Applies to all profiles (not profile-overridable).";
+  const note = t("settings:globalNote");
   return d.description ? `${d.description} ${note}` : note;
 }
 
 /** Visible placeholder for a `custom` widget whose `id` has no registered web
  *  component. Rendering this (rather than silently dropping the field) keeps a
  *  schema/web mismatch obvious instead of letting a setting vanish. */
-function UnsupportedCustomWidget({ d, id }: { d: SettingsFieldDescriptor; id: string }) {
+function UnsupportedCustomWidget({ d, id, t }: { d: SettingsFieldDescriptor; id: string; t: TFunction }) {
   return (
     <div className="text-xs text-status-error bg-status-error/10 rounded-lg p-3">
-      No web control registered for "{d.label}" (custom widget "{id}"). Edit it from the TUI or <code>config.toml</code>
-      .
+      {t("settings:unsupportedWidget", { label: d.label, id })}
     </div>
   );
 }
@@ -83,9 +83,10 @@ function renderField(
   d: SettingsFieldDescriptor,
   values: Record<string, unknown>,
   save: (value: unknown) => Promise<boolean>,
+  t: TFunction,
 ) {
   const raw = values[d.field];
-  const description = describe(d);
+  const description = describe(d, t);
   const widget = d.widget;
 
   switch (widget.kind) {
@@ -167,13 +168,13 @@ function renderField(
           description={description}
           items={Array.isArray(raw) ? (raw as string[]) : []}
           onChange={save}
-          validate={listValidator(d.validation)}
+          validate={listValidator(d.validation, t)}
         />
       );
     case "custom": {
       const Widget = CUSTOM_SETTINGS_WIDGETS[widget.id];
       if (!Widget) {
-        return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} />;
+        return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} t={t} />;
       }
       return <Widget key={d.field} descriptor={{ ...d, description }} value={raw} save={save} />;
     }
@@ -198,6 +199,7 @@ export function SchemaSection({
   focusRequest,
   fieldAnchor,
 }: Props) {
+  const { t } = useTranslation();
   const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
@@ -259,10 +261,10 @@ export function SchemaSection({
 
   return (
     <div className="space-y-4">
-      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d), t)))}
       {advanced.length > 0 && (
-        <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
-          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+        <CollapsibleSection title={t("settings:advanced")} subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
+          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d), t)))}
         </CollapsibleSection>
       )}
     </div>

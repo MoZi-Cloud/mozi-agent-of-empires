@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { fetchAbout } from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
 import { reportError, reportInfo } from "../lib/toastBus";
+import i18n from "../i18n";
 
 interface Props {
   onClose: () => void;
@@ -60,6 +62,7 @@ function buildFeedbackUrl(version: string | null): string {
 }
 
 export function AboutModal({ onClose, sessionId }: Props) {
+  const { t } = useTranslation();
   const closeRef = useRef<HTMLButtonElement>(null);
   const [version, setVersion] = useState<string | null>(null);
 
@@ -87,7 +90,10 @@ export function AboutModal({ onClose, sessionId }: Props) {
               Agent of Empires
             </h2>
             {version && (
-              <span className="font-mono text-[11px] text-text-muted shrink-0" aria-label={`Version ${version}`}>
+              <span
+                className="font-mono text-[11px] text-text-muted shrink-0"
+                aria-label={t("shell:about.version", { version })}
+              >
                 v{version}
               </span>
             )}
@@ -96,31 +102,29 @@ export function AboutModal({ onClose, sessionId }: Props) {
             ref={closeRef}
             onClick={onClose}
             className="text-text-muted hover:text-text-secondary cursor-pointer text-lg leading-none px-1"
-            aria-label="Close"
+            aria-label={t("shell:about.close")}
           >
             &times;
           </button>
         </div>
 
         <div className="p-5 space-y-4">
-          <p className="text-sm text-text-secondary">
-            Terminal session manager for parallel AI coding agents. Open source, cross-platform, sandboxed.
-          </p>
+          <p className="text-sm text-text-secondary">{t("shell:about.tagline")}</p>
 
           {sessionId && (
             <button
               type="button"
               onClick={async () => {
                 const ok = await writeClipboard(sessionId);
-                if (ok) reportInfo("Copied session id");
-                else reportError("Copy failed");
+                if (ok) reportInfo(i18n.t("shell:about.copiedSessionId"));
+                else reportError(i18n.t("shell:about.copyFailed"));
               }}
               className="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-surface-900 border border-surface-700/50 hover:border-surface-700 hover:bg-surface-850 transition-colors group cursor-pointer text-left"
-              title="Copy session id to clipboard"
-              aria-label="Copy session id"
+              title={t("shell:about.copySessionIdTitle")}
+              aria-label={t("shell:about.copySessionId")}
             >
               <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted shrink-0">
-                Session id
+                {t("shell:about.sessionId")}
               </span>
               <span className="text-sm text-text-secondary group-hover:text-text-primary font-mono truncate">
                 {sessionId}
@@ -137,7 +141,9 @@ export function AboutModal({ onClose, sessionId }: Props) {
                 rel="noopener noreferrer"
                 className="flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-surface-900 border border-surface-700/50 hover:border-surface-700 hover:bg-surface-850 transition-colors group"
               >
-                <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">{link.label}</span>
+                <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">
+                  {t(`shell:about.link.${link.label.toLowerCase()}`, link.label)}
+                </span>
                 <span className="text-sm text-brand-500 group-hover:text-brand-400 font-mono truncate">
                   {link.display}
                 </span>
@@ -151,12 +157,12 @@ export function AboutModal({ onClose, sessionId }: Props) {
             rel="noopener noreferrer"
             className="block text-center py-2 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary hover:border-surface-700 transition-colors"
           >
-            Send feedback
+            {t("shell:about.sendFeedback")}
           </a>
         </div>
 
         <div className="px-5 py-3 border-t border-surface-700">
-          <p className="font-mono text-[11px] text-text-dim">Built for developers running many agents at once.</p>
+          <p className="font-mono text-[11px] text-text-dim">{t("shell:about.footer")}</p>
         </div>
       </div>
     </div>

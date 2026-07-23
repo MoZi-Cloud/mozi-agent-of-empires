@@ -16,6 +16,7 @@ interface WizardData {
   advancedEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  hostProxy: string;
   customInstruction: string;
   extraArgs: string;
   commandOverride: string;
@@ -198,6 +199,21 @@ export function AgentOptions({
 
   const advancedBlock = (
     <div className="space-y-4">
+      {!data.sandboxEnabled && !willUseStructuredView && (
+        <div>
+          <label className="block text-sm text-text-dim mb-1.5">Proxy server</label>
+          <input
+            type="url"
+            value={data.hostProxy}
+            onChange={(e) => onChange("hostProxy", e.target.value)}
+            placeholder="http://127.0.0.1:10808"
+            className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+          />
+          <p className="mt-1 text-xs text-text-dim">
+            Set HTTP(S) and SOCKS proxy variables for this terminal session only. Restart the agent after changing it.
+          </p>
+        </div>
+      )}
       {/* Container config (if sandbox enabled) */}
       {data.sandboxEnabled && (
         <>

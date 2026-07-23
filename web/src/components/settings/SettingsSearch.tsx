@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Command } from "cmdk";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { buildSettingsSearchIndex, type SettingsSearchHit } from "./settingsSearchIndex";
@@ -15,6 +16,7 @@ interface Props {
 // provides the fuzzy filtering and arrow/Enter keyboard navigation; the index
 // is built once from the cached schema.
 export function SettingsSearch({ schema, loading, onJump }: Props) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const index = useMemo(() => buildSettingsSearchIndex(schema), [schema]);
   const open = query.trim().length > 0;
@@ -26,7 +28,7 @@ export function SettingsSearch({ schema, loading, onJump }: Props) {
 
   return (
     <Command
-      label="Search settings"
+      label={t("settings:search.label")}
       data-testid="settings-search"
       className="relative"
       // Let the click on a result fire before the list unmounts on blur.
@@ -35,13 +37,15 @@ export function SettingsSearch({ schema, loading, onJump }: Props) {
       <Command.Input
         value={query}
         onValueChange={setQuery}
-        placeholder={loading ? "Loading settings..." : "Search settings..."}
+        placeholder={loading ? t("settings:search.placeholderLoading") : t("settings:search.placeholder")}
         disabled={loading}
         className="w-full rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm text-text-primary outline-none placeholder:text-text-muted focus:border-brand-500 disabled:opacity-50"
       />
       {open && (
         <Command.List className="absolute left-0 right-0 top-full mt-1 z-20 max-h-[40vh] overflow-y-auto rounded-md border border-surface-700 bg-surface-800 p-1 shadow-2xl">
-          <Command.Empty className="px-3 py-4 text-center text-sm text-text-muted">No matching settings</Command.Empty>
+          <Command.Empty className="px-3 py-4 text-center text-sm text-text-muted">
+            {t("settings:search.noMatch")}
+          </Command.Empty>
           {index.map((hit) => (
             <Command.Item
               key={`${hit.section}.${hit.field}`}

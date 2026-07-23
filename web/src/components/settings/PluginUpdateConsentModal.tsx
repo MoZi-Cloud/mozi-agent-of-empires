@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 import type { PluginUpdateChangelog, PluginUpdateConsent } from "../../lib/api";
 
@@ -45,6 +46,7 @@ export function PluginUpdateConsentModal({
   onDecline,
   onClose,
 }: PluginUpdateConsentModalProps) {
+  const { t } = useTranslation();
   // While an apply/dismiss is in flight, the modal must not close: dropping it
   // would re-expose the Update button and let the same flow start concurrently.
   const closeIfIdle = () => {
@@ -66,7 +68,9 @@ export function PluginUpdateConsentModal({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"
-      aria-label={`${needsConsent ? "Approve update for" : "Update"} ${name}`}
+      aria-label={
+        needsConsent ? t("settings:plugins.approveUpdateAria", { name }) : t("settings:plugins.updateAria", { name })
+      }
       onClick={closeIfIdle}
       data-testid="plugin-update-consent-modal"
     >
@@ -76,7 +80,7 @@ export function PluginUpdateConsentModal({
       >
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <h2 className="font-semibold">Update {name}?</h2>
+            <h2 className="font-semibold">{t("settings:plugins.updateTitle", { name })}</h2>
             <p className="text-xs text-text-dim">
               v{fromVersion} → v{toVersion}
             </p>
@@ -88,22 +92,18 @@ export function PluginUpdateConsentModal({
             onClick={closeIfIdle}
             data-testid="plugin-update-consent-close"
           >
-            Close
+            {t("settings:plugins.close")}
           </button>
         </div>
 
         <PluginChangelogSection changelog={changelog} />
 
-        {needsConsent && (
-          <p className="mb-3 text-xs text-text-dim">
-            This update expands what the plugin can do. Review the new access before approving.
-          </p>
-        )}
+        {needsConsent && <p className="mb-3 text-xs text-text-dim">{t("settings:plugins.updateExpands")}</p>}
 
         {consent && consent.added_capabilities.length > 0 && (
           <div className="mb-3" data-testid="plugin-update-added-caps">
             <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">
-              New capabilities
+              {t("settings:plugins.newCapabilities")}
             </p>
             <p className="text-xs text-status-warning">{consent.added_capabilities.join(", ")}</p>
           </div>
@@ -111,27 +111,29 @@ export function PluginUpdateConsentModal({
 
         {consent && consent.removed_capabilities.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">Removed capabilities</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.removedCapabilities")}
+            </p>
             <p className="text-xs text-text-dim">{consent.removed_capabilities.join(", ")}</p>
           </div>
         )}
 
         {consent?.runtime_change && (
           <p className="mb-3 text-xs text-status-warning" data-testid="plugin-update-runtime-change">
-            Runtime change: {consent.runtime_change}
+            {t("settings:plugins.runtimeChange", { change: consent.runtime_change })}
           </p>
         )}
 
         {consent?.trust_downgrade && (
           <p className="mb-3 text-xs text-status-warning" data-testid="plugin-update-trust-downgrade">
-            This version is no longer a verified featured plugin (community trust).
+            {t("settings:plugins.trustDowngrade")}
           </p>
         )}
 
         {consent && consent.build_steps.length > 0 && (
           <div className="mb-3" data-testid="plugin-update-build-steps">
             <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-status-warning">
-              Build commands (run as you, unsandboxed)
+              {t("settings:plugins.buildCommandsLabel")}
             </p>
             <ul className="space-y-0.5">
               {consent.build_steps.map((step, i) => (
@@ -145,18 +147,14 @@ export function PluginUpdateConsentModal({
 
         {consent && consent.ui.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">Dashboard UI slots</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.uiSlotsLabel")}
+            </p>
             <p className="text-xs text-text-dim">{[...new Set(consent.ui.map((u) => u.slot))].join(", ")}</p>
           </div>
         )}
 
-        {needsConsent && (
-          <p className="mb-3 text-[11px] text-text-dim">
-            Approving trusts this plugin. The host enforces capabilities at its API boundary, but a plugin worker (and
-            any build step) runs without OS-level sandboxing, so a malicious plugin is not contained. Only approve
-            updates from sources you trust.
-          </p>
-        )}
+        {needsConsent && <p className="mb-3 text-[11px] text-text-dim">{t("settings:plugins.approveTrust")}</p>}
 
         {error && (
           <p className="mb-3 text-xs text-status-error" data-testid="plugin-update-consent-error">
@@ -172,7 +170,7 @@ export function PluginUpdateConsentModal({
             onClick={needsConsent ? onDecline : closeIfIdle}
             data-testid="plugin-update-decline"
           >
-            {needsConsent ? "Decline" : "Cancel"}
+            {needsConsent ? t("settings:plugins.decline") : t("settings:plugins.cancel")}
           </button>
           <button
             type="button"
@@ -181,7 +179,11 @@ export function PluginUpdateConsentModal({
             onClick={onApprove}
             data-testid="plugin-update-approve"
           >
-            {busy ? "Updating…" : needsConsent ? "Approve and update" : "Update"}
+            {busy
+              ? t("settings:plugins.updating")
+              : needsConsent
+                ? t("settings:plugins.approveUpdate")
+                : t("settings:plugins.update")}
           </button>
         </div>
       </div>

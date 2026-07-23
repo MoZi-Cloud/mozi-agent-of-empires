@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { login } from "../lib/api";
 
 interface Props {
@@ -6,6 +7,7 @@ interface Props {
 }
 
 export function LoginPage({ onSuccess }: Props) {
+  const { t } = useTranslation();
   const [passphrase, setPassphrase] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -28,7 +30,7 @@ export function LoginPage({ onSuccess }: Props) {
     if (result.ok) {
       onSuccess();
     } else {
-      setError(result.error ?? "Login failed");
+      setError(result.error ?? t("shell:login.failed"));
       setLoading(false);
       inputRef.current?.focus();
     }
@@ -47,7 +49,7 @@ export function LoginPage({ onSuccess }: Props) {
           {/* Passphrase input */}
           <div className="mb-4">
             <label htmlFor="passphrase" className="block text-xs text-text-muted mb-2 font-medium">
-              Passphrase
+              {t("shell:login.passphrase")}
             </label>
             <div className="relative">
               <input
@@ -59,14 +61,14 @@ export function LoginPage({ onSuccess }: Props) {
                 disabled={loading}
                 autoComplete="current-password"
                 className="w-full px-3 py-2.5 pr-10 bg-surface-900 border border-surface-700/60 rounded-lg text-text-primary text-sm placeholder:text-text-dim focus:outline-none focus:ring-2 focus:ring-brand-600 focus:border-transparent disabled:opacity-50 transition-colors"
-                placeholder="Enter passphrase"
+                placeholder={t("shell:login.placeholder")}
               />
               <button
                 type="button"
                 onClick={() => setShowPassphrase((s) => !s)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center text-text-dim hover:text-text-secondary transition-colors cursor-pointer rounded"
                 tabIndex={-1}
-                aria-label={showPassphrase ? "Hide passphrase" : "Show passphrase"}
+                aria-label={showPassphrase ? t("shell:login.hide") : t("shell:login.show")}
               >
                 {showPassphrase ? (
                   <svg
@@ -122,10 +124,10 @@ export function LoginPage({ onSuccess }: Props) {
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                   />
                 </svg>
-                Signing in...
+                {t("shell:login.signingIn")}
               </>
             ) : (
-              "Sign in"
+              t("shell:login.signIn")
             )}
           </button>
         </form>

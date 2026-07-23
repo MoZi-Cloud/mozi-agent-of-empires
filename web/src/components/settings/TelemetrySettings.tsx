@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { fetchTelemetryStatus, setTelemetryConsent, type TelemetryStatus } from "../../lib/api";
 import { ToggleField } from "./FormFields";
@@ -8,6 +9,7 @@ import { ToggleField } from "./FormFields";
 /// id (the browser never posts to the telemetry backend), so the toggle calls
 /// the dedicated consent endpoint, which also generates / deletes the id.
 export function TelemetrySettings() {
+  const { t } = useTranslation();
   const [status, setStatus] = useState<TelemetryStatus | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -44,19 +46,14 @@ export function TelemetrySettings() {
   return (
     <div className="space-y-4">
       <ToggleField
-        label="Enable usage telemetry"
-        description="Anonymous, opt-in usage telemetry: counts of sessions, agents/models, your aoe version, and OS. Off by default. Never sends prompts, paths, names, branches, or commands. Honors DO_NOT_TRACK."
+        label={t("settings:telemetry.enableLabel")}
+        description={t("settings:telemetry.enableDesc")}
         checked={enabled && !dnt}
         onChange={(v) => {
           if (!dnt && !saving) void onToggle(v);
         }}
       />
-      {dnt && (
-        <p className="text-xs text-text-dim">
-          DO_NOT_TRACK is set in the server environment, so telemetry stays off and no install id is generated
-          regardless of this toggle.
-        </p>
-      )}
+      {dnt && <p className="text-xs text-text-dim">{t("settings:telemetry.dntNote")}</p>}
     </div>
   );
 }

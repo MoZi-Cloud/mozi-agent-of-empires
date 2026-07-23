@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
+import i18n from "../../i18n";
 import {
   applyPluginUpdate,
   dismissPluginUpdate,
@@ -51,6 +53,7 @@ interface DetailTarget {
 /// elevated setting; other failures surface their message inline. `load_errors`
 /// are shown as a warning line.
 export function PluginsSettings() {
+  const { t } = useTranslation();
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -116,7 +119,7 @@ export function PluginsSettings() {
       setData(next);
       setError(null);
     } else {
-      setError("Failed to load plugins.");
+      setError(i18n.t("settings:plugins.loadFailed"));
     }
   }, []);
 
@@ -141,7 +144,7 @@ export function PluginsSettings() {
         // but the running daemon keeps serving until it restarts. Say so,
         // otherwise the toggle looks like a no-op (#2311 testing feedback).
         if (plugin.id === "aoe.web" && !enabled) {
-          reportInfo("Web dashboard stays up until aoe serve is restarted.");
+          reportInfo(i18n.t("settings:plugins.webStaysUp"));
         }
       } else {
         // The toggle did not take effect; the checkbox is controlled by the
@@ -188,7 +191,7 @@ export function PluginsSettings() {
       const preview = res.preview;
       setConsentError(null);
       if (preview.kind === "no_update") {
-        reportInfo(`${plugin.name} is already up to date.`);
+        reportInfo(i18n.t("settings:plugins.upToDate", { name: plugin.name }));
         clearUpdateBadge(plugin.id);
       } else if (preview.kind === "safe_update") {
         // A safe version bump no longer auto-applies: show the changelog first
@@ -226,7 +229,7 @@ export function PluginsSettings() {
         clearUpdateBadge(reviewModal.plugin.id);
         const name = reviewModal.plugin.name;
         setReviewModal(null);
-        setJob({ id: res.jobId, title: `Updating ${name}` });
+        setJob({ id: res.jobId, title: i18n.t("settings:plugins.updatingJob", { name }) });
       } else {
         // Any failure keeps the modal open with the message; the user can close
         // and re-Update to re-preview.
@@ -289,7 +292,7 @@ export function PluginsSettings() {
     try {
       const res = await startPluginInstall(installConsent.source, installConsent.fingerprint);
       if (res.kind === "ok") {
-        const title = `Installing ${installConsent.id}`;
+        const title = i18n.t("settings:plugins.installingJob", { name: installConsent.id });
         setInstallConsent(null);
         setJob({ id: res.jobId, title });
       } else {
@@ -306,7 +309,7 @@ export function PluginsSettings() {
     setConfirmUninstall(null);
     const res = await startPluginUninstall(plugin.id);
     if (res.kind === "ok") {
-      setJob({ id: res.jobId, title: `Uninstalling ${plugin.name}` });
+      setJob({ id: res.jobId, title: i18n.t("settings:plugins.uninstallingJob", { name: plugin.name }) });
     } else {
       setError(res.message);
     }
@@ -333,25 +336,25 @@ export function PluginsSettings() {
   };
 
   if (!data && !error) {
-    return <p className="text-sm text-text-dim">Loading plugins…</p>;
+    return <p className="text-sm text-text-dim">{t("settings:plugins.loading")}</p>;
   }
 
   return (
     <div className="space-y-4">
       <div role="tablist" className="flex gap-1 border-b border-surface-700">
-        {(["installed", "marketplace"] as const).map((t) => (
+        {(["installed", "marketplace"] as const).map((tabId) => (
           <button
-            key={t}
+            key={tabId}
             type="button"
             role="tab"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-            data-testid={`plugins-tab-${t}`}
+            aria-selected={tab === tabId}
+            onClick={() => setTab(tabId)}
+            data-testid={`plugins-tab-${tabId}`}
             className={`px-3 py-1.5 text-xs capitalize ${
-              tab === t ? "border-b-2 border-accent-500 font-medium text-accent-500" : "text-text-dim"
+              tab === tabId ? "border-b-2 border-accent-500 font-medium text-accent-500" : "text-text-dim"
             }`}
           >
-            {t}
+            {tabId === "installed" ? t("settings:plugins.tabInstalled") : t("settings:plugins.tabMarketplace")}
           </button>
         ))}
       </div>
@@ -366,7 +369,7 @@ export function PluginsSettings() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") void onDiscover();
               }}
-              placeholder="Search GitHub (aoe-plugin topic)…"
+              placeholder={t("settings:plugins.searchPlaceholder")}
               className="min-w-0 flex-1 rounded border border-surface-700 bg-surface-850 px-2 py-1 text-xs"
               data-testid="plugins-discover-query"
             />
@@ -377,7 +380,7 @@ export function PluginsSettings() {
               onClick={() => void onDiscover()}
               data-testid="plugins-discover"
             >
-              {discovering ? "Searching…" : "Search GitHub"}
+              {discovering ? t("settings:plugins.searching") : t("settings:plugins.searchGithub")}
             </button>
           </div>
 
@@ -390,7 +393,7 @@ export function PluginsSettings() {
           {discoverResults && (
             <div className="space-y-2" data-testid="plugins-discover-results">
               {discoverResults.length === 0 ? (
-                <p className="text-xs text-text-dim">No plugins found on the aoe-plugin topic.</p>
+                <p className="text-xs text-text-dim">{t("settings:plugins.noDiscoverResults")}</p>
               ) : (
                 discoverResults.map((r) => (
                   <div
@@ -424,14 +427,14 @@ export function PluginsSettings() {
                       </span>
                       <span className="text-text-dim">★ {r.stars}</span>
                       <a href={r.html_url} target="_blank" rel="noreferrer" className="text-text-dim hover:underline">
-                        GitHub ↗
+                        {t("settings:plugins.githubLink")}
                       </a>
                     </div>
                     {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
                     <div className="mt-2 flex flex-wrap items-center gap-2">
                       {r.badge === "installed" ||
                       data?.plugins.some((p) => p.source === sourceFromCommand(r.install_command)) ? (
-                        <span className="text-text-dim">Installed.</span>
+                        <span className="text-text-dim">{t("settings:plugins.installedBadge")}</span>
                       ) : (
                         <button
                           type="button"
@@ -440,11 +443,13 @@ export function PluginsSettings() {
                           onClick={() => void onInstall(sourceFromCommand(r.install_command))}
                           data-testid={`plugins-install-${r.slug}`}
                         >
-                          {previewingSource === sourceFromCommand(r.install_command) ? "Checking…" : "Install"}
+                          {previewingSource === sourceFromCommand(r.install_command)
+                            ? t("settings:plugins.checking")
+                            : t("settings:plugins.install")}
                         </button>
                       )}
                       <span className="text-text-dim">
-                        or in a terminal: <code>{r.install_command}</code>
+                        {t("settings:plugins.orInTerminal")} <code>{r.install_command}</code>
                       </span>
                     </div>
                   </div>
@@ -461,7 +466,7 @@ export function PluginsSettings() {
 
           {data && data.load_errors.length > 0 && (
             <div className="rounded border border-status-warning bg-status-warning/10 p-3 text-xs text-status-warning">
-              <p className="mb-1 font-semibold">Plugin load problems</p>
+              <p className="mb-1 font-semibold">{t("settings:plugins.loadProblems")}</p>
               {data.load_errors.map((e) => (
                 <p key={e}>{e}</p>
               ))}
@@ -475,12 +480,12 @@ export function PluginsSettings() {
             onClick={() => void onCheckUpdates()}
             data-testid="plugins-check-updates"
           >
-            {checkingUpdates ? "Checking…" : "Check for updates"}
+            {checkingUpdates ? t("settings:plugins.checking") : t("settings:plugins.checkUpdates")}
           </button>
 
           {data && data.plugins.length === 0 && (
             <p className="text-xs text-text-dim" data-testid="plugins-empty">
-              No plugins detected.
+              {t("settings:plugins.noPlugins")}
             </p>
           )}
           {data?.plugins.map((plugin) => {
@@ -532,7 +537,7 @@ export function PluginsSettings() {
                           className="rounded bg-status-warning/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-status-warning"
                           data-testid={`plugin-needs-approval-${plugin.id}`}
                         >
-                          needs approval
+                          {t("settings:plugins.needsApproval")}
                         </span>
                       )}
                       {update?.needs_update && (
@@ -540,31 +545,37 @@ export function PluginsSettings() {
                           className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
                           data-testid={`plugin-update-available-${plugin.id}`}
                         >
-                          update available
+                          {t("settings:plugins.updateAvailable")}
                         </span>
                       )}
                     </div>
                     <p className="mt-1 text-xs text-text-dim">{plugin.description}</p>
                     {plugin.capabilities.length > 0 && (
                       <p className="mt-1 text-[11px] text-text-dim">
-                        Capabilities: {plugin.capabilities.join(", ")}
-                        {plugin.granted ? "" : " (not granted)"}
+                        {t("settings:plugins.capabilities")} {plugin.capabilities.join(", ")}
+                        {plugin.granted ? "" : ` ${t("settings:plugins.notGranted")}`}
                       </p>
                     )}
                     {(plugin.ui_contributions ?? []).length > 0 && (
                       <p className="mt-1 text-[11px] text-text-dim">
-                        UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
+                        {t("settings:plugins.ui")}{" "}
+                        {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
                       </p>
                     )}
                     {plugin.needs_reapproval && (
                       <p className="mt-1 text-[11px] text-status-warning">
-                        Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.
+                        {t("settings:plugins.inactivePrefix")}
+                        <code>{`aoe plugin update ${plugin.id}`}</code>
+                        {t("settings:plugins.inactiveSuffix")}
                       </p>
                     )}
                     {update?.needs_update && (
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <span className="text-[11px] text-text-dim">
-                          Update available ({update.current} → {update.available ?? "modified"}).
+                          {t("settings:plugins.updateLine", {
+                            current: update.current,
+                            available: update.available ?? "modified",
+                          })}
                         </span>
                         <button
                           type="button"
@@ -573,12 +584,14 @@ export function PluginsSettings() {
                           onClick={() => void onUpdate(plugin)}
                           data-testid={`plugin-update-${plugin.id}`}
                         >
-                          {updatingId === plugin.id ? "Checking…" : "Update"}
+                          {updatingId === plugin.id ? t("settings:plugins.checking") : t("settings:plugins.update")}
                         </button>
                       </div>
                     )}
                     {update?.error && (
-                      <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
+                      <p className="mt-1 text-[11px] text-status-error">
+                        {t("settings:plugins.updateCheckFailed", { error: update.error })}
+                      </p>
                     )}
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-2">
@@ -586,12 +599,12 @@ export function PluginsSettings() {
                       <input
                         type="checkbox"
                         role="switch"
-                        aria-label={`Enable ${plugin.name}`}
+                        aria-label={t("settings:plugins.enableAria", { name: plugin.name })}
                         checked={plugin.enabled}
                         disabled={busy}
                         onChange={(e) => void onToggle(plugin, e.target.checked)}
                       />
-                      Enabled
+                      {t("settings:plugins.enabled")}
                     </label>
                     {!plugin.builtin && plugin.source && (
                       <button
@@ -600,7 +613,7 @@ export function PluginsSettings() {
                         onClick={() => setConfirmUninstall(plugin)}
                         data-testid={`plugin-uninstall-${plugin.id}`}
                       >
-                        Uninstall
+                        {t("settings:plugins.uninstall")}
                       </button>
                     )}
                   </div>
@@ -654,7 +667,7 @@ export function PluginsSettings() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
           role="dialog"
           aria-modal="true"
-          aria-label={`Uninstall ${confirmUninstall.name}`}
+          aria-label={t("settings:plugins.uninstallAria", { name: confirmUninstall.name })}
           onClick={() => setConfirmUninstall(null)}
           data-testid="plugin-uninstall-confirm"
         >
@@ -662,11 +675,10 @@ export function PluginsSettings() {
             className="w-full max-w-sm rounded border border-surface-700 bg-surface-900 p-4 text-sm"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 className="mb-2 font-semibold">Uninstall {confirmUninstall.name}?</h2>
-            <p className="mb-4 text-xs text-text-dim">
-              This removes the plugin's files, config entry, and lockfile entry from the host. You can reinstall it
-              later from the marketplace.
-            </p>
+            <h2 className="mb-2 font-semibold">
+              {t("settings:plugins.uninstallTitle", { name: confirmUninstall.name })}
+            </h2>
+            <p className="mb-4 text-xs text-text-dim">{t("settings:plugins.uninstallBody")}</p>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
@@ -674,7 +686,7 @@ export function PluginsSettings() {
                 onClick={() => setConfirmUninstall(null)}
                 data-testid="plugin-uninstall-cancel"
               >
-                Cancel
+                {t("settings:plugins.cancel")}
               </button>
               <button
                 type="button"
@@ -682,7 +694,7 @@ export function PluginsSettings() {
                 onClick={() => void onConfirmUninstall()}
                 data-testid="plugin-uninstall-confirm-button"
               >
-                Uninstall
+                {t("settings:plugins.uninstall")}
               </button>
             </div>
           </div>

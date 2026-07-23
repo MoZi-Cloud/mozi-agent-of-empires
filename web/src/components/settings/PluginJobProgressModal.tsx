@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { fetchPluginJob, type PluginJob } from "../../lib/api";
 
@@ -18,6 +19,7 @@ interface PluginJobProgressModalProps {
 /// dashboard-only user can watch fetch / build / remove work and see the final
 /// success or failure without a terminal.
 export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgressModalProps) {
+  const { t } = useTranslation();
   const [job, setJob] = useState<PluginJob | null>(null);
   const [error, setError] = useState<string | null>(null);
   // The job is gone (404), e.g. the daemon restarted mid-run. Terminal: stop
@@ -77,9 +79,9 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
           <div>
             <h2 className="font-semibold">{title}</h2>
             <p className="text-xs text-text-dim" data-testid="plugin-job-status">
-              {gone ? "Job no longer available." : state === "running" && "Running…"}
-              {!gone && state === "succeeded" && "Done."}
-              {!gone && state === "failed" && "Failed."}
+              {gone ? t("settings:plugins.jobGone") : state === "running" && t("settings:plugins.running")}
+              {!gone && state === "succeeded" && t("settings:plugins.done")}
+              {!gone && state === "failed" && t("settings:plugins.failed")}
             </p>
           </div>
           <button
@@ -89,7 +91,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
             onClick={onClose}
             data-testid="plugin-job-close"
           >
-            {done ? "Close" : "Running…"}
+            {done ? t("settings:plugins.close") : t("settings:plugins.running")}
           </button>
         </div>
 
@@ -98,14 +100,16 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
             {failedError}
           </p>
         )}
-        {error && !done && <p className="mb-2 text-xs text-text-dim">Reconnecting… ({error})</p>}
+        {error && !done && (
+          <p className="mb-2 text-xs text-text-dim">{t("settings:plugins.reconnecting", { error })}</p>
+        )}
 
         <pre
           ref={logRef}
           className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-dim"
           data-testid="plugin-job-log"
         >
-          {job?.log.tail || (state === "running" ? "Starting…" : "")}
+          {job?.log.tail || (state === "running" ? t("settings:plugins.starting") : "")}
         </pre>
 
         {done && (
@@ -116,7 +120,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
               onClick={onClose}
               data-testid="plugin-job-done"
             >
-              Close
+              {t("settings:plugins.close")}
             </button>
           </div>
         )}

@@ -37,6 +37,8 @@ pub struct InstanceParams {
     /// Additional environment entries for the container.
     /// `KEY` = pass through from host, `KEY=VALUE` = set explicitly.
     pub extra_env: Vec<String>,
+    /// Proxy URL injected into this host (terminal) session only.
+    pub host_proxy: Option<String>,
     /// Extra arguments to append after the agent binary
     pub extra_args: String,
     /// Command override for the agent binary (replaces the default binary)
@@ -669,6 +671,7 @@ pub fn build_instance(
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
     instance.yolo_mode = params.yolo_mode;
+    instance.host_proxy = params.host_proxy.filter(|proxy| !proxy.trim().is_empty());
 
     // Apply command overrides and custom agent commands from resolved config.
     // Priority: per-session params > agent_command_override > custom_agents > AgentDef default.
@@ -1678,6 +1681,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            host_proxy: None,
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
@@ -1861,6 +1865,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: vec![],
             scratch: false,
+            host_proxy: None,
             fork_seed: Some(ForkSeed::Terminal {
                 parent_agent_session_id: "parent-uuid".into(),
                 child_session_id: "child-uuid".into(),
@@ -1903,6 +1908,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: vec![],
             scratch: false,
+            host_proxy: None,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),

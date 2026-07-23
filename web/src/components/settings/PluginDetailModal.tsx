@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { fetchPluginDetails, type PluginDetail } from "../../lib/api";
 import { PluginIdentityIcon } from "./PluginIdentityIcon";
@@ -33,6 +34,7 @@ interface PluginDetailModalProps {
 /// fallback fields. Screenshots come only from the fetched gh manifest (the
 /// server resolves their paths to raw.githubusercontent.com URLs).
 export function PluginDetailModal({ source, title, fallback, installCommand, onClose }: PluginDetailModalProps) {
+  const { t } = useTranslation();
   const isGithub = source.startsWith("gh:");
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -85,7 +87,7 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"
-      aria-label={`${title} details`}
+      aria-label={t("settings:plugins.detailsAria", { title })}
       onClick={onClose}
       data-testid="plugin-detail-modal"
     >
@@ -113,11 +115,11 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
             onClick={onClose}
             data-testid="plugin-detail-close"
           >
-            Close
+            {t("settings:plugins.close")}
           </button>
         </div>
 
-        {loading && <p className="text-xs text-text-dim">Loading details…</p>}
+        {loading && <p className="text-xs text-text-dim">{t("settings:plugins.loadingDetails")}</p>}
         {error && (
           <p className="text-xs text-status-error" data-testid="plugin-detail-error">
             {error}
@@ -132,7 +134,9 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
                   type="button"
                   className="block w-full cursor-zoom-in"
                   onClick={() => setZoomed({ src: shot.src, alt: shot.alt })}
-                  aria-label={`View ${shot.alt || "screenshot"} full size`}
+                  aria-label={t("settings:plugins.viewScreenshotAria", {
+                    alt: shot.alt || t("settings:plugins.screenshot"),
+                  })}
                 >
                   <img
                     src={shot.src}
@@ -159,29 +163,39 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
 
         {capabilities.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">Capabilities</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.capabilitiesLabel")}
+            </p>
             <p className="text-xs text-text-dim">{capabilities.join(", ")}</p>
           </div>
         )}
 
         {ui.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">UI slots</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.uiSlotsShort")}
+            </p>
             <p className="text-xs text-text-dim">{[...new Set(ui.map((u) => u.slot))].join(", ")}</p>
           </div>
         )}
 
         {manifest?.api_version != null && (
-          <p className="mb-3 text-[11px] text-text-dim">Manifest api_version: {manifest.api_version}</p>
+          <p className="mb-3 text-[11px] text-text-dim">
+            {t("settings:plugins.manifestApiVersion", { v: manifest.api_version })}
+          </p>
         )}
 
         {detail?.manifest_error && (
-          <p className="mb-3 text-[11px] text-status-warning">Manifest: {detail.manifest_error}</p>
+          <p className="mb-3 text-[11px] text-status-warning">
+            {t("settings:plugins.manifestError", { err: detail.manifest_error })}
+          </p>
         )}
 
         {isGithub && (
           <div className="mb-3" data-testid="plugin-detail-versions">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">Available versions</p>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-text-dim">
+              {t("settings:plugins.availableVersions")}
+            </p>
             {detail && detail.release_tags.length > 0 ? (
               <ul className="flex flex-wrap gap-1">
                 {detail.release_tags.map((tag) => (
@@ -193,14 +207,14 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
             ) : (
               // Only claim "no releases" after a successful fetch; a transport
               // error already shows above and must not read as zero releases.
-              !loading && !error && <p className="text-xs text-text-dim">No published releases.</p>
+              !loading && !error && <p className="text-xs text-text-dim">{t("settings:plugins.noReleases")}</p>
             )}
           </div>
         )}
 
         {installCommand && (
           <p className="text-[11px] text-text-dim">
-            Install in a terminal: <code>{installCommand}</code>
+            {t("settings:plugins.installInTerminal")} <code>{installCommand}</code>
           </p>
         )}
       </div>
@@ -210,7 +224,9 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4"
           role="dialog"
           aria-modal="true"
-          aria-label={`${zoomed.alt || "Screenshot"} full size`}
+          aria-label={t("settings:plugins.viewScreenshotAria", {
+            alt: zoomed.alt || t("settings:plugins.screenshotAria"),
+          })}
           onClick={(e) => {
             // Don't bubble to the modal backdrop (which would close the whole
             // modal); the lightbox owns this click. Dismiss only on a backdrop

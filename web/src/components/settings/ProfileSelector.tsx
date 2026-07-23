@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { createProfile, deleteProfile, fetchProfiles, renameProfile } from "../../lib/api";
 import type { ProfileInfo } from "../../lib/types";
 
@@ -8,6 +9,7 @@ interface Props {
 }
 
 export function ProfileSelector({ selectedProfile, onSelect }: Props) {
+  const { t } = useTranslation();
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [creating, setCreating] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -20,8 +22,8 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
   }, []);
 
   const validateName = (name: string): string | null => {
-    if (!name) return "Name is required";
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) return "Only letters, digits, hyphens, and underscores";
+    if (!name) return t("settings:profile.nameRequired");
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) return t("settings:profile.nameInvalid");
     return null;
   };
 
@@ -61,7 +63,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     if (ok) {
       closeInput();
       load();
-    } else setError("Failed to create profile");
+    } else setError(t("settings:profile.createFailed"));
   };
 
   const handleRename = async () => {
@@ -80,7 +82,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
       onSelect(trimmed);
       closeInput();
       load();
-    } else setError("Failed to rename profile");
+    } else setError(t("settings:profile.renameFailed"));
   };
 
   const handleDelete = async (name: string) => {
@@ -116,7 +118,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
   return (
     <div className="relative" ref={panelRef}>
       <div className="flex items-center gap-2 flex-nowrap">
-        <label className="text-sm font-medium text-text-secondary shrink-0">Profile</label>
+        <label className="text-sm font-medium text-text-secondary shrink-0">{t("settings:profile.label")}</label>
         <select
           value={selectedProfile}
           onChange={(e) => onSelect(e.target.value)}
@@ -131,26 +133,26 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
         <button
           onClick={startCreate}
           className="text-sm text-brand-500 hover:text-brand-400 cursor-pointer shrink-0 font-medium px-1.5"
-          title="Create new profile"
+          title={t("settings:profile.titleCreate")}
         >
-          + New
+          {t("settings:profile.new")}
         </button>
         {!creating && !renaming && (
           <>
             <button
               onClick={startRename}
               className="text-xs text-text-dim hover:text-text-primary cursor-pointer"
-              title="Rename profile"
+              title={t("settings:profile.titleRename")}
             >
-              Rename
+              {t("settings:profile.rename")}
             </button>
             {(!activeProfile || activeProfile.name !== selectedProfile) && (
               <button
                 onClick={() => handleDelete(selectedProfile)}
                 className="text-xs text-text-dim hover:text-red-400 cursor-pointer"
-                title="Delete profile"
+                title={t("settings:profile.titleDelete")}
               >
-                Delete
+                {t("settings:profile.delete")}
               </button>
             )}
           </>
@@ -171,7 +173,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
                 if (e.key === "Enter") submitInput();
                 if (e.key === "Escape") closeInput();
               }}
-              placeholder={creating ? "Profile name" : "New name"}
+              placeholder={creating ? t("settings:profile.placeholderNew") : t("settings:profile.placeholderRename")}
               autoFocus
               className={`flex-1 bg-surface-900 border rounded-md px-2 py-1.5 text-sm text-text-primary focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
             />
@@ -179,7 +181,7 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
               onClick={submitInput}
               className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-xs font-medium text-surface-950 cursor-pointer"
             >
-              {creating ? "Create" : "Rename"}
+              {creating ? t("settings:profile.create") : t("settings:profile.rename")}
             </button>
           </div>
           {error && <div className="text-xs text-red-400 mt-1">{error}</div>}

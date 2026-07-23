@@ -252,6 +252,7 @@ impl HomeView {
             sandbox_image: data.sandbox_image,
             yolo_mode: data.yolo_mode,
             extra_env: data.extra_env,
+            host_proxy: None,
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,

@@ -17,6 +17,9 @@ pub struct CloneRepoBody {
     pub shallow: bool,
     #[serde(default)]
     pub bare: bool,
+    /// Optional proxy used by this clone subprocess only.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 /// Returns true if `url` looks like a git clone URL accepted by this
@@ -118,6 +121,10 @@ pub async fn clone_repo(
             .into_response();
     }
 
+    let proxy = body.proxy.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
     // Resolve destination path
     let destination = if let Some(ref dest) = body.destination {
         let dest = dest.trim();
@@ -184,9 +191,9 @@ pub async fn clone_repo(
     let bare = body.bare;
     let result = tokio::task::spawn_blocking(move || {
         if bare {
-            crate::git::clone_bare_repo(&url, &destination)
+            crate::git::clone_bare_repo_with_proxy(&url, &destination, proxy.as_deref())
         } else {
-            crate::git::clone_repo(&url, &destination, shallow)?;
+            crate::git::clone_repo_with_proxy(&url, &destination, shallow, proxy.as_deref())?;
             Ok(destination.display().to_string())
         }
     })

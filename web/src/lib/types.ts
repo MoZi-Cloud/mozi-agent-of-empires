@@ -33,6 +33,8 @@ export interface SessionResponse {
    *  diff header. See #970. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
+  /** Per-session host proxy for a terminal session, when explicitly set. */
+  host_proxy?: string;
   /** True when the session was created in scratch mode (`aoe add
    *  --scratch` or the wizard toggle). The `project_path` points
    *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
@@ -485,6 +487,7 @@ export interface CreateSessionRequest {
   extra_args?: string;
   sandbox_image?: string;
   extra_env?: string[];
+  host_proxy?: string;
   extra_repo_paths?: string[];
   command_override?: string;
   custom_instruction?: string;

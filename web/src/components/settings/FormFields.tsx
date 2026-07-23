@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export function CollapsibleSection({
   title,
@@ -285,6 +286,7 @@ export function ListField({
   placeholder?: string;
   validate?: (value: string) => string | null;
 }) {
+  const { t } = useTranslation();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -318,12 +320,14 @@ export function ListField({
             onClick={() => setAdding(true)}
             className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer"
           >
-            + Add
+            {t("settings:list.add")}
           </button>
         )}
       </div>
       {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
-      {items.length === 0 && !adding && <div className="text-xs text-text-dim italic py-2">No items configured</div>}
+      {items.length === 0 && !adding && (
+        <div className="text-xs text-text-dim italic py-2">{t("settings:list.noItems")}</div>
+      )}
       <div className="space-y-1 max-h-[320px] overflow-y-auto">
         {items.map((item, i) => (
           <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group">
@@ -331,7 +335,7 @@ export function ListField({
             <button
               onClick={() => remove(i)}
               className="text-text-dim hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
-              title="Remove"
+              title={t("settings:list.remove")}
             >
               <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
                 <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
@@ -367,7 +371,7 @@ export function ListField({
               onClick={submit}
               className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-sm font-medium text-surface-950 cursor-pointer"
             >
-              Add
+              {t("settings:list.addBtn")}
             </button>
             <button
               onClick={() => {
@@ -377,7 +381,7 @@ export function ListField({
               }}
               className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer"
             >
-              Cancel
+              {t("settings:list.cancel")}
             </button>
           </div>
           {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
