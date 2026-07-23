@@ -35,13 +35,13 @@ pub enum ActionId {
     ToolPicker,
     SearchStart,
     SearchNext,
-    SearchPrev,
     NewSession,
     NewFromSelection,
     NewFromProject,
     AttachTerminal,
     ToggleView,
     SendMessage,
+    RespondToPermission,
     Stop,
     Delete,
     Rename,
@@ -246,6 +246,18 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
+/// Whether a plugin-declared keybind string (e.g. `Ctrl+Shift+G`) matches this
+/// key event. The structured view resolves daemon-provided command keybinds
+/// through this rather than the local registry, so it parses the raw chord
+/// string here. A chord string that does not parse never matches.
+///
+/// Only the structured view (serve-gated) executes plugin commands, so this is
+/// unused in a bare-core build; gate it to avoid a dead-code warning there.
+#[cfg(feature = "serve")]
+pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
+    parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
+}
+
 /// The active plugins' declared keybinds, parsed into `(chord, action)`. A
 /// keybind whose key string does not parse is skipped (its conflict-free state
 /// is surfaced by `aoe plugin info`).
@@ -344,18 +356,13 @@ fn format_chord(c: &Chord) -> String {
 // one (search-cycle vs new, etc.) come first so they win when their guard holds.
 pub static BINDINGS: &[Binding] = &[
     // --- search cycle (only while matches are active; both modes) ---
+    // Only bare `n` cycles (forward, wrapping). `N`/Shift+N stays a new-session
+    // key in every state so a committed search never shadows it (#3038); the
+    // forward wrap keeps every match reachable, so there is no reverse binding.
     Binding {
         id: ActionId::SearchNext,
         non_strict: &[k('n')],
         strict: &[k('n')],
-        context: Context::SearchActive,
-        help: None,
-        palette: None,
-    },
-    Binding {
-        id: ActionId::SearchPrev,
-        non_strict: &[k('N')],
-        strict: &[k('N')],
         context: Context::SearchActive,
         help: None,
         palette: None,
@@ -554,17 +561,33 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::RespondToPermission,
+        non_strict: &[k('a')],
+        strict: &[k('A')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Respond to permission prompt",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Respond to permission prompt",
+            keywords: &["allow", "deny", "approve", "permission"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Stop,
         non_strict: &[k('x')],
         strict: &[k('X')],
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Stop session",
+            desc: "Stop session / kill terminal (by view)",
         }),
         palette: Some(PaletteMeta {
-            title: "Stop session",
-            keywords: &["kill", "end", "halt"],
+            title: "Stop session / kill terminal",
+            keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),
@@ -904,6 +927,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::AttachTerminal => "attach-terminal",
         ActionId::ToggleView => "toggle-view",
         ActionId::SendMessage => "send-message",
+        ActionId::RespondToPermission => "respond-to-permission",
         ActionId::Stop => "stop",
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",
@@ -927,7 +951,6 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToolPicker => "tool-picker",
         ActionId::SearchStart => "search",
         ActionId::SearchNext => "search-next",
-        ActionId::SearchPrev => "search-prev",
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
@@ -1144,18 +1167,37 @@ mod tests {
         }
     }
 
+    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles
+    // (forward); every `N`/Shift+N chord stays a new-session action whether or
+    // not a search is committed.
     #[test]
-    fn search_cycle_overrides_new_session_when_active() {
+    fn committed_search_cycles_n_but_never_shadows_shift_new_session() {
         let mut c = ctx();
         c.has_search = true;
-        for strict in [false, true] {
-            assert_eq!(resolve(&key('n'), strict, &c), Some(ActionId::SearchNext));
-            assert_eq!(resolve(&key('N'), strict, &c), Some(ActionId::SearchPrev));
-        }
-        // Without an active search, the same keys are new-session actions.
+        // Bare `n` cycles forward through matches in both modes.
+        assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::SearchNext));
+        assert_eq!(resolve(&key('n'), true, &c), Some(ActionId::SearchNext));
+        // Shift+N stays a new-session action even while a search is live:
+        // NewFromSelection in non-strict, NewSession in strict.
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
+        assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+
+        // Without a committed search, the same keys keep their new-session
+        // meaning; `n` is only borrowed for cycling while matches exist.
         c.has_search = false;
         assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
         assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&ctrl_key('n'), true, &c),
+            Some(ActionId::NewFromSelection)
+        );
     }
 
     #[test]

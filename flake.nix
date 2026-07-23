@@ -9,7 +9,7 @@
 
   outputs = inputs @ { flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       perSystem = { config, self', inputs', pkgs, system, ... }:
         let
@@ -75,7 +75,10 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-jlIOP3fAnhvCS4WqEy6ev9Gt4WWUPjfnXFSgZjZLRYw=";
+            # TODO: re-derive after merging fork deps (i18next, @assistant-ui/core)
+            # into package-lock. No local nix; set to fakeHash so Nix Build Web
+            # reports the correct `got:` sha256 in its CI log for a follow-up.
+            npmDepsHash = lib.fakeHash;
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

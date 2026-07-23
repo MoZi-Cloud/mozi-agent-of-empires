@@ -58,13 +58,15 @@ pub struct McpConflict {
 }
 
 impl McpConflict {
-    /// Optimistic-concurrency token: the fingerprint of the AoE (snapshot) side
-    /// as this surface saw it when it opened the conflict modal. [`resolve_conflict`]
-    /// rejects the resolution as stale if the on-disk snapshot no longer matches
-    /// this token, i.e. another surface (web vs TUI) resolved the same conflict
-    /// first.
+    /// Optimistic-concurrency token binding BOTH sides of the conflict as this
+    /// surface saw them: the AoE snapshot side (`previous`) and the native side
+    /// (`current`). [`resolve_conflict`] rejects the resolution as stale if this
+    /// token no longer matches the freshly reconciled conflict, so a change to
+    /// EITHER side after the surface captured the token, another surface
+    /// re-baselining the snapshot, or the native config changing again, is caught
+    /// rather than silently applying the user's old decision to new state.
     pub fn fingerprint(&self) -> String {
-        super::project_mcp::fingerprint(std::slice::from_ref(&self.previous))
+        super::project_mcp::fingerprint(&[self.previous.clone(), self.current.clone()])
     }
 }
 
@@ -223,13 +225,18 @@ pub fn forget_native(agent: &str, name: &str) -> Result<()> {
 /// Resolve a conflict between AoE's snapshot and the native config (feature C).
 ///
 /// `expected_fingerprint` is the optimistic-concurrency token the surface
-/// captured when it opened the modal ([`McpConflict::fingerprint`]). Under the
-/// store lock, if the snapshot entry is gone or no longer matches that token
-/// (another surface already resolved it), nothing changes and [`ResolveStatus::Stale`]
-/// is returned. Otherwise the snapshot is re-baselined to the native definition
-/// (so the conflict does not re-surface), and for [`ConflictWinner::Aoe`] the
-/// AoE-side definition is additionally promoted into the global `mcp.json` so it
-/// keeps forwarding. AoE never writes the native config either way.
+/// captured when it opened the modal ([`McpConflict::fingerprint`]), binding
+/// BOTH the snapshot (`previous`) and native (`current`) sides. The caller is
+/// expected to pass a freshly reconciled `conflict`; if its token no longer
+/// matches `expected_fingerprint`, either side moved since the surface captured
+/// it (the native config changed again, or another surface re-baselined the
+/// snapshot), so nothing changes and [`ResolveStatus::Stale`] is returned. Under
+/// the store lock this is re-checked against the on-disk snapshot to close the
+/// window between the caller's reconcile and this write. Otherwise the snapshot
+/// is re-baselined to the native definition (so the conflict does not
+/// re-surface), and for [`ConflictWinner::Aoe`] the AoE-side definition is
+/// additionally promoted into the global `mcp.json`. AoE never writes the native
+/// config either way.
 pub fn resolve_conflict(
     conflict: &McpConflict,
     winner: ConflictWinner,
@@ -237,8 +244,18 @@ pub fn resolve_conflict(
 ) -> Result<ResolveStatus> {
     let name = conflict.current.name.clone();
 
-    // Phase 1, under the store lock: verify the token, re-baseline the snapshot,
-    // and report whether the AoE side must still be promoted to global.
+    // The token binds both sides of the conflict as the surface saw them.
+    // Recompute from the freshly reconciled conflict the caller passed: if
+    // either side moved since the token was captured, it no longer matches and
+    // the resolution is stale (the user's decision was made against old state).
+    if conflict.fingerprint() != expected_fingerprint {
+        return Ok(ResolveStatus::Stale);
+    }
+
+    // Phase 1, under the store lock: re-verify the snapshot still holds the
+    // previous side the caller resolved against (closing the window between the
+    // caller's reconcile and this write), re-baseline it, and report whether the
+    // AoE side must still be promoted to global.
     enum Decision {
         Stale,
         Applied { promote: Option<ProjectMcpServer> },
@@ -251,7 +268,7 @@ pub fn resolve_conflict(
         else {
             return Decision::Stale;
         };
-        if super::project_mcp::fingerprint(std::slice::from_ref(snap)) != expected_fingerprint {
+        if snap != &conflict.previous {
             return Decision::Stale;
         }
         let promote = match winner {
@@ -282,48 +299,20 @@ pub fn resolve_conflict(
     }
 }
 
-/// Open the drift store, lock it exclusively, hand the parsed state to `f`, then
-/// write the (possibly mutated) state back through the same locked handle. The
-/// lock serializes concurrent surface opens (web and TUI) so neither clobbers
-/// the other's snapshot.
+/// Parse the drift store under an exclusive sidecar lock, hand it to `f`, then
+/// persist the (possibly mutated) state atomically while still holding the
+/// lock. The lock serializes concurrent surface opens (web and TUI) so neither
+/// clobbers the other's snapshot; `locked_update` also keeps the store
+/// owner-only, which matters here because it holds the same plaintext secrets
+/// as the user's mcp.json and native configs.
 fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     let path = mcp_state_path()?;
-    if !path.exists() {
-        std::fs::write(&path, "").with_context(|| format!("creating {}", path.display()))?;
-    }
-    // Owner-only: the store holds the same plaintext secrets as the user's
-    // mcp.json and native configs, so it must never widen beyond the owner.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.lock_exclusive().context("locking mcp_state.json")?;
-
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    let mut state: McpState = if content.trim().is_empty() {
-        McpState::default()
-    } else {
-        serde_json::from_str(&content).context("parsing mcp_state.json")?
-    };
-
-    let result = f(&mut state);
-
-    let new_content = serde_json::to_string_pretty(&state)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    file.write_all(new_content.as_bytes())?;
-    Ok(result)
+    super::storage::locked_update(
+        &path,
+        |content| serde_json::from_str(content).context("parsing mcp_state.json"),
+        |state| Ok(serde_json::to_string_pretty(state)?),
+        |state| Ok::<_, anyhow::Error>(f(state)),
+    )?
 }
 
 #[cfg(test)]
@@ -517,6 +506,33 @@ mod tests {
             1,
             "stale resolution must not clear the conflict"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_conflict_stale_when_native_changes_after_token_captured() {
+        let _home = set_tmp_home();
+        // Surface sees old->new and captures a token binding both sides.
+        let conflict = make_conflict("claude");
+        let token = conflict.fingerprint();
+
+        // The native config then changes AGAIN (new -> newer) before the user's
+        // resolution lands; the caller reconciles and finds the newer conflict.
+        let r = reconcile_agent(
+            "claude",
+            &read(r#"{ "mcpServers": { "fs": { "command": "newer" } } }"#),
+        )
+        .unwrap();
+        let newer = r.conflicts.into_iter().next().unwrap();
+
+        // Applying the stale token against the newer native definition is
+        // rejected, and nothing is promoted to global.
+        let status = resolve_conflict(&newer, ConflictWinner::Aoe, &token).unwrap();
+        assert_eq!(status, ResolveStatus::Stale);
+        let app_dir = crate::session::get_app_dir().unwrap();
+        assert!(crate::session::mcp_model::load_global_mcp_servers(&app_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -1,8 +1,6 @@
 use super::container_interface::{docker_env_args, ContainerConfig};
 use super::error::{sanitize_stderr, DockerError, Result};
-use std::io::Read;
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Upper bound on a single `docker pull`. `docker pull` has no overall timeout
@@ -11,57 +9,6 @@ use std::time::{Duration, Instant};
 /// generously so a genuinely large
 /// image on a slow link still completes; it only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Wait for `child` to exit, killing it if it outlives `timeout`.
-///
-/// stdout/stderr are drained on dedicated threads so a full pipe buffer cannot
-/// wedge the child (and thus this wait) before the deadline. Returns `Ok(None)`
-/// when the timeout fired and the child was killed.
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<Option<Output>> {
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let (otx, orx) = mpsc::channel();
-    let (etx, erx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stdout_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = otx.send(buf);
-    });
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stderr_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = etx.send(buf);
-    });
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            // The child exited, but if it spawned a grandchild that inherited
-            // the pipe, `read_to_end` (and thus an unbounded `recv`) would block
-            // forever. Cap the drain at the remaining deadline so the timeout
-            // guarantee holds even then; the exit status is already in hand.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let stdout = orx.recv_timeout(remaining).unwrap_or_default();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let stderr = erx.recv_timeout(remaining).unwrap_or_default();
-            return Ok(Some(Output {
-                status,
-                stdout,
-                stderr,
-            }));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
 
 /// Shared implementation for container runtimes.
 ///
@@ -89,6 +36,11 @@ pub(crate) struct RuntimeBase {
     /// Whether this runtime supports the `:z`/`:Z` SELinux relabel volume flag
     /// (Docker and Podman do; Apple Container does not).
     pub supports_selinux_relabel: bool,
+    /// Whether this runtime supports Docker-style `--network <mode>` (`none`,
+    /// `bridge`, or a named network). Docker and Podman do; Apple Container's
+    /// `run` does not take these modes, so a configured `sandbox.network` is
+    /// skipped with a warning there rather than emitting a flag that fails.
+    pub supports_network_mode: bool,
     /// Case-insensitive stderr substrings that identify a "container does not
     /// exist" error for this runtime. Each runtime words it differently (Docker
     /// "No such container", Apple Container "notFound … not found"), so the
@@ -97,7 +49,7 @@ pub(crate) struct RuntimeBase {
     /// Case-sensitive stderr substrings that identify a "daemon is not
     /// reachable" error for this runtime. Structural parallel to
     /// `not_found_markers`: keeping this per-runtime prevents cross-runtime
-    /// substring bleed and lets `classify_inspect_failure` surface an
+    /// substring bleed and lets `classify_probe_failure` surface an
     /// actionable [`DockerError::DaemonNotRunning`] at the fail-closed gate
     /// sites (#2596 follow-up). Case sensitivity is intentional; every
     /// runtime's daemon-down message has stable capitalization at the source.
@@ -128,6 +80,7 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        supports_network_mode: true,
         not_found_markers: &["no such container"],
         // moby/moby client/errors.go connectionFailed() is the single source
         // of this message across every Docker OS variant (macOS Desktop, Linux
@@ -154,14 +107,23 @@ impl RuntimeBase {
         supports_remove_volumes: false,
         supports_named_volumes: false,
         supports_selinux_relabel: false,
-        // Apple Container reports a missing container as
-        // `notFound: "container with ID <id> not found"`. The bare "not found"
-        // substring would be dangerously broad; a plausible daemon-connectivity
-        // error containing "socket not found" or "endpoint not found" would
-        // misclassify as absent and silently reintroduce #2596 on this runtime.
-        // Match the container-specific prefix instead (lowercased to align with
-        // is_not_found's case-fold).
-        not_found_markers: &["container with id"],
+        supports_network_mode: false,
+        // Apple Container surfaces a missing container with two distinct
+        // wordings depending on the subcommand:
+        // - `container delete`/`container logs`: `notFound: "container with
+        //   ID <id> not found"`.
+        // - `container inspect`: `Error: container not found: <name>`.
+        // The bare "not found" substring would be dangerously broad; a
+        // plausible daemon-connectivity error containing "socket not found"
+        // or "endpoint not found" would misclassify as absent and silently
+        // reintroduce #2596 on this runtime. Both entries below are
+        // container-not-found-specific substrings with no known collision
+        // risk between each other or with daemon-connectivity wording, so a
+        // single shared list is intentional: `classify_probe_failure` reads
+        // from it for both the running-state (inspect) and existence
+        // (logs/delete) surfaces. Entries are lowercase to align with
+        // is_not_found's case-fold.
+        not_found_markers: &["container with id", "container not found"],
         // Placeholder: Apple's `container` CLI daemon-down wording is not
         // captured in this repo. The fallback to InspectFailed still fails
         // closed at gate sites, so an unmatched real message only degrades
@@ -189,6 +151,7 @@ impl RuntimeBase {
         supports_remove_volumes: true,
         supports_named_volumes: true,
         supports_selinux_relabel: true,
+        supports_network_mode: true,
         not_found_markers: &["no such container"],
         // Two distinct daemon-down wordings observed in real Podman output:
         // - "connect to Podman socket" fires on Linux socket mode
@@ -234,18 +197,34 @@ impl RuntimeBase {
         self.not_found_markers.iter().any(|m| lower.contains(m))
     }
 
-    /// Classify a non-success `container inspect` stderr into either a
-    /// definitive "not running" (container absent, matches `is_not_found`)
-    /// or a genuine runtime failure (daemon down / 500 / any other
-    /// transient) that must surface to the caller.
+    /// Classify a non-success container-state probe stderr into either a
+    /// definitive "not running" / "absent" (container missing, matches
+    /// `is_not_found`) or a genuine runtime failure (daemon down / 500 / any
+    /// other transient) that must surface to the caller.
     ///
     /// Without this split, `ContainerRuntime::is_container_running`
     /// collapses BOTH failure modes into `Ok(false)`, and every fail-closed
     /// probe site silently swallows the daemon-down signal as
     /// `Probe::NotRunning`: the same swallowing-existence-probe class
     /// fixed on the removal path by #2576 and on the discard path by
-    /// #2596. Mirrors the stderr-sniff pattern `remove()` already uses.
-    pub fn classify_inspect_failure(&self, stderr: &str) -> Result<bool> {
+    /// #2596.
+    ///
+    /// Both probe surfaces funnel through this one classifier: the
+    /// running-state probe (`is_container_running`) and the existence probe
+    /// (`does_container_exist`, `container inspect` on Docker/Podman, `logs`
+    /// on Apple). Keeping the order-of-checks priority (permission-denied
+    /// before daemon-down) authoritative in one place closes the
+    /// swallowing-existence-probe class of bug (#2596 / #2652 / #2654) on both
+    /// surfaces, following #2652 which closed it on the running-state surface.
+    ///
+    /// `stderr` is decoded upstream via `String::from_utf8_lossy`, which
+    /// replaces invalid bytes with U+FFFD (the replacement character). The
+    /// markers matched below (`not_found_markers` / `daemon_down_markers` /
+    /// `permission_denied_markers`) are all ASCII, and Docker / Podman /
+    /// Apple emit English ASCII stderr, so a U+FFFD substitution on a
+    /// mangled-encoding host cannot spuriously match a marker; classification
+    /// is safe over the lossily-decoded string despite not being byte-exact.
+    pub fn classify_probe_failure(&self, stderr: &str) -> Result<bool> {
         if self.is_not_found(stderr) {
             return Ok(false);
         }
@@ -273,23 +252,29 @@ impl RuntimeBase {
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }
 
-    /// Classify a non-success stderr from the existence surface (`container inspect`
-    /// on Docker/Podman, `logs` on Apple), parallel to
-    /// [`Self::classify_inspect_failure`]. Both arms funnel through this classifier;
-    /// the terminal [`DockerError::InspectFailed`] variant is reused because the
-    /// classification rules and `Display` contract are identical.
-    ///
-    /// Delegating rather than duplicating keeps the order-of-checks
-    /// priority (permission-denied before daemon-down) authoritative in
-    /// one place. Closes the swallowing-existence-probe class of bug
-    /// (#2596 / #2652 / #2654) on the existence surface, following #2652
-    /// which closed it on the running-state surface.
-    pub fn classify_exists_failure(&self, stderr: &str) -> Result<bool> {
-        self.classify_inspect_failure(stderr)
-    }
-
     pub fn command(&self) -> Command {
         Command::new(self.binary)
+    }
+
+    /// Run `cmd` and capture its output, mapping a missing-binary spawn
+    /// failure to the actionable [`DockerError::NotInstalled`].
+    ///
+    /// `Command::output()` short-circuits with `io::ErrorKind::NotFound` when
+    /// the runtime binary is not on `PATH`. The bare `?` conversion routes
+    /// that through `#[from] std::io::Error` into the opaque
+    /// [`DockerError::IoError`], hiding the one variant whose Display tells
+    /// the operator how to fix it ("Docker is not installed or not in PATH.
+    /// Install: ..."). Every `.output()?` call site that propagates its
+    /// error goes through this wrapper so the not-installed case surfaces
+    /// with its remediation intact; all other IO errors propagate unchanged.
+    pub fn probe_output(&self, cmd: &mut Command) -> Result<std::process::Output> {
+        cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DockerError::NotInstalled
+            } else {
+                DockerError::IoError(e)
+            }
+        })
     }
 
     pub fn is_available(&self) -> bool {
@@ -321,12 +306,9 @@ impl RuntimeBase {
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let child = cmd.spawn()?;
-        let output = match wait_with_timeout(child, PULL_TIMEOUT)? {
+        let output = match crate::process::run_with_timeout(&mut cmd, PULL_TIMEOUT)? {
             Some(output) => output,
             None => {
                 let dur_ms = start.elapsed().as_millis() as u64;
@@ -468,9 +450,41 @@ impl RuntimeBase {
         let (env_argv, _inherit) = docker_env_args(&config.environment);
         args.extend(env_argv);
 
-        for port in &config.port_mappings {
-            args.push("-p".to_string());
-            args.push(port.clone());
+        // Apple Container's `run` doesn't take Docker-style `--network` modes,
+        // so a configured network is skipped there with a warning rather than
+        // emitting a flag that fails container creation.
+        let network = match config.network.as_deref() {
+            Some(n) if !self.supports_network_mode => {
+                tracing::warn!(
+                    target: "containers.runtime",
+                    "{} does not support --network modes; ignoring sandbox.network = {:?}",
+                    self.name,
+                    n
+                );
+                None
+            }
+            other => other,
+        };
+        let network_none = network.is_some_and(|n| n.eq_ignore_ascii_case("none"));
+        if let Some(network) = network {
+            args.push("--network".to_string());
+            args.push(network.to_string());
+        }
+
+        // Publishing ports requires a network; the runtime errors out if `-p`
+        // is combined with `--network none`, so drop the mappings and warn
+        // rather than fail container creation.
+        if network_none && !config.port_mappings.is_empty() {
+            tracing::warn!(
+                target: "containers.runtime",
+                "Ignoring {} port mapping(s) because sandbox.network = \"none\"",
+                config.port_mappings.len()
+            );
+        } else {
+            for port in &config.port_mappings {
+                args.push("-p".to_string());
+                args.push(port.clone());
+            }
         }
 
         if let Some(cpu) = &config.cpu_limit {
@@ -503,7 +517,7 @@ impl RuntimeBase {
         for (key, value) in inherit {
             cmd.env(key, value);
         }
-        let output = cmd.output()?;
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -526,7 +540,9 @@ impl RuntimeBase {
 
     pub fn start_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "starting container");
-        let output = self.command().args(["start", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["start", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -538,7 +554,9 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
-        let output = self.command().args(["stop", name]).output()?;
+        let mut cmd = self.command();
+        cmd.args(["stop", name]);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -564,7 +582,9 @@ impl RuntimeBase {
         args.push(name.to_string());
 
         tracing::debug!(target: "containers.runtime", runtime = %self.name, %name, %force, "removing container");
-        let output = self.command().args(&args).output()?;
+        let mut cmd = self.command();
+        cmd.args(&args);
+        let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -590,16 +610,15 @@ impl RuntimeBase {
         }
 
         // List volumes whose names start with the prefix.
-        let list_output = self
-            .command()
-            .args([
-                "volume",
-                "ls",
-                "--filter",
-                &format!("name={}", prefix),
-                "-q",
-            ])
-            .output()?;
+        let mut list_cmd = self.command();
+        list_cmd.args([
+            "volume",
+            "ls",
+            "--filter",
+            &format!("name={}", prefix),
+            "-q",
+        ]);
+        let list_output = self.probe_output(&mut list_cmd)?;
 
         if !list_output.status.success() {
             let stderr = String::from_utf8_lossy(&list_output.stderr);
@@ -622,7 +641,9 @@ impl RuntimeBase {
         tracing::debug!(target: "containers.runtime", runtime = %self.name, ?names, "removing named ignore volumes");
         let mut rm_args = vec!["volume", "rm"];
         rm_args.extend(names.iter().copied());
-        let rm_output = self.command().args(&rm_args).output()?;
+        let mut rm_cmd = self.command();
+        rm_cmd.args(&rm_args);
+        let rm_output = self.probe_output(&mut rm_cmd)?;
 
         if !rm_output.status.success() {
             let stderr = String::from_utf8_lossy(&rm_output.stderr);
@@ -644,7 +665,9 @@ impl RuntimeBase {
         let mut args = vec!["exec", name];
         args.extend(cmd);
 
-        let output = self.command().args(&args).output()?;
+        let mut command = self.command();
+        command.args(&args);
+        let output = self.probe_output(&mut command)?;
 
         Ok(output)
     }
@@ -661,9 +684,46 @@ mod tests {
     const DOCKER_MISSING: &str =
         "Error response from daemon: No such container: aoe-sandbox-abc123";
     const APPLE_MISSING: &str = "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID aoe-sandbox-abc123 not found\"\")";
+    // Real stderr captured from `container inspect <missing>` on Apple
+    // Container CLI v1.1.0 (2026-07-21). Distinct wording from APPLE_MISSING
+    // (delete/logs); pins the specific not-found classification that
+    // is_container_running()'s inspect path relies on. Regression fixture for
+    // the brand-new-session first-start failure this marker gap caused.
+    const APPLE_INSPECT_MISSING: &str = "Error: container not found: aoe-sandbox-abc123";
     // Podman not installed locally; representative of its documented output.
     const PODMAN_MISSING: &str =
         "Error: no container with name or ID \"aoe-sandbox-abc123\" found: no such container";
+
+    // Daemon-unreachable stderr fixtures, shared between the running-state and
+    // existence suites so both probe surfaces stay pinned to byte-identical
+    // wording (previously inlined copies kept in sync by hand). Each matches
+    // only its own runtime's `daemon_down_markers`; no cross-runtime bleed by
+    // construction.
+    const DOCKER_DAEMON_DOWN: &str =
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+         Is the docker daemon running?";
+    // Podman socket mode (Linux): libpod service unavailable.
+    const PODMAN_SOCKET_DOWN: &str =
+        "Error: unable to connect to Podman socket: Connection refused";
+    // Podman Desktop / machine mode (macOS / Windows): VM stopped.
+    const PODMAN_DESKTOP_DOWN: &str = "Cannot connect to Podman. \
+         Please verify your connection to the Linux system using \
+         `podman system connection list`, or try `podman machine init` \
+         and `podman machine start` to manage a new Linux VM";
+    // Apple placeholder: real `container` CLI daemon-down wording is not
+    // captured in this repo; the marker match is by construction.
+    const APPLE_DAEMON_DOWN: &str =
+        "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
+
+    // Permission-denied stderr fixtures, likewise shared between both suites.
+    // Docker's canonical Linux socket-permission wording; Podman and Apple use
+    // broader placeholders pending real-fixture capture.
+    const DOCKER_PERMISSION_DENIED: &str =
+        "Got permission denied while trying to connect to the Docker daemon socket \
+                             at unix:///var/run/docker.sock";
+    const PODMAN_PERMISSION_DENIED: &str = "Error: unable to connect to Podman socket: dial unix \
+                             /run/user/1000/podman/podman.sock: connect: permission denied";
+    const APPLE_PERMISSION_DENIED: &str = "Error: permission denied accessing container socket";
 
     #[test]
     fn docker_not_found_stderr_classifies() {
@@ -673,6 +733,16 @@ mod tests {
     #[test]
     fn apple_not_found_stderr_classifies() {
         assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_MISSING));
+    }
+
+    #[test]
+    fn apple_inspect_not_found_stderr_classifies() {
+        // The `inspect` shape ("container not found: <name>") is distinct
+        // from the `delete`/`logs` shape (APPLE_MISSING) and was not
+        // originally covered by not_found_markers, causing every
+        // brand-new Apple-Container-sandboxed session to fail its first
+        // start with a surfaced InspectFailed instead of Ok(false).
+        assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_INSPECT_MISSING));
     }
 
     #[test]
@@ -699,15 +769,22 @@ mod tests {
         // the classifier keeps the not-running vs absent collapse consistent
         // across all state-probe paths.
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(DOCKER_MISSING),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(APPLE_MISSING),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(PODMAN_MISSING),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
+            Ok(false)
+        ));
+        // The real `container inspect <missing>` shape must also collapse
+        // to Ok(false); this is the shape is_container_running() actually
+        // sees, distinct from the delete/logs shape covered above.
+        assert!(matches!(
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_INSPECT_MISSING),
             Ok(false)
         ));
     }
@@ -727,37 +804,23 @@ mod tests {
         // Markers now live in `daemon_down_markers` per-runtime (parallel to
         // `not_found_markers`), so each runtime only matches its own
         // wording; no cross-runtime bleed by construction.
-        let docker_daemon_down =
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
-             Is the docker daemon running?";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(docker_daemon_down),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Podman socket mode (Linux): libpod service unavailable.
-        let podman_socket_down = "Error: unable to connect to Podman socket: Connection refused";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_socket_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Podman Desktop / machine mode (macOS / Windows): VM stopped.
-        let podman_desktop_down = "Cannot connect to Podman. \
-             Please verify your connection to the Linux system using \
-             `podman system connection list`, or try `podman machine init` \
-             and `podman machine start` to manage a new Linux VM";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_desktop_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        // Apple placeholder: real `container` CLI daemon-down wording is
-        // not captured in this repo; the marker match is by construction.
-        let apple_daemon_down =
-            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(apple_daemon_down),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
     }
@@ -793,18 +856,13 @@ mod tests {
         // per-runtime `permission_denied_markers`. Podman and Apple use the
         // broader "permission denied" placeholder pending real-fixture capture,
         // so the OS-level socket error text matches on those runtimes too.
-        let docker_stderr =
-            "Got permission denied while trying to connect to the Docker daemon socket \
-                             at unix:///var/run/docker.sock";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(docker_stderr),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let podman_stderr = "Error: unable to connect to Podman socket: dial unix \
-                             /run/user/1000/podman/podman.sock: connect: permission denied";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_inspect_failure(podman_stderr),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
@@ -813,9 +871,8 @@ mod tests {
         // TODO: replace with captured Apple `container` CLI permission
         // stderr once a real macOS 26 fixture is available (cf. #2655 for
         // the parallel Apple daemon-down fixture follow-up).
-        let apple_stderr = "Error: permission denied accessing container socket";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_inspect_failure(apple_stderr),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
     }
@@ -852,6 +909,37 @@ mod tests {
     }
 
     #[test]
+    fn probe_output_maps_missing_binary_to_not_installed() {
+        // A runtime binary absent from PATH makes `Command::output()` fail
+        // with io::ErrorKind::NotFound. probe_output must translate that into
+        // the actionable NotInstalled variant rather than the opaque IoError
+        // the bare `?` conversion would surface at gate sites.
+        let mut cmd = Command::new("aoe-nonexistent-runtime-binary-zzz");
+        cmd.arg("--version");
+        assert!(matches!(
+            RuntimeBase::DOCKER.probe_output(&mut cmd),
+            Err(DockerError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn probe_output_returns_ok_for_a_spawnable_binary() {
+        // A binary that exists but exits non-zero must NOT be misclassified as
+        // NotInstalled: probe_output only remaps the missing-binary NotFound
+        // spawn error, and lets a real (non-success) run return Ok(output).
+        // `false` exits 1 on every Unix; skip where it is not on PATH.
+        let mut probe = Command::new("false");
+        if probe.output().is_err() {
+            return;
+        }
+        let mut cmd = Command::new("false");
+        let output = RuntimeBase::DOCKER
+            .probe_output(&mut cmd)
+            .expect("spawnable binary must not map to a DockerError");
+        assert!(!output.status.success());
+    }
+
+    #[test]
     fn inspect_generic_transient_maps_to_inspect_failed() {
         // Any non-not-found, non-daemon-down, non-permission-denied stderr
         // falls through to InspectFailed carrying the raw stderr. This is
@@ -859,22 +947,42 @@ mod tests {
         // during inspect": the operator sees the underlying runtime message
         // via the warn's error field.
         let stderr = "Error response from daemon: internal server error 500";
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_inspect_failure(stderr),
-            Err(DockerError::InspectFailed(_))
-        ));
+        // Assert the sanitized stderr is carried in the payload (not just the
+        // variant): the `_` discard would pass even if sanitize_stderr dropped
+        // the operator-facing content.
+        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
+            Err(DockerError::InspectFailed(s)) => assert!(
+                s.contains("500"),
+                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
+            ),
+            other => panic!("expected Err(InspectFailed), got {other:?}"),
+        }
     }
 
-    // classify_exists_failure test triples: parallel to the classify_inspect_failure
-    // triples above, verifying the existence surface (used by
-    // `does_container_exist`) shares the same fixture-based classification.
-    // Closes the swallowing-existence-probe class of bug (#2596) on the
-    // existence surface, following #2652 which closed it on the running-state
-    // surface. Absent-container fixture bytes are shared with the
-    // classify_inspect_failure suite via the `_MISSING` module-scope
-    // constants; daemon-down and permission-denied fixture strings are
-    // byte-identical inlined copies (keep them in sync manually until a
-    // shared fixture module lands).
+    #[test]
+    fn inspect_empty_stderr_maps_to_inspect_failed_with_sentinel() {
+        // A runtime that exits non-zero without writing stderr must still
+        // surface an actionable Display: the terminal InspectFailed arm runs
+        // stderr through sanitize_stderr, which substitutes the `<no stderr>`
+        // sentinel so the operator never sees a dangling "Failed to inspect
+        // container: ".
+        match RuntimeBase::DOCKER.classify_probe_failure("") {
+            Err(DockerError::InspectFailed(msg)) => assert_eq!(msg, "<no stderr>"),
+            other => panic!("expected InspectFailed(<no stderr>), got {other:?}"),
+        }
+    }
+
+    // Existence-surface test triples: parallel to the running-state triples
+    // above, verifying the existence surface (used by `does_container_exist`)
+    // shares the same `classify_probe_failure` classification. Both surfaces
+    // now funnel through the one classifier, so these exercise the same code
+    // path with the existence-surface fixtures. Closes the
+    // swallowing-existence-probe class of bug (#2596) on the existence
+    // surface, following #2652 which closed it on the running-state surface.
+    // Absent-container, daemon-down, and permission-denied fixture bytes are
+    // all shared with the running-state suite via the module-scope constants
+    // (`_MISSING`, `_DAEMON_DOWN` / `_SOCKET_DOWN` / `_DESKTOP_DOWN`,
+    // `_PERMISSION_DENIED`), so the two probe surfaces cannot drift apart.
 
     #[test]
     fn exists_not_found_stderr_collapses_to_ok_false() {
@@ -884,15 +992,15 @@ mod tests {
         // definitive "absent" instead of surfacing the missing container as
         // an Err.
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(DOCKER_MISSING),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(APPLE_MISSING),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
             Ok(false)
         ));
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(PODMAN_MISSING),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
             Ok(false)
         ));
     }
@@ -904,64 +1012,48 @@ mod tests {
         // failure mode this fix closes. Surfacing as Err lets the
         // create-path and future fail-closed gates route the daemon-down
         // signal to the actionable DaemonNotRunning Display message.
-        let docker_daemon_down =
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
-             Is the docker daemon running?";
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(docker_daemon_down),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        let podman_socket_down = "Error: unable to connect to Podman socket: Connection refused";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_socket_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
-        let podman_desktop_down = "Cannot connect to Podman. \
-             Please verify your connection to the Linux system using \
-             `podman system connection list`, or try `podman machine init` \
-             and `podman machine start` to manage a new Linux VM";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_desktop_down),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
 
         // Apple placeholder: real `container` CLI daemon-down wording is not
         // captured in this repo; marker match is by construction, same
-        // caveat as classify_inspect_failure's Apple daemon-down test.
-        let apple_daemon_down =
-            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
+        // caveat as classify_probe_failure's Apple daemon-down test.
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_daemon_down),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
             Err(DockerError::DaemonNotRunning)
         ));
     }
 
     #[test]
     fn exists_permission_denied_stderr_maps_to_permission_denied() {
-        // Same PermissionDenied classification as classify_inspect_failure:
+        // Same PermissionDenied classification as classify_probe_failure:
         // Docker's tight marker isolates cleanly; Podman and Apple use the
         // broader "permission denied" placeholder pending real-fixture
-        // capture (same caveat documented on classify_inspect_failure).
-        let docker_stderr =
-            "Got permission denied while trying to connect to the Docker daemon socket \
-                             at unix:///var/run/docker.sock";
+        // capture (same caveat documented on classify_probe_failure).
         assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(docker_stderr),
+            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let podman_stderr = "Error: unable to connect to Podman socket: dial unix \
-                             /run/user/1000/podman/podman.sock: connect: permission denied";
         assert!(matches!(
-            RuntimeBase::PODMAN.classify_exists_failure(podman_stderr),
+            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
 
-        let apple_stderr = "Error: permission denied accessing container socket";
         assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_exists_failure(apple_stderr),
+            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
             Err(DockerError::PermissionDenied)
         ));
     }
@@ -974,10 +1066,15 @@ mod tests {
         // identical, and operators read the raw stderr via the error field
         // regardless of which argv produced it.
         let stderr = "Error response from daemon: internal server error 500";
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_exists_failure(stderr),
-            Err(DockerError::InspectFailed(_))
-        ));
+        // As with the inspect sibling, assert the payload carries the fixture
+        // content, not merely the InspectFailed variant.
+        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
+            Err(DockerError::InspectFailed(s)) => assert!(
+                s.contains("500"),
+                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
+            ),
+            other => panic!("expected Err(InspectFailed), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1029,6 +1126,91 @@ mod tests {
         // Should NOT include :ro suffix (Apple Container doesn't support it)
         assert!(args.contains(&"/host/path:/container/path".to_string()));
         assert!(!args.iter().any(|a| a.ends_with(":ro")));
+    }
+
+    /// The value immediately following `flag` in an arg list, if present.
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn test_build_create_args_no_network_flag_by_default() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert!(!args.iter().any(|a| a == "--network"));
+    }
+
+    #[test]
+    fn test_build_create_args_named_network_emitted() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("egress-proxy".to_string()),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "--network"), Some("egress-proxy"));
+    }
+
+    #[test]
+    fn test_build_create_args_network_none_drops_port_mappings() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("none".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "--network"), Some("none"));
+        // `-p` conflicts with `--network none`, so it must be dropped.
+        assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn test_build_create_args_network_skipped_on_unsupported_runtime() {
+        let base = RuntimeBase::APPLE_CONTAINER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("none".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        // Apple Container gets no --network flag, and because it wasn't applied
+        // the port mappings are still emitted.
+        assert!(!args.iter().any(|a| a == "--network"));
+        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
+    }
+
+    #[test]
+    fn test_build_create_args_ports_kept_with_named_network() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            network: Some("egress-proxy".to_string()),
+            port_mappings: vec!["3000:3000".to_string()],
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
     }
 
     #[test]
@@ -1316,69 +1498,5 @@ mod tests {
         const { assert!(RuntimeBase::DOCKER.supports_named_volumes) };
         const { assert!(RuntimeBase::PODMAN.supports_named_volumes) };
         const { assert!(!RuntimeBase::APPLE_CONTAINER.supports_named_volumes) };
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn wait_with_timeout_kills_child_that_outlives_deadline() {
-        // A `docker pull` that wedges on the network has no timeout of its own
-        // and blocked the caller forever. `sleep 30` stands in for
-        // the wedged child; the timeout must fire and kill it.
-        let mut cmd = Command::new("sleep");
-        cmd.arg("30");
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-        let child = cmd.spawn().unwrap();
-
-        let start = Instant::now();
-        let result = wait_with_timeout(child, Duration::from_millis(300)).unwrap();
-        assert!(
-            result.is_none(),
-            "expected the timeout to fire and kill the child"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "wait should return promptly after the deadline, not block on the child"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn wait_with_timeout_bounds_drain_when_grandchild_holds_pipe() {
-        // The immediate child (sh) exits fast but backgrounds a `sleep` that
-        // inherits stdout, so the pipe never closes. The drain must still
-        // return by the deadline rather than blocking on read_to_end. `sleep 30`
-        // (>> the 5s assertion) ensures an unbounded recv would visibly fail.
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 30 >&1 & printf done");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let child = cmd.spawn().unwrap();
-
-        let start = Instant::now();
-        let output = wait_with_timeout(child, Duration::from_millis(500))
-            .unwrap()
-            .expect("the sh child exits quickly, so an Output is produced");
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "drain must be bounded by the deadline even while the pipe stays open"
-        );
-        assert!(output.status.success());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn wait_with_timeout_returns_output_for_fast_child() {
-        let mut cmd = Command::new("printf");
-        cmd.arg("hello");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let child = cmd.spawn().unwrap();
-
-        let output = wait_with_timeout(child, Duration::from_secs(10))
-            .unwrap()
-            .expect("fast child should complete before the timeout");
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"hello");
     }
 }

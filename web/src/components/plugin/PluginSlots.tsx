@@ -2,7 +2,7 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// pane, detail-badge. Notifications surface as toasts via the hook; the
+// pane, detail-badge, composer-action, settings-page. Notifications surface as toasts via the hook; the
 // sort-key and filter-facet slots render as sidebar sort options and a facet
 // filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
@@ -29,6 +29,12 @@ import {
   validTone,
 } from "../../lib/pluginUi";
 import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
+
+export interface ComposerActionSnapshot {
+  text: string;
+  selectionStart: number;
+  selectionEnd: number;
+}
 
 // Plugin strings are untrusted: only follow http/https hrefs, never
 // javascript:/data: and friends. Returns undefined for anything else, so the
@@ -254,6 +260,131 @@ export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
         <Badge key={`${e.plugin_id}:${e.id}`} entry={e} />
       ))}
     </div>
+  );
+}
+
+/** tool-card-badge: per-session pills on a transcript tool-call card, matched to
+ *  the card by its target `(kind, name)`. One entry carries an `items` list so a
+ *  plugin can badge every MCP server / skill it knows in one push; this renders
+ *  only the items whose target matches this card. Renders nothing when no plugin
+ *  badges this target, so a card is byte-identical without a plugin. */
+export function PluginToolCardBadges({
+  sessionId,
+  kind,
+  target,
+}: {
+  sessionId: string;
+  kind: "mcp" | "skill";
+  target: string;
+}) {
+  const entries = sessionEntries(usePluginUiEntries(), "tool-card-badge", sessionId);
+  if (entries.length === 0) return null;
+  const chips = entries.flatMap((e) => {
+    const items = objectList(e.payload, "items");
+    if (!items) return [];
+    return items
+      .filter((it) => {
+        const t = it.target;
+        return isObject(t) && str(t, "kind") === kind && str(t, "name") === target;
+      })
+      .map((it, i) => (
+        <BadgeChip
+          key={`${e.plugin_id}:${e.id}:${i}`}
+          text={str(it, "text")}
+          icon={str(it, "icon")}
+          tone={validTone(it.tone)}
+          tooltip={str(it, "tooltip")}
+          slot="tool-card-badge"
+          pluginId={e.plugin_id}
+        />
+      ));
+  });
+  if (chips.length === 0) return null;
+  return <span className="flex shrink-0 items-center gap-1">{chips}</span>;
+}
+
+export function PluginComposerActions({
+  sessionId,
+  getSnapshot,
+}: {
+  sessionId: string;
+  getSnapshot: () => ComposerActionSnapshot;
+}) {
+  const entries = sessionEntries(usePluginUiEntries(), "composer-action", sessionId);
+  if (entries.length === 0) return null;
+  return (
+    <>
+      {entries.map((entry) => (
+        <PluginComposerActionButton
+          key={`${entry.plugin_id}:${entry.id}`}
+          entry={entry}
+          sessionId={sessionId}
+          getSnapshot={getSnapshot}
+        />
+      ))}
+    </>
+  );
+}
+
+function PluginComposerActionButton({
+  entry,
+  sessionId,
+  getSnapshot,
+}: {
+  entry: PluginUiEntry;
+  sessionId: string;
+  getSnapshot: () => ComposerActionSnapshot;
+}) {
+  const label = payloadStr(entry, "label");
+  const method = payloadStr(entry, "method");
+  const tooltip = payloadStr(entry, "tooltip") || label;
+  const iconComp = lucideIcon(payloadStr(entry, "icon") || undefined);
+  const disabled = entry.payload.disabled === true || !method || !label;
+  const [posting, setPosting] = useState(false);
+  const postingRef = useRef(false);
+  const poke = usePluginUiPoke();
+  if (!label || !method) return null;
+  const onClick = async () => {
+    if (postingRef.current || disabled) return;
+    postingRef.current = true;
+    setPosting(true);
+    try {
+      const snapshot = getSnapshot();
+      const accepted = await invokePluginAction(entry.plugin_id, method, sessionId, {
+        composer: {
+          text: snapshot.text,
+          selection_start: snapshot.selectionStart,
+          selection_end: snapshot.selectionEnd,
+        },
+      });
+      if (accepted) poke();
+    } finally {
+      postingRef.current = false;
+      setPosting(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled || posting}
+      title={tooltip}
+      aria-label={label}
+      aria-busy={posting || undefined}
+      data-testid="plugin-composer-action"
+      className={[
+        "inline-flex h-8 items-center justify-center gap-1 rounded-md border border-surface-700 bg-surface-800 px-2.5 text-[12px]",
+        toneClasses(entryTone(entry)),
+        "hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60 transition-colors duration-100",
+      ].join(" ")}
+    >
+      {posting ? (
+        <Spinner className="size-3.5" />
+      ) : (
+        iconComp && createElement(iconComp, { className: "size-3.5 shrink-0", "aria-hidden": true })
+      )}
+      <span className="max-w-24 truncate">{label}</span>
+    </button>
   );
 }
 
@@ -590,6 +721,45 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
           {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
         </>
       )}
+    </div>
+  );
+}
+
+/** The routed full-page slot (#2985). A plugin declaring `settings-page` gets a
+ *  Settings nav entry (see SettingsView); this renders the global UI-state entry
+ *  it pushed for that `(plugin_id, id)` through the same block vocabulary as a
+ *  pane. The nav entry exists on declaration, so the entry may not be pushed yet
+ *  (worker still starting, or nothing to show): render an explicit waiting state
+ *  rather than a blank page. The entry is global (no `session_id`), so the reused
+ *  PluginPaneBody dispatches its `action` blocks session-lessly. */
+export function PluginSettingsPage({
+  pluginId,
+  contribId,
+  pluginName,
+}: {
+  pluginId: string;
+  contribId: string;
+  pluginName: string;
+}) {
+  const entries = usePluginUiEntries();
+  const entry = globalEntries(entries, "settings-page").find((e) => e.plugin_id === pluginId && e.id === contribId);
+  if (!entry) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-text-dim" data-testid="plugin-settings-page-waiting">
+        <Spinner className="size-3.5" />
+        Waiting for {pluginName} to load this page…
+      </div>
+    );
+  }
+  return <PluginSettingsPageBody entry={entry} />;
+}
+
+/** Separate component so the reused PluginPaneBody is only mounted once an entry
+ *  exists; it renders in a full-width settings container, not the docked pane. */
+function PluginSettingsPageBody({ entry }: { entry: PluginUiEntry }) {
+  return (
+    <div className="flex flex-col min-h-0" data-testid="plugin-settings-page" data-plugin-id={entry.plugin_id}>
+      <PluginPaneBody entry={entry} />
     </div>
   );
 }

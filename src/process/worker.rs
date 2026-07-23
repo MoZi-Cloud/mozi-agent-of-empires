@@ -175,6 +175,28 @@ pub fn kill_process_group(pid: u32) {
     let _ = pid;
 }
 
+/// SIGKILL the calling process's own group, but only when this process is
+/// its group leader (i.e. `setsid` succeeded). Returns `true` when the
+/// group was killed, `false` when the caller must fall back to killing its
+/// direct child (either `setsid` failed and the group is shared, or the
+/// platform is non-unix). Guarding on leadership prevents a failed `setsid`
+/// from SIGKILLing an inherited group, e.g. the daemon's.
+#[cfg(unix)]
+pub fn kill_own_process_group_if_leader(own_pid: u32) -> bool {
+    use nix::unistd::{getpgrp, getpid};
+    if getpgrp() == getpid() {
+        kill_process_group(own_pid);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_own_process_group_if_leader(_own_pid: u32) -> bool {
+    false
+}
+
 /// Reap a worker process group with SIGKILL escalation: SIGTERM the group,
 /// wait `grace` for it to exit, then SIGKILL the group. A bare SIGTERM can
 /// leave a grandchild that ignores it alive under PID 1, so the escalation
@@ -259,6 +281,25 @@ pub fn socket_path(dir: &Path, id: &str) -> Result<PathBuf> {
 pub fn log_path(dir: &Path, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(dir.join(format!("{id}.log")))
+}
+
+/// `<dir>/<id>.control.sock`, the typed control channel that rides
+/// alongside the raw ACP relay `<id>.sock`. Deriving it from the main
+/// socket keeps the runner (which binds it) and the daemon (which dials
+/// it) in agreement without either needing the workers dir: `x.sock`
+/// becomes `x.control.sock`. Session ids are validated (alphanumeric,
+/// `-`, `_`) so they never carry a `.` that would confuse the extension
+/// swap. Phase A of #1054.
+pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
+    // Guard against self-application: feeding an already-derived control
+    // path would silently yield `x.control.control.sock`. All callers pass
+    // the main `.sock`; this makes future misuse loud in debug builds.
+    debug_assert!(
+        !main_socket.to_string_lossy().ends_with(".control.sock"),
+        "control_socket_sibling called on an already-derived control path: {}",
+        main_socket.display()
+    );
+    main_socket.with_extension("control.sock")
 }
 
 /// `<dir>/<id>.restart`, a sentinel that distinguishes a restart-driven

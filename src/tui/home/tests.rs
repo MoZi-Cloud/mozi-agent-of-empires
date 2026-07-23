@@ -1,11 +1,12 @@
 //! Tests for HomeView
 
+use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -15,10 +16,8 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-fn setup_test_home(temp: &TempDir) {
-    std::env::set_var("HOME", temp.path());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+    isolate_app_dir_at(temp.path())
 }
 
 fn seed_instances(view: &mut HomeView, insts: &[Instance]) {
@@ -26,14 +25,15 @@ fn seed_instances(view: &mut HomeView, insts: &[Instance]) {
 }
 
 struct TestEnv {
-    _temp: TempDir,
     view: HomeView,
+    _guard: AppDirGuard,
+    _temp: TempDir,
 }
 
 fn create_test_env_empty() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
@@ -45,7 +45,11 @@ fn create_test_env_empty() -> TestEnv {
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 // #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
@@ -55,6 +59,7 @@ fn create_test_env_empty() -> TestEnv {
 // counts a session that never existed. Asserts deltas (not absolutes) since the
 // counter is a process-global shared with the `telemetry_creates` serial group.
 #[test]
+#[serial]
 #[serial_test::serial(telemetry_creates)]
 fn add_instance_counts_only_finalized_creates() {
     use crate::session::Status;
@@ -85,7 +90,7 @@ fn add_instance_counts_only_finalized_creates() {
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
@@ -118,7 +123,7 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
 #[serial]
 async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let profile_name = "<global>";
     let _storage = Storage::new_unwatched(profile_name).unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -144,7 +149,7 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
 #[serial]
 fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(
@@ -177,7 +182,7 @@ fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
 #[serial]
 fn interactive_refresh_reopens_hotkey_warning_dialog() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(
@@ -206,7 +211,7 @@ fn interactive_refresh_reopens_hotkey_warning_dialog() {
 #[serial]
 fn watcher_refresh_stashes_pending_watcher_theme() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
@@ -234,7 +239,7 @@ fn watcher_refresh_stashes_pending_watcher_theme() {
 #[serial]
 fn interactive_refresh_does_not_stash_pending_watcher_theme() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
@@ -261,7 +266,7 @@ fn interactive_refresh_does_not_stash_pending_watcher_theme() {
 #[serial]
 fn take_pending_watcher_theme_clears_the_field() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
     let mut view = HomeView::new(
@@ -286,7 +291,7 @@ fn take_pending_watcher_theme_clears_the_field() {
 fn watcher_refresh_stashes_global_theme_not_profile_override() {
     use crate::session::profile_config::{save_profile_config, ProfileConfig};
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
@@ -320,7 +325,7 @@ fn watcher_refresh_stashes_global_theme_not_profile_override() {
 #[serial]
 fn second_watcher_refresh_overwrites_stale_stash() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
     let mut view = HomeView::new(
@@ -344,10 +349,39 @@ fn second_watcher_refresh_overwrites_stale_stash() {
     );
 }
 
+/// Render the view once into an off-screen backend so geometry-dependent
+/// fields (`list_inner_area`, `shelf_inner_area`, scroll offsets) reflect a
+/// real layout. Needed by mouse tests that click rows in the pinned Trash /
+/// Archived shelf, whose position can't be faked the way `setup_inner` fakes
+/// the flat list rect.
+fn render_geometry(view: &mut HomeView) {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+}
+
+/// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
+/// `idx`, after `render_geometry` has populated `shelf_inner_area`. Assumes the
+/// shelf isn't scrolled (true for the small fixtures these tests build).
+fn shelf_row_for_idx(view: &HomeView, idx: usize) -> u16 {
+    let list_len = view.shelf_start().expect("a shelf must be present");
+    assert!(idx >= list_len, "idx {idx} is in the list, not the shelf");
+    view.shelf_inner_area.y + (idx - list_len) as u16
+}
+
 fn create_test_env_with_sessions(count: usize) -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
     for i in 0..count {
@@ -374,7 +408,11 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 /// Disable trash-first delete for tests that assert the permanent-delete
@@ -384,28 +422,26 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
 /// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
 /// writes into the test HOME. See #2489.
 fn disable_delete_to_trash() {
-    let mut config = crate::session::config::load_config()
-        .unwrap()
-        .unwrap_or_default();
-    config.session.delete_to_trash = false;
-    crate::session::config::save_config(&config).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.delete_to_trash = false;
+    })
+    .unwrap();
 }
 
 /// Turn on `session.confirm_delete` so `d` guards the trash with a
 /// confirmation dialog instead of trashing on the keystroke. Must run after
 /// `setup_test_home` so it writes into the test HOME. See #2583.
 fn enable_confirm_delete() {
-    let mut config = crate::session::config::load_config()
-        .unwrap()
-        .unwrap_or_default();
-    config.session.confirm_delete = true;
-    crate::session::config::save_config(&config).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.confirm_delete = true;
+    })
+    .unwrap();
 }
 
 fn create_test_env_with_groups() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
@@ -438,14 +474,18 @@ fn create_test_env_with_groups() -> TestEnv {
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 fn create_test_env_with_mixed_sessions() -> TestEnv {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
@@ -483,7 +523,11 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 #[test]
@@ -568,6 +612,146 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     assert!(
         shown_live.contains("Profile:"),
         "a shown header stays shown in live mode (flag, not mode, governs it).\n{shown_live}"
+    );
+}
+
+/// The app-level global keybindings defer Ctrl+C to live-send via this
+/// predicate (#2894). It is true only while live mode owns the keyboard: an
+/// overlay opened on top of live mode takes focus back, and Ctrl+C should
+/// then behave normally.
+#[test]
+#[serial]
+fn is_live_send_capturing_tracks_state_and_overlays() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+
+    assert!(
+        !env.view.is_live_send_capturing(),
+        "no live-send means the keyboard is not captured"
+    );
+
+    env.view.live_send = Some(LiveSendState {
+        session_id: id.clone(),
+        title: "session0".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+    assert!(
+        env.view.is_live_send_capturing(),
+        "live-send with no overlay captures the keyboard"
+    );
+
+    // An overlay over live mode hands focus back to the overlay, so Ctrl+C
+    // must stop being routed to the agent.
+    env.view.info_dialog = Some(InfoDialog::new("t", "b"));
+    assert!(
+        !env.view.is_live_send_capturing(),
+        "an overlay over live-send releases the capture"
+    );
+}
+
+/// #2894: in live mode Ctrl+C is forwarded to the agent (an interrupt), not
+/// treated as a quit, and each forward arms the footer reminder. Drives the
+/// real `handle_key` routing with the default `C-q` exit chord present so the
+/// test proves Ctrl+C is distinct from exiting.
+#[test]
+#[serial]
+fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let inst = env.view.instance_at(0).clone();
+
+    // Match the generated tmux name so the drift guard doesn't tear live mode
+    // down before the key is translated.
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+
+    assert!(!env.view.live_send_ctrl_c_flash_active());
+
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let action = env.view.handle_key(ctrl_c, None);
+
+    assert!(
+        action.is_none(),
+        "Ctrl+C in live mode produces no home-view action"
+    );
+    assert!(
+        env.view.live_send.is_some(),
+        "Ctrl+C reaches the agent; it must not exit live mode"
+    );
+    assert!(
+        env.view.live_send_ctrl_c_flash_active(),
+        "forwarding Ctrl+C arms the footer reminder"
+    );
+}
+
+/// The live-send footer renders the "Ctrl+C sent to agent" reminder only
+/// while the flash window is open (#2894).
+#[test]
+#[serial]
+fn ctrl_c_flash_renders_in_live_footer() {
+    use super::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.view_mode = ViewMode::Structured;
+    let theme = load_theme("empire");
+
+    let render_to_string = |view: &mut HomeView| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    env.view.live_send = Some(LiveSendState {
+        session_id: id.clone(),
+        title: "session0".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+
+    let without = render_to_string(&mut env.view);
+    assert!(
+        !without.contains("Ctrl+C sent to agent"),
+        "the reminder must be absent before any Ctrl+C\n{without}"
+    );
+
+    env.view.flash_ctrl_c_hint();
+    let with = render_to_string(&mut env.view);
+    assert!(
+        with.contains("Ctrl+C sent to agent"),
+        "the reminder must render while the flash window is open\n{with}"
     );
 }
 
@@ -731,6 +915,120 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
     assert!(
         !render(&mut env).contains('●'),
         "an archived unread row must not paint the unread dot"
+    );
+}
+
+/// Unread is an Agent-view concept: the dot marks agent output the user hasn't
+/// seen. The paired terminal has no such notion, so Terminal view must never
+/// paint the unread dot even when the underlying instance carries the flag.
+#[test]
+#[serial]
+fn unread_dot_never_paints_in_terminal_view() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Agent view: the idle unread row paints the dot (baseline sanity).
+    env.view.view_mode = ViewMode::Structured;
+    assert!(
+        render(&mut env).contains('●'),
+        "agent view should paint the unread dot for an idle unread row"
+    );
+
+    // Terminal view: same instance, no dot. The terminal pane isn't running
+    // (no tmux session in the test env), so the row shows its idle glyph.
+    env.view.view_mode = ViewMode::Terminal;
+    assert!(
+        !render(&mut env).contains('●'),
+        "terminal view must not paint the unread dot"
+    );
+}
+
+/// Stop targets what the user is looking at: Agent view arms the
+/// `stop_session` confirm (agent + container stop), while Terminal and Tool
+/// views route to their respective pane-kill paths and never arm an agent
+/// stop. The routing decision lives in `stop_selected`.
+#[test]
+#[serial]
+fn stop_in_terminal_view_does_not_target_agent_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+    env.view.selected_session = Some(id.clone());
+
+    // Agent view: Stop arms the agent-session stop and opens its confirm.
+    env.view.view_mode = ViewMode::Structured;
+    env.view.stop_selected();
+    assert_eq!(
+        env.view.pending_stop_session.as_deref(),
+        Some(id.as_str()),
+        "agent view stop must arm the agent-session stop"
+    );
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "agent view stop must open the stop-session confirm"
+    );
+
+    env.view.confirm_dialog = None;
+    env.view.pending_stop_session = None;
+
+    // Terminal view: Stop must never touch the agent session. With no live
+    // terminal in the test env the terminal-kill path no-ops, but the critical
+    // invariant is that no agent stop was armed and the stop-session confirm
+    // never opened.
+    env.view.view_mode = ViewMode::Terminal;
+    env.view.stop_selected();
+    assert!(
+        env.view.pending_stop_session.is_none(),
+        "terminal view stop must not arm an agent-session stop"
+    );
+    assert_ne!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "terminal view stop must not open the stop-session confirm"
+    );
+
+    // Tool view: same invariant, Stop routes to the tool-kill path and never
+    // arms an agent stop.
+    env.view.view_mode = ViewMode::Tool("lazygit".to_string());
+    env.view.stop_selected();
+    assert!(
+        env.view.pending_stop_session.is_none(),
+        "tool view stop must not arm an agent-session stop"
+    );
+    assert_ne!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("stop_session"),
+        "tool view stop must not open the stop-session confirm"
     );
 }
 
@@ -1349,7 +1647,7 @@ fn test_enter_on_session_returns_attach_action() {
 fn test_enter_on_acp_session_opens_structured_view() {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = vec![
         Instance::new("plain", "/tmp/0"),
@@ -1475,7 +1773,7 @@ fn test_reload_after_enter_preserves_search_state() {
     // Regression guard for #2676: `refresh_search_matches` wipes matches
     // whenever the query is empty. If Enter cleared search_query, the very
     // next storage/config reload would destroy the matches Enter promised
-    // to keep, silently breaking n/N cycling.
+    // to keep, silently breaking `n` match cycling.
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
     env.view.handle_key(key(KeyCode::Char('s')), None);
@@ -1576,15 +1874,18 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     env.view.handle_key(key(KeyCode::Char('n')), None);
     assert_eq!(env.view.search_match_index, 0, "n wraps to first");
 
+    // #3038: Shift+N never cycles. Even with a committed search live, it opens
+    // the new-from-selection dialog and leaves the match index untouched.
+    assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(
-        env.view.search_match_index,
-        n_matches - 1,
-        "N wraps to last"
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Shift+N opens new-from-selection even during a committed search"
     );
-
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(env.view.search_match_index, n_matches - 2);
+    assert_eq!(
+        env.view.search_match_index, 0,
+        "Shift+N must not cycle the search"
+    );
 }
 
 #[test]
@@ -1756,16 +2057,70 @@ fn test_search_n_wraps_around() {
 
 #[test]
 #[serial]
-fn test_search_shift_n_cycles_backward() {
+fn test_search_shift_n_opens_new_from_selection_not_cycle() {
+    // #3038 regression guard: after a committed search, Shift+N must create a
+    // new session (new-from-selection), not jump to the previous match. Before
+    // #3038 the committed search shadowed Shift+N with a reverse-cycle.
     let mut env = create_test_env_with_sessions(5);
     env.view.search_query = Input::new("session".to_string());
     env.view.update_search();
-    let match_count = env.view.search_matches.len();
-    assert!(match_count > 1);
+    assert!(env.view.search_matches.len() > 1);
+    assert_eq!(env.view.search_match_index, 0);
 
-    // N from index 0 should wrap to last
+    assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert_eq!(env.view.search_match_index, match_count - 1);
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Shift+N opens new-from-selection during a committed search"
+    );
+    assert_eq!(
+        env.view.search_match_index, 0,
+        "Shift+N must not cycle the search backward"
+    );
+}
+
+#[test]
+#[serial]
+fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
+    // #3038 follow-up: a search match must not recolor the status spinner. A
+    // running match used to paint its spinner theme.search (amber in most
+    // themes), which read as "waiting" while the true status was running. The
+    // spinner and title must keep the running status color and highlight with
+    // bold only.
+    use ratatui::style::Modifier;
+
+    let (env, running, _waiting) = attention_env_running_then_waiting();
+    let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+    assert_ne!(
+        theme.running, theme.search,
+        "test needs distinct running vs search colors to be meaningful"
+    );
+
+    let item = env.view.flat_items[running].clone();
+    let line = env.view.render_item_line(&item, false, true, &theme, 80);
+
+    // Spans: [indent, spinner, title, ...].
+    let spinner = &line.spans[1];
+    let title = &line.spans[2];
+
+    assert_eq!(
+        spinner.style.fg,
+        Some(theme.running),
+        "matched spinner must stay the running status color, not theme.search"
+    );
+    assert!(
+        spinner.style.add_modifier.contains(Modifier::BOLD),
+        "matched spinner should highlight with bold"
+    );
+    assert_eq!(
+        title.style.fg,
+        Some(theme.running),
+        "matched title keeps the running status color"
+    );
+    assert!(
+        title.style.add_modifier.contains(Modifier::BOLD),
+        "matched title should highlight with bold"
+    );
 }
 
 #[test]
@@ -1778,6 +2133,122 @@ fn test_esc_clears_search_matches() {
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.search_matches.is_empty());
     assert_eq!(env.view.search_match_index, 0);
+}
+
+#[test]
+#[serial]
+fn committed_search_keeps_bar_visible_until_esc() {
+    // The searched text should stay pinned at the bottom of the list after you
+    // press Enter, until you Esc out. `search_bar_visible` gates both the render
+    // and the list-row reservation, so it must stay true through a commit.
+    let mut env = create_test_env_with_sessions(5);
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    assert!(env.view.search_active);
+    assert!(env.view.search_bar_visible());
+
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(!env.view.search_active, "Enter commits the search");
+    assert!(!env.view.search_matches.is_empty(), "matches are kept");
+    assert!(
+        env.view.search_bar_visible(),
+        "the committed bar stays visible so the query is still shown"
+    );
+    assert_eq!(
+        env.view.search_query.value(),
+        "s",
+        "the searched text persists in the bar"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.search_bar_visible(),
+        "Esc clears the search and hides the bar"
+    );
+}
+
+#[test]
+#[serial]
+fn committed_zero_result_search_keeps_bar_visible() {
+    // A committed search that matched nothing is still something you searched
+    // for: the bar must stay visible (showing `/query [0/0]`) until Esc, rather
+    // than vanishing the instant you press Enter. Gating on the committed query
+    // rather than on matches keeps it visible.
+    let mut env = create_test_env_with_sessions(5);
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    for ch in ['z', 'q', 'x', 'w', 'v'] {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    assert!(
+        env.view.search_matches.is_empty(),
+        "the query is expected to match no session"
+    );
+
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        !env.view.search_active,
+        "Enter commits even with no matches"
+    );
+    assert!(env.view.search_matches.is_empty());
+    assert!(
+        env.view.search_bar_visible(),
+        "a committed zero-result search keeps the bar (and query) visible"
+    );
+    assert_eq!(env.view.search_query.value(), "zqxwv");
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.search_bar_visible(),
+        "Esc clears the committed zero-result search"
+    );
+}
+
+#[test]
+#[serial]
+fn committed_search_bar_renders_query_after_enter() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(5);
+    let theme = load_theme("empire");
+
+    let render_to_string = |view: &mut HomeView| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    for ch in ['/', 's', 'e', 's', 's'] {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(!env.view.search_active);
+    assert!(
+        !env.view.search_matches.is_empty(),
+        "query must match a row"
+    );
+
+    let screen = render_to_string(&mut env.view);
+    // The `/`-prefixed query is unique to the bar (session titles carry no
+    // leading slash), so its presence proves the committed bar rendered.
+    assert!(
+        screen.contains("/sess"),
+        "committed search bar must still render the query after Enter"
+    );
 }
 
 #[test]
@@ -1799,12 +2270,13 @@ fn test_esc_clears_matches_so_n_opens_new_dialog() {
 // `new_session_with_selection` counter crosses its threshold. Set that on disk
 // and refresh the cached badge so a test starts with the tip eligible.
 fn earn_tip(env: &mut TestEnv) {
-    let mut config = crate::session::config::load_config()
+    crate::session::config::update_app_state(|state| {
+        state.new_session_with_selection_count = crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
+    })
+    .unwrap();
+    let config = crate::session::config::load_config()
         .unwrap()
         .unwrap_or_default();
-    config.app_state.new_session_with_selection_count =
-        crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
-    crate::session::config::save_config(&config).unwrap();
     env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
 }
 
@@ -2321,7 +2793,7 @@ fn test_uppercase_p_picker_esc_closes() {
 #[serial]
 fn test_uppercase_p_picker_switch_profile() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     crate::session::create_profile("first").unwrap();
     crate::session::create_profile("second").unwrap();
@@ -2523,7 +2995,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
     use crate::session::{GroupTree, SandboxInfo};
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
@@ -2575,7 +3047,11 @@ fn create_test_env_with_group_sessions() -> TestEnv {
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 /// Trashing and restoring a session through the view's own actions keeps the
@@ -2632,7 +3108,7 @@ fn test_group_has_managed_worktrees() {
     use chrono::Utc;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
@@ -2680,7 +3156,7 @@ fn test_group_has_containers() {
     use crate::session::SandboxInfo;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
@@ -2855,7 +3331,7 @@ fn test_archive_selected_group_widened_teardown_persists_synchronously() {
 #[serial]
 fn test_archive_selected_group_project_mode() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     // Two sessions sharing one repo, one session in a different repo.
@@ -3014,7 +3490,7 @@ fn test_delete_group_with_sessions_respects_worktree_option() {
     use chrono::Utc;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
@@ -3076,7 +3552,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
     use crate::tui::dialogs::GroupDeleteOptions;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
@@ -3707,7 +4183,7 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut running = Instance::new("running", "/tmp/running");
@@ -3735,7 +4211,11 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     view.sort_order = SortOrder::Attention;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    let env = TestEnv { _temp: temp, view };
+    let env = TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    };
 
     let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
         Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
@@ -3755,7 +4235,7 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut running = Instance::new("running", "/tmp/running");
@@ -3783,7 +4263,11 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
     view.sort_order = SortOrder::Attention;
     view.flat_items = view.build_flat_items();
     view.update_selected();
-    let env = TestEnv { _temp: temp, view };
+    let env = TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    };
 
     let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
         Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
@@ -3862,7 +4346,7 @@ fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort()
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut alpha_idle = Instance::new("alpha-idle", "/repos/alpha");
@@ -4367,7 +4851,7 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
 #[serial]
 fn test_all_profiles_view_loads_from_multiple_profiles() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
@@ -4412,7 +4896,7 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
 #[serial]
 fn test_filtered_view_loads_single_profile() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
@@ -4458,7 +4942,7 @@ fn test_filtered_view_loads_single_profile() {
 #[serial]
 fn test_all_profiles_view_has_no_profile_headers() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
@@ -4504,7 +4988,7 @@ fn test_all_profiles_view_has_no_profile_headers() {
 #[serial]
 fn test_all_profiles_view_shows_all_sessions_flat() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
@@ -4560,7 +5044,7 @@ fn rendered_single_session_text(
     row_tag_mode: crate::session::config::RowTagMode,
 ) -> String {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage = Storage::new_unwatched("alpha").unwrap();
     let instances = vec![inst];
@@ -4617,7 +5101,7 @@ fn test_default_row_tag_mode_renders_branch_tag() {
 #[serial]
 fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
@@ -4675,7 +5159,7 @@ fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
 #[serial]
 fn test_row_tag_auto_omits_tag_in_filtered_view() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
@@ -4723,7 +5207,7 @@ fn test_row_tag_auto_omits_tag_in_filtered_view() {
 #[serial]
 fn test_row_tag_profile_renders_in_filtered_view() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
@@ -4798,7 +5282,7 @@ fn test_row_tag_branch_renders_when_branch_differs_from_title() {
 #[serial]
 fn test_row_tag_branch_renders_when_title_matches_branch() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage = Storage::new_unwatched("alpha").unwrap();
     // Title and branch MATCH, so the divergence display stays quiet.
@@ -4943,7 +5427,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
 #[serial]
 fn test_row_tag_auto_skips_for_empty_source_profile() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let storage = Storage::new_unwatched("legacy").unwrap();
     let mut inst = Instance::new("Legacy1", "/tmp/legacy");
@@ -4982,7 +5466,7 @@ fn test_create_session_in_all_mode_is_findable() {
     use crate::tui::dialogs::NewSessionData;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // Create a profile so "all" mode has something
     let storage = Storage::new_unwatched("alpha").unwrap();
@@ -5025,6 +5509,7 @@ fn test_create_session_in_all_mode_is_findable() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -5046,7 +5531,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // Create alpha with group "work" (collapsed)
     let storage_a = Storage::new_unwatched("alpha").unwrap();
@@ -5134,7 +5619,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
 #[serial]
 fn test_create_profile_rejects_reserved_name_all() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("default").unwrap();
 
     let result = crate::session::create_profile("all");
@@ -5155,7 +5640,7 @@ fn test_delete_group_scoped_to_owning_profile() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // Create alpha with group "work"
     let storage_a = Storage::new_unwatched("alpha").unwrap();
@@ -5260,7 +5745,7 @@ fn test_group_delete_dialog_scoped_to_owning_profile() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // alpha owns an EMPTY "work" group (group exists, no sessions).
     let storage_a = Storage::new_unwatched("alpha").unwrap();
@@ -5335,7 +5820,7 @@ fn test_rename_profile_change_prunes_source_group() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // alpha has one session in "work"; beta exists but is empty.
     let storage_a = Storage::new_unwatched("alpha").unwrap();
@@ -5828,7 +6313,7 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     use crate::session::WorktreeInfo;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst = Instance::new("worktree-session", "/tmp/repo-worktrees/feature-branch");
@@ -5957,7 +6442,7 @@ fn test_rename_selected_group_with_children() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("parent-session", "/tmp/p");
@@ -6064,7 +6549,7 @@ fn test_rename_group_removes_old_path() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst = Instance::new("work-session", "/tmp/w");
@@ -6108,7 +6593,7 @@ fn test_rename_group_empty_group() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let instances: Vec<Instance> = vec![];
@@ -6158,7 +6643,7 @@ fn test_rename_group_duplicate_returns_error() {
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/w");
@@ -6198,15 +6683,16 @@ fn test_rename_group_duplicate_returns_error() {
 #[test]
 #[serial]
 fn test_rename_group_resort_az() {
-    use crate::session::config::{save_config, Config, SortOrder};
+    use crate::session::config::SortOrder;
     use crate::session::GroupTree;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
-    let mut config = Config::default();
-    config.app_state.sort_order = Some(SortOrder::AZ);
-    save_config(&config).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.sort_order = Some(SortOrder::AZ);
+    })
+    .unwrap();
 
     let storage = Storage::new_unwatched("test").unwrap();
 
@@ -6297,7 +6783,7 @@ fn test_apply_creation_results_returns_session_id() {
     use crate::tui::dialogs::NewSessionData;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -6332,6 +6818,7 @@ fn test_apply_creation_results_returns_session_id() {
         command_override: String::new(),
         scratch: false,
         fork_seed: None,
+        structured: false,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -6435,7 +6922,7 @@ fn test_cursor_follows_session_after_deletion() {
 #[serial]
 fn home_defaults_to_agent_when_config_unset() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -6852,7 +7339,6 @@ fn apply_status_update_runs_status_hook_on_transition() {
     };
     env.view.status_hook_config = StatusHookConfig {
         enabled: true,
-        debounce_ms: 0,
         on_waiting: Some("notify-waiting".to_string()),
         on_change: Some("notify-change".to_string()),
         ..Default::default()
@@ -6891,7 +7377,6 @@ fn all_profiles_status_hook_lookup_uses_cache() {
         "cached".to_string(),
         StatusHookConfig {
             enabled: true,
-            debounce_ms: 0,
             on_waiting: Some("notify-cached".to_string()),
             ..Default::default()
         },
@@ -6919,7 +7404,6 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
     };
     env.view.status_hook_config = StatusHookConfig {
         enabled: true,
-        debounce_ms: 0,
         on_change: Some("notify-change".to_string()),
         ..Default::default()
     };
@@ -6952,7 +7436,6 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
     };
     env.view.status_hook_config = StatusHookConfig {
         enabled: true,
-        debounce_ms: 0,
         on_waiting: Some("notify-waiting".to_string()),
         ..Default::default()
     };
@@ -6986,7 +7469,6 @@ fn set_instance_status_runs_status_hook_on_transition() {
     };
     env.view.status_hook_config = StatusHookConfig {
         enabled: true,
-        debounce_ms: 0,
         on_error: Some("notify-error".to_string()),
         ..Default::default()
     };
@@ -7532,6 +8014,574 @@ fn trashing_leaves_collapsed_trash_section_collapsed() {
     );
 }
 
+/// Regression: trashing must offload the blocking teardown (tmux kill, the
+/// ~10s `docker stop`, and the worktree relocation) to the `TrashPoller`
+/// instead of running it on the input thread, which froze the TUI while the
+/// sandbox container stopped. The durable trash marker is still written inline
+/// so the row flips to Trashed instantly; the teardown is merely queued.
+#[test]
+#[serial]
+fn trash_offloads_blocking_teardown_to_poller() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    // Inline: the row is durably trashed the instant the key is handled.
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "trash marker must be written inline for instant feedback"
+    );
+    // Off-thread: the blocking teardown is in flight on the worker, tracked in
+    // its pending set until a result is drained. If trashing had run the
+    // teardown inline (the frozen-TUI bug), nothing would be queued here.
+    let pending = env.view.trash_poller.take_pending();
+    assert_eq!(
+        pending,
+        vec![id],
+        "trash teardown must be queued on the TrashPoller, not run on the input thread"
+    );
+}
+
+/// Trashing marks the teardown as in flight on the durable row: `d` sets the
+/// Trash claim under the storage flock so peer processes observe the teardown
+/// as state instead of inferring it. Driven directly against storage because
+/// `merge_user_action_diff` deliberately drops `op_claim` (#2541).
+#[test]
+#[serial]
+fn trash_sets_durable_teardown_claim() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    let rows = env.view.storages.get("test").unwrap().load().unwrap();
+    let row = rows.iter().find(|i| i.id == id).unwrap();
+    assert!(row.is_trashed());
+    assert_eq!(
+        row.op_claim.as_ref().map(|c| c.op),
+        Some(crate::session::ClaimOp::Trash),
+        "the durable row must carry the in-flight Trash claim"
+    );
+}
+
+/// The teardown's no-relocation terminal path releases the durable Trash
+/// claim: a plain (non-worktree) session's teardown ends in `Skipped`, and
+/// draining that result must clear the claim set at `d` time, leaving a
+/// trashed row with no in-flight marker.
+#[test]
+#[serial]
+fn trash_teardown_release_clears_durable_claim() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+    let row = |view: &HomeView| {
+        view.storages
+            .get("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap()
+    };
+    assert_eq!(
+        row(&env.view).op_claim.as_ref().map(|c| c.op),
+        Some(crate::session::ClaimOp::Trash),
+        "claim set at d time"
+    );
+
+    // Drain the worker's (Skipped) teardown result; the drain is the
+    // terminal path and must release the claim.
+    let mut drained = false;
+    for _ in 0..100 {
+        env.view.apply_trash_results();
+        if !env.view.trash_poller.is_pending(&id) {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(drained, "teardown result never drained");
+    let final_row = row(&env.view);
+    assert!(final_row.is_trashed(), "row stays trashed");
+    assert_eq!(
+        final_row.op_claim, None,
+        "Skipped teardown must release the Trash claim"
+    );
+}
+
+/// End-to-end `d`-then-restore handoff through the TUI: the restore seizes
+/// the teardown's fresh Trash claim (instant, no lockout), commits untrash,
+/// and releases; the teardown's later result then finds nothing to do and
+/// never re-trashes or re-claims the row.
+#[test]
+#[serial]
+fn trash_then_immediate_restore_hands_off_cleanly() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+    // Immediate restore, well inside the teardown window.
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+
+    let row = |view: &HomeView| {
+        view.storages
+            .get("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap()
+    };
+    let restored = row(&env.view);
+    assert!(!restored.is_trashed(), "restore must win instantly");
+    assert_eq!(
+        restored.op_claim, None,
+        "restore seized the Trash claim and released it on commit"
+    );
+
+    // Let the stale teardown result drain; it must not resurrect anything.
+    let mut drained = false;
+    for _ in 0..100 {
+        env.view.apply_trash_results();
+        if !env.view.trash_poller.is_pending(&id) {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(drained, "teardown result never drained");
+    let final_row = row(&env.view);
+    assert!(!final_row.is_trashed(), "row stays restored");
+    assert_eq!(final_row.op_claim, None, "no claim resurrected");
+}
+
+/// Right-clicking the synthetic Trash section header opens the bulk menu
+/// (Empty Trash / Restore All / Collapse), not the meaningless "Rename Group /
+/// Delete Group" a real group would show.
+#[test]
+#[serial]
+fn right_click_trash_header_shows_bulk_menu() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+
+    let header_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| {
+            matches!(it, Item::Group { path, .. }
+                if crate::session::is_trash_section_path(path))
+        })
+        .expect("Trash header must render");
+    render_geometry(&mut env.view);
+    let row = shelf_row_for_idx(&env.view, header_idx);
+    assert!(env.view.handle_right_click(5, row));
+
+    let labels: Vec<&str> = env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    assert_eq!(labels, vec!["Empty Trash", "Restore All", "Collapse"]);
+}
+
+/// Right-clicking the synthetic Archived section header offers Restore All and
+/// the collapse toggle, but no destructive "empty" action (archived rows are
+/// never purged from there).
+#[test]
+#[serial]
+fn right_click_archived_header_shows_restore_menu() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    let header_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| {
+            matches!(it, Item::Group { path, .. }
+                if crate::session::is_archived_section_path(path))
+        })
+        .expect("Archived header must render");
+    render_geometry(&mut env.view);
+    let row = shelf_row_for_idx(&env.view, header_idx);
+    assert!(env.view.handle_right_click(5, row));
+
+    let labels: Vec<&str> = env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    assert_eq!(labels, vec!["Restore All", "Collapse"]);
+}
+
+/// "Empty Trash" routes through a destructive confirm carrying the count; the
+/// confirmed action marks every trashed row for deletion (claimed + Deleting).
+#[test]
+#[serial]
+fn empty_trash_confirm_purges_every_trashed_row() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(3);
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
+    env.view.trash_session_by_id(&a);
+    env.view.trash_session_by_id(&b);
+
+    env.view.prompt_empty_trash();
+    let dialog = env
+        .view
+        .confirm_dialog
+        .as_ref()
+        .expect("Empty Trash must open a confirm dialog");
+    assert_eq!(dialog.action(), "empty_trash");
+
+    env.view.dispatch_confirm_submit("empty_trash");
+    for id in [&a, &b] {
+        let inst = env
+            .view
+            .get_instance(id)
+            .expect("row kept until purge lands");
+        assert_eq!(
+            inst.status,
+            Status::Deleting,
+            "each trashed row must be claimed and marked Deleting"
+        );
+        assert!(
+            env.view.purge_claimed.contains(id),
+            "each row's purge claim must be owned"
+        );
+    }
+}
+
+/// "Empty Trash" on an already-empty trash shows an info dialog instead of a
+/// confirm that would delete nothing.
+#[test]
+#[serial]
+fn empty_trash_on_empty_trash_is_a_noop_info() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.prompt_empty_trash();
+    assert!(env.view.confirm_dialog.is_none());
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Trash is empty")
+    );
+}
+
+/// "Restore All" pulls every trashed session back out of the trash in one go.
+#[test]
+#[serial]
+fn restore_all_from_trash_restores_every_row() {
+    let mut env = create_test_env_with_sessions(3);
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
+    env.view.trash_session_by_id(&a);
+    env.view.trash_session_by_id(&b);
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .count(),
+        2
+    );
+
+    env.view.restore_all_from_trash();
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_trashed())
+            .count(),
+        0,
+        "Restore All must un-trash every row"
+    );
+}
+
+/// "Restore All" on the Archived section unarchives every archived session.
+#[test]
+#[serial]
+fn unarchive_all_unarchives_every_row() {
+    let mut env = create_test_env_with_sessions(3);
+    for i in 0..2 {
+        env.view.cursor = i;
+        env.view.update_selected();
+        env.view.toggle_archive_at_cursor().unwrap();
+    }
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_archived())
+            .count(),
+        2
+    );
+
+    env.view.unarchive_all();
+    assert_eq!(
+        env.view
+            .instances
+            .values()
+            .filter(|i| i.is_archived())
+            .count(),
+        0,
+        "Restore All (archived) must unarchive every row"
+    );
+}
+
+/// The Trash section renders in the pinned shelf with its distinct type glyph,
+/// and the sort indicator moves onto the divider above it.
+#[test]
+#[serial]
+fn shelf_renders_trash_with_glyph_and_divider_sort() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+
+    assert!(
+        screen.contains(super::ICON_TRASH_SECTION),
+        "shelf must show the Trash type glyph"
+    );
+    assert!(
+        screen.contains("Trash (1)"),
+        "shelf must show the Trash count"
+    );
+    assert!(
+        screen.contains("sort:"),
+        "the sort indicator rides the shelf divider"
+    );
+    assert!(
+        env.view.shelf_inner_area.height > 0,
+        "a shelf rect must be populated when trash is present"
+    );
+}
+
+/// Render the full home view into a TestBackend and dump the screen as one
+/// string, for asserting on preview/list text.
+fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// A trashed row whose permanent delete failed carries `Status::Error` +
+/// `last_error` (set by `apply_deletion_results`). The preview must surface
+/// that failure instead of the calm "Trash" placeholder, and the shelf row
+/// must show the error glyph instead of the uniform muted one.
+#[test]
+#[serial]
+fn trashed_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("worktree removal failed: directory locked".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("worktree removal failed"),
+        "a failed delete's error must show in the trashed preview.\n{screen}"
+    );
+    assert!(
+        screen.contains(super::ICON_ERROR),
+        "the shelf row must show the error glyph after a failed delete.\n{screen}"
+    );
+}
+
+/// While a trashed row's permanent delete is running (`Status::Deleting`),
+/// the preview placeholder must say so instead of advertising restore/delete
+/// keys that would race the in-flight purge.
+#[test]
+#[serial]
+fn trashed_preview_shows_deleting_status() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("Deleting"),
+        "an in-flight delete must be visible in the trashed preview.\n{screen}"
+    );
+}
+
+/// An archived row can also be deleted; a failed delete must surface in the
+/// archived preview the same way.
+#[test]
+#[serial]
+fn archived_preview_surfaces_delete_failure() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Error;
+        inst.last_error = Some("container teardown failed".to_string());
+    });
+
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        screen.contains("container teardown failed"),
+        "a failed delete's error must show in the archived preview.\n{screen}"
+    );
+}
+
+/// Restart (`e`) on an archived or trashed row is intentionally refused, but
+/// the refusal must be visible: an info dialog, not a silent no-op.
+#[test]
+#[serial]
+fn restart_on_trashed_row_surfaces_refusal() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_some(),
+        "restarting a trashed row must explain why nothing happened"
+    );
+}
+
+/// While a trashed row's permanent delete is in flight (`Status::Deleting`),
+/// restart must stay a silent drop: the "press z to restore it first" dialog
+/// would race the purge (same rationale as the Deleting preview body, which
+/// drops the restore/delete hints).
+#[test]
+#[serial]
+fn restart_on_deleting_trashed_row_stays_silent() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Deleting;
+    });
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a mid-purge row must not get a restore hint that races the delete"
+    );
+}
+
+/// In compact layouts (< 80 cols) the preview hoists the session's status
+/// icon into the block title. A trashed row must mask a stale persisted
+/// Running status there (no spinner above the "Trash" placeholder body),
+/// matching the archived treatment.
+#[test]
+#[serial]
+fn compact_title_masks_stale_spinner_on_trashed_row() {
+    use crate::session::Status;
+    let mut env = create_test_env_with_sessions(2);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    env.view.select_session_by_id(&id);
+    // Stale persisted live status; the pane was killed on trash.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+    });
+
+    let screen = render_home_to_string(&mut env.view, 70, 40);
+    assert!(
+        screen.contains("Trash"),
+        "trashed placeholder should render.\n{screen}"
+    );
+    // The hoisted preview title starts at the block's top-left corner. With
+    // the mask it carries ICON_STOPPED; unmasked, Running would paint a
+    // time-varying `dots()` spinner frame there instead (a frame set that
+    // never includes ICON_STOPPED, so this pin cannot pass by accident).
+    let masked_title = format!("\u{256d} {} session0", super::ICON_STOPPED);
+    assert!(
+        screen.contains(&masked_title),
+        "a trashed row's compact title must show the stopped icon, not a stale spinner.\n{screen}"
+    );
+}
+
 /// Regression for #2489: `w` (jump to next needing-attention) must skip
 /// trashed rows even when a stale unread flag survived the trash. A trashed
 /// session is stopped and only lives under the Trash section, so it never
@@ -7575,6 +8625,196 @@ fn w_skips_unread_trashed_session() {
         landed.as_deref(),
         Some(trashed.as_str()),
         "`w` must not land on a trashed session even when it is unread"
+    );
+}
+
+/// Snooze is the same "don't bother me" sink state as trash/archive for
+/// every other subsystem (see `Instance::is_snoozed`); `w`'s forward walk
+/// (pass 1) must skip a snoozed session even though it is otherwise
+/// `Status::Waiting`, exactly the state `w` is looking for. A third,
+/// eligible `Status::Waiting` control session proves the walk actually
+/// found and landed on a real target rather than merely failing to land
+/// on the snoozed one (with only two sessions "landed != snoozed" would
+/// hold trivially even if `w` did nothing at all).
+#[test]
+#[serial]
+fn w_skips_snoozed_waiting_session() {
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(3);
+    env.view.strict_hotkeys = false;
+
+    let snoozed = env.view.instances[0].id.clone();
+    let active = env.view.instances[1].id.clone();
+    let control = env.view.instances[2].id.clone();
+    // The active row is a plain idle session the cursor starts on; the
+    // control row is a legitimate, non-dismissed Waiting session `w` should
+    // land on; the snoozed row is otherwise Waiting too, as it would be if
+    // it started waiting on input before being snoozed.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&control, |inst| inst.status = Status::Waiting);
+    env.view.mutate_instance(&snoozed, |inst| {
+        inst.status = Status::Waiting;
+        inst.snooze(30);
+    });
+    assert!(env.view.get_instance(&snoozed).unwrap().is_snoozed());
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(snoozed.as_str()),
+        "`w` must not land on a snoozed session even though it is Waiting"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(control.as_str()),
+        "`w` must land on the eligible Waiting session, proving the forward walk actually ran"
+    );
+}
+
+/// Same contract as `w_skips_snoozed_waiting_session`, but for the pass-2
+/// idle fallback: with the only Idle candidate snoozed, `w` must not treat
+/// it as the "most-recently-accessed Idle session" fallback target.
+#[test]
+#[serial]
+fn w_skips_snoozed_idle_session_in_fallback() {
+    let (mut env, running, idle) = attention_env_running_then_idle();
+    let running_id = match env.view.flat_items.get(running) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the running row to be a session item"),
+    };
+    let idle_id = match env.view.flat_items.get(idle) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the idle row to be a session item"),
+    };
+    env.view.mutate_instance(&idle_id, |inst| inst.snooze(30));
+    assert!(env.view.get_instance(&idle_id).unwrap().is_snoozed());
+
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(idle_id.as_str()),
+        "`w` must not fall back to a snoozed session even when it is the only Idle candidate"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(running_id.as_str()),
+        "with no eligible target, `w` must leave the cursor on the Running session"
+    );
+}
+
+/// Archive is the same "don't bother me" sink state as trash/snooze (see
+/// `Instance::archive`'s mutual-exclusion doc comment: archive is "the
+/// strongest dismiss"); `w`'s forward walk (pass 1) must skip an archived
+/// session even though it is otherwise `Status::Waiting`, exactly the state
+/// `w` is looking for. A third, eligible `Status::Waiting` control session
+/// proves the walk actually found and landed on a real target rather than
+/// merely failing to land on the archived one (with only two sessions
+/// "landed != archived" would hold trivially even if `w` did nothing at
+/// all).
+#[test]
+#[serial]
+fn w_skips_archived_waiting_session() {
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(3);
+    env.view.strict_hotkeys = false;
+    // Keep the Archived section expanded so the archived row lands in
+    // `flat_items`; that is the only way `w`'s walk could reach it.
+    env.view.archived_section_collapsed = false;
+
+    let archived = env.view.instances[0].id.clone();
+    let active = env.view.instances[1].id.clone();
+    let control = env.view.instances[2].id.clone();
+    // The active row is a plain idle session the cursor starts on; the
+    // control row is a legitimate, non-dismissed Waiting session `w` should
+    // land on; the archived row is otherwise Waiting too, as it would be if
+    // it started waiting on input before being archived.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&control, |inst| inst.status = Status::Waiting);
+    env.view.mutate_instance(&archived, |inst| {
+        inst.status = Status::Waiting;
+        inst.archive();
+    });
+    assert!(env.view.get_instance(&archived).unwrap().is_archived());
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(archived.as_str()),
+        "`w` must not land on an archived session even though it is Waiting"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(control.as_str()),
+        "`w` must land on the eligible Waiting session, proving the forward walk actually ran"
+    );
+}
+
+/// Same contract as `w_skips_archived_waiting_session`, but for the pass-2
+/// idle fallback: with the only Idle candidate archived, `w` must not treat
+/// it as the "most-recently-accessed Idle session" fallback target.
+#[test]
+#[serial]
+fn w_skips_archived_idle_session_in_fallback() {
+    let (mut env, running, idle) = attention_env_running_then_idle();
+    let running_id = match env.view.flat_items.get(running) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the running row to be a session item"),
+    };
+    let idle_id = match env.view.flat_items.get(idle) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the idle row to be a session item"),
+    };
+    // `mutate_instance` updates the instance in place without rebuilding
+    // `flat_items`, so the now-archived row stays at its original index
+    // (pass 2 re-derives its dismissed state from the live instance, not
+    // from `flat_items`, so this still exercises the real code path).
+    env.view.mutate_instance(&idle_id, |inst| inst.archive());
+    assert!(env.view.get_instance(&idle_id).unwrap().is_archived());
+
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(idle_id.as_str()),
+        "`w` must not fall back to an archived session even when it is the only Idle candidate"
+    );
+    assert_eq!(
+        landed.as_deref(),
+        Some(running_id.as_str()),
+        "with no eligible target, `w` must leave the cursor on the Running session"
     );
 }
 
@@ -8017,7 +9257,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     }
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
@@ -8040,6 +9280,15 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
             Ok(())
         })
         .unwrap();
+
+    // A real prior conversation on disk so the restart drives the --resume
+    // cascade (and its ResumeFailed path). A stored sid with no transcript now
+    // launches fresh-pinned (`--session-id`), which would not surface here.
+    let claude_dir = temp.path().join(".claude").join("projects").join(
+        crate::session::capture::encode_claude_project_path("/tmp/x"),
+    );
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
@@ -8239,7 +9488,7 @@ fn delete_selected_refused_during_restart() {
 fn create_test_env_two_projects_mixed_attention() -> TestEnv {
     use crate::session::Status;
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     let mut alpha_waiting = Instance::new("alpha-waiting", "/repos/alpha");
@@ -8268,7 +9517,11 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    TestEnv { _temp: temp, view }
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 /// Project grouping must survive Attention sort. Previously `build_flat_items`
@@ -8515,12 +9768,23 @@ fn p_key_pins_project_on_header() {
     );
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
+    // A successful pin stays quiet: the header's pin icon is feedback enough,
+    // so there is no dialog to dismiss.
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a successful pin must not raise an info dialog"
+    );
 
     // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
     // so the entry stays in the registry (only an explicit remove deletes it).
     // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    // A successful unpin is likewise quiet.
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a successful unpin must not raise an info dialog"
+    );
     // The specific entry is kept (not just "registry non-empty") with its pin
     // flag cleared: unpin keeps the saved project, only Remove deletes it.
     let after = crate::session::projects::load_global().unwrap();
@@ -8641,7 +9905,7 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
     // A live session in another project, plus an ARCHIVED session whose repo
@@ -8871,7 +10135,7 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     use crate::session::projects::{self, Project, ProjectScope};
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // Two discoverable profiles, each with a session.
     for (profile, title, path) in [
@@ -8929,7 +10193,7 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     use crate::session::projects::{self, Project, ProjectScope};
 
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
 
     // Two discoverable profiles, each with a session, so all-profiles mode
     // loads both registries.
@@ -9223,7 +10487,7 @@ fn manual_grouping_attention_sort_stays_flat() {
 #[serial]
 fn prune_empty_group_drops_source_when_no_session_remains() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
     let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -9260,7 +10524,7 @@ fn prune_empty_group_drops_source_when_no_session_remains() {
 #[serial]
 fn prune_empty_group_keeps_source_when_sibling_session_remains() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
     let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -9296,7 +10560,7 @@ fn prune_empty_group_keeps_source_when_sibling_session_remains() {
 #[serial]
 fn prune_empty_group_keeps_source_when_descendant_session_remains() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
     let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -9334,7 +10598,7 @@ fn prune_empty_group_keeps_source_when_descendant_session_remains() {
 #[serial]
 fn prune_empty_group_keeps_source_when_descendant_group_remains() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
     let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -9376,7 +10640,7 @@ fn prune_empty_group_keeps_source_when_descendant_group_remains() {
 #[serial]
 fn prune_empty_group_survives_save_and_reload() {
     let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
+    let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
     let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -10052,6 +11316,7 @@ mod scroll_pane_isolation {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all: false,
             position_reliable: true,
         }
     }
@@ -10196,6 +11461,49 @@ mod scroll_pane_isolation {
         // Forwarding never starts an aoe text selection, even passively.
         assert!(env.view.drag_state.is_none());
         assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Bare motion over the preview is forwarded to an any-event-tracking
+    /// (1003) agent so its hover UI (Claude Code's expandable-block
+    /// highlight) works in live mode, deduped per pane cell, and re-armed
+    /// when the pointer leaves the preview and comes back.
+    #[test]
+    #[serial]
+    fn forward_hover_to_preview_reports_once_per_cell() {
+        let mut cursor = alt_screen_cursor(true, true, true);
+        cursor.mouse_all = true;
+        let mut env = live_env_with_cursor(cursor);
+        // The forward maps cells against the previewed pane's rect; give it
+        // the preview area like a rendered frame would.
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+
+        assert!(env.view.forward_hover_to_preview(50, 10));
+        assert_eq!(env.view.hover_forward_cell, Some((21, 11)));
+        // Same cell again: deduped, nothing sent.
+        assert!(!env.view.forward_hover_to_preview(50, 10));
+        // A different cell reports again.
+        assert!(env.view.forward_hover_to_preview(51, 10));
+        assert_eq!(env.view.hover_forward_cell, Some((22, 11)));
+        // Leaving the preview clears the dedup cell (and forwards nothing)...
+        assert!(!env.view.forward_hover_to_preview(1, 1));
+        assert_eq!(env.view.hover_forward_cell, None);
+        // ...so re-entering the same cell reports it to the agent again.
+        assert!(env.view.forward_hover_to_preview(51, 10));
+    }
+
+    /// A button-tracking (1000/1002) agent never gets bare motion: it didn't
+    /// ask for it and would misparse the report. Same for a non-mouse agent.
+    #[test]
+    #[serial]
+    fn forward_hover_to_preview_requires_any_event_tracking() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+        assert!(!env.view.forward_hover_to_preview(50, 10));
+        assert_eq!(env.view.hover_forward_cell, None);
+
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
+        assert!(!env.view.forward_hover_to_preview(50, 10));
     }
 
     /// Shift+press is NOT forwarded: it falls through so aoe's own preview
@@ -11154,15 +12462,16 @@ mod click_to_select {
         // EnterLiveSend. Double-click + Enter still activate the row,
         // but that path is gated by `default_attach_mode`, not this
         // setting, so it's exercised elsewhere.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let action = env.view.handle_click(5, 3);
         assert_eq!(
@@ -11182,16 +12491,17 @@ mod click_to_select {
         // live-sending must leave live mode (otherwise keystrokes stay aimed at
         // the old session while the cursor/preview walk away). The click still
         // emits no action and still moves the cursor.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let live_id = env.view.selected_session.clone().unwrap();
         env.view.live_send = Some(LiveSendState {
@@ -11217,7 +12527,7 @@ mod click_to_select {
     fn select_only_click_on_live_row_stays_live() {
         // Clicking the row that's already live-sending is not a "leave" gesture:
         // the cursor is already there, so SelectOnly must not tear down live mode.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
@@ -11225,9 +12535,10 @@ mod click_to_select {
         env.view.cursor = 2;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let live_id = env.view.selected_session.clone().unwrap();
         env.view.live_send = Some(LiveSendState {
@@ -11278,7 +12589,11 @@ mod click_to_select {
             .iter()
             .position(|it| matches!(it, Item::Session { id, .. } if id == &archived_id))
             .expect("archived session must render under the expanded Archived section");
-        let row = env.view.list_inner_area.y + idx as u16;
+        // Archived rows now live in the pinned shelf, so render a real frame to
+        // populate `shelf_inner_area` and click the shelf row, not the faked
+        // list rect.
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, idx);
         let action = env.view.handle_click(5, row);
 
         assert_eq!(
@@ -11334,15 +12649,16 @@ mod click_to_select {
         // default, so we expect AttachSession). Locks down the
         // separation between the two settings so a future refactor
         // can't accidentally route double-click through `click_action`.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::SelectOnly;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::SelectOnly;
+        })
+        .unwrap();
 
         let t0 = std::time::Instant::now();
         let first = env.view.handle_click_at(t0, 5, 3);
@@ -11372,15 +12688,16 @@ mod click_to_select {
         // `default_attach_mode = Tmux`. The attach must exit live mode
         // first, otherwise the worker is stranded against a pane we're
         // leaving and detaching drops the user back into live mode.
-        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::session::config::{update_config, ClickAction};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let mut config = Config::default();
-        config.session.click_action = ClickAction::LiveSend;
-        save_config(&config).unwrap();
+        update_config(|config| {
+            config.session.click_action = ClickAction::LiveSend;
+        })
+        .unwrap();
 
         // Simulate the first click of the double having already entered
         // live-send (the real install runs in App::execute_action, which a
@@ -12007,6 +13324,49 @@ mod click_to_select {
             env.view.hovered_index(),
             None,
             "keyboard nav must clear hover so only the selected row paints"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn changing_session_clears_preview_selection() {
+        // A finalized preview selection pins to the previous pane's cells, and
+        // the preview freezes while a selection is held. Carried into a
+        // different session it would both paint a stale highlight and stop the
+        // new session's preview from following output, so selecting another
+        // session must drop it.
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        let sessions: Vec<usize> = env
+            .view
+            .flat_items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, Item::Session { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(sessions.len() >= 2, "test needs two session rows");
+
+        env.view.cursor = sessions[0];
+        env.view.update_selected();
+        let first = env.view.selected_session.clone();
+        assert!(first.is_some(), "precondition: a session is selected");
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (0, 0),
+            extent: (4, 2),
+            finalized: true,
+        });
+
+        env.view.cursor = sessions[1];
+        env.view.update_selected();
+        assert_ne!(
+            env.view.selected_session, first,
+            "precondition: cursor moved to a different session"
+        );
+        assert!(
+            env.view.preview_selection.is_none(),
+            "changing sessions must clear the stale selection so the new preview isn't frozen"
         );
     }
 
@@ -13169,6 +14529,53 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
+        // Regression guard: the Tool arm of the drift check must resolve
+        // the current name the same way `prepare_live_send` computed
+        // `tmux_name` at entry (via `ToolSession::new(..).session_name()`).
+        // A prior bug instead re-derived the Tool arm's "current name"
+        // through `Session::generate_name`, the agent-pane naming scheme,
+        // which never matches a tool's own tmux name. That mismatch made
+        // every Tool-view live-send look "renamed" on its very first
+        // keystroke and auto-exit immediately.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let tmux_name = crate::tmux::ToolSession::new(&inst.id, &inst.title, "lazygit")
+            .session_name()
+            .to_string();
+        crate::tmux::test_inject_session_into_cache(&tmux_name);
+        env.view.live_send = Some(LiveSendState {
+            session_id: inst.id.clone(),
+            title: inst.title,
+            tmux_name,
+            target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+
+        assert!(
+            env.view.live_send.is_some(),
+            "first keystroke in a Tool-view live-send must not trip spurious drift"
+        );
+        assert!(env.view.info_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
     fn live_mode_makes_has_dialog_true() {
         // Every dialog-gating predicate that already inspects has_dialog()
         // (mouse swallow, list nav suspend, palette skip) inherits live
@@ -13250,9 +14657,10 @@ mod live_send_mode {
     #[test]
     #[serial]
     fn tab_does_not_start_live_send_for_acp_session() {
-        // Acp sessions are not tmux-backed, so live-send has no
-        // valid target. Tab must silently no-op rather than enqueue
-        // an Action::EnterLiveSend that would fail downstream.
+        // Acp sessions are not tmux-backed, so live-send has no valid
+        // target. Tab must refuse with a visible "no tmux pane" toast
+        // (a silent no-op reads as a broken key) and must never
+        // enqueue an Action::EnterLiveSend that would fail downstream.
         let mut env = create_test_env_with_sessions(1);
         env.view.cursor = 0;
         env.view.update_selected();
@@ -13272,7 +14680,13 @@ mod live_send_mode {
         let action = env
             .view
             .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
-        assert!(action.is_none(), "expected no action, got {:?}", action);
+        assert!(
+            matches!(
+                &action,
+                Some(Action::SetTransientStatus(msg)) if msg.contains("no tmux pane")
+            ),
+            "Tab on a structured row must surface the no-tmux-pane toast, got {action:?}"
+        );
         assert!(env.view.live_send.is_none());
     }
 
@@ -13306,6 +14720,89 @@ mod live_send_mode {
         assert!(env.view.has_non_live_send_overlay());
     }
 
+    /// Regression for the preview-mode paste misroute: a rename dialog
+    /// opened on top of live-send (reachable via the right-click context
+    /// menu, which stays clickable while "attached") must receive pastes.
+    /// Before the fix, `handle_paste` gave live-send absolute priority,
+    /// so the clipboard streamed into the agent's pane while the user was
+    /// staring at a focused dialog input; the key path had already been
+    /// taught to route to overlays, but paste hadn't.
+    #[test]
+    #[serial]
+    fn paste_routes_to_rename_dialog_opened_over_live_send() {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.update_selected();
+        install_live_for_first_session(&mut env);
+        env.view.open_rename_for_selected();
+        assert!(env.view.rename_dialog.is_some());
+        assert!(
+            env.view.live_send.is_some(),
+            "live-send must stay active underneath the dialog"
+        );
+
+        env.view.handle_paste("pasted-title");
+
+        assert_eq!(
+            env.view.rename_dialog.as_ref().unwrap().title_value(),
+            "pasted-title",
+            "paste must land in the dialog's focused input, not the pane behind it"
+        );
+    }
+
+    /// Companion pin: with live-send active and NO overlay on top, paste
+    /// keeps streaming to the pane. The unit fixture has no worker
+    /// attached, so the observable contract is that the live-send branch
+    /// consumes the paste: nothing buffers into a compose dialog or
+    /// pending_paste.
+    #[test]
+    #[serial]
+    fn paste_in_pure_live_mode_is_consumed_by_live_send() {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.update_selected();
+        install_live_for_first_session(&mut env);
+
+        env.view.handle_paste("streamed to pane");
+
+        assert!(env.view.send_message_dialog.is_none());
+        assert!(env.view.pending_paste.is_none());
+    }
+
+    /// A finalized preview highlight (installed via a mouse drag, which
+    /// never runs through `handle_key`) must be dropped when the user
+    /// pastes into a dialog opened over live-send. Before the clear was
+    /// hoisted to the top of `handle_paste`, only the pane-streaming
+    /// branch cleared it, so the highlight survived a dialog-routed paste
+    /// and kept repainting over stale cells after the dialog closed.
+    #[test]
+    #[serial]
+    fn paste_into_dialog_over_live_send_clears_preview_selection() {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.update_selected();
+        install_live_for_first_session(&mut env);
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (0, 0),
+            extent: (4, 2),
+            finalized: true,
+        });
+        env.view.open_rename_for_selected();
+        assert!(env.view.rename_dialog.is_some());
+        assert!(
+            env.view.preview_selection.is_some(),
+            "precondition: opening the dialog must not clear the selection"
+        );
+
+        env.view.handle_paste("pasted-title");
+
+        assert!(
+            env.view.preview_selection.is_none(),
+            "a dialog-routed paste must still drop the finalized highlight"
+        );
+        assert_eq!(
+            env.view.rename_dialog.as_ref().unwrap().title_value(),
+            "pasted-title"
+        );
+    }
+
     #[test]
     #[serial]
     fn refresh_preserves_cache_when_live_capture_fails() {
@@ -13333,6 +14830,92 @@ mod live_send_mode {
             "cache must be preserved when the fork capture fails inside live mode"
         );
         assert_eq!(env.view.preview_cache.captured_lines, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn warm_predicates_stay_cold_without_a_live_pane() {
+        // The EnterLiveSend / SendMessage handlers skip the "Reviving
+        // session..." toast only when the target pane is provably warm; every
+        // uncertain case must stay cold so a real revive keeps its feedback.
+        // The unit fixture has no tmux server, so even a live-status row must
+        // report cold (pane existence is the load-bearing half).
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+
+        // Unknown session id: cold.
+        assert!(!env.view.agent_pane_is_warm("no-such-session"));
+        assert!(!env.view.live_entry_is_warm("no-such-session"));
+
+        // Live status but no tmux session behind it: cold.
+        env.view
+            .set_instance_status(&id, crate::session::Status::Idle);
+        assert!(!env.view.agent_pane_is_warm(&id));
+
+        // Non-live statuses are cold regardless of pane state.
+        for status in [
+            crate::session::Status::Stopped,
+            crate::session::Status::Starting,
+            crate::session::Status::Error,
+            crate::session::Status::Unknown,
+        ] {
+            env.view.set_instance_status(&id, status);
+            assert!(
+                !env.view.agent_pane_is_warm(&id),
+                "status {status:?} must not count as warm"
+            );
+        }
+
+        // Terminal-target warmth is keyed on the paired terminal pane, which
+        // the fixture also lacks: cold.
+        env.view
+            .set_instance_status(&id, crate::session::Status::Idle);
+        env.view.pending_live_send_target = crate::tui::home::live_send::LiveSendTarget::Terminal;
+        assert!(!env.view.live_entry_is_warm(&id));
+    }
+
+    #[test]
+    #[serial]
+    fn passive_preview_sync_ignores_one_frame_toast_geometry() {
+        // The EnterLiveSend / SendMessage handlers draw exactly one frame with
+        // a transient toast up; its bottom bar makes the preview output rect
+        // one row shorter for that frame only. The passive sync must not chase
+        // it: pre-debounce it resized the agent's pane down and back up ~30ms
+        // apart, and the double SIGWINCH made claude's bottom-anchored input
+        // box (and cursor) visibly jump right as live mode opened.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.selected_session = Some(id.clone());
+        // Steady state: pane already synced to the toast-free geometry.
+        env.view.preview_pane_synced = Some((id.clone(), 141, 43));
+
+        // Toast frame: one row shorter. Armed only; the synced geometry (and
+        // with it the real pane) must stay untouched.
+        env.view.refresh_preview_cache_if_needed(141, 42);
+        assert_eq!(env.view.preview_pane_pending, Some((id.clone(), 141, 42)));
+        assert_eq!(env.view.preview_pane_synced, Some((id.clone(), 141, 43)));
+
+        // Post-toast frame: back in sync; the transient arm is dropped so a
+        // later real change still needs two consecutive sightings.
+        env.view.refresh_preview_cache_if_needed(141, 43);
+        assert_eq!(env.view.preview_pane_pending, None);
+        assert_eq!(env.view.preview_pane_synced, Some((id, 141, 43)));
     }
 
     #[test]
@@ -13544,15 +15127,16 @@ mod live_send_mode {
     }
 }
 
-/// Tests for the `new_session_attach_mode` setting that drives whether
-/// a freshly-created session enters tmux or live-send mode. The unit
-/// under test is `HomeView::new_session_attach_mode`, plus the
-/// invariant that the sync create path emits the routed action variant
-/// (so it doesn't bypass the setting the way `Action::AttachSession`
-/// would).
-mod new_session_attach_mode {
+/// Tests for the post-create half of the `default_attach_mode` setting:
+/// a freshly-created session enters tmux or live-send mode per the same
+/// resolver as Enter/double-click. The unit under test is
+/// `HomeView::default_attach_mode` as consumed by the post-create
+/// dispatch, plus the invariant that the sync create path emits the
+/// routed action variant (so it doesn't bypass the setting the way
+/// `Action::AttachSession` would).
+mod post_create_attach_mode {
     use super::*;
-    use crate::session::config::{save_config, Config, NewSessionAttachMode};
+    use crate::session::config::{update_config, AttachMode};
 
     /// Add a session to the home view, return its id. The instance's
     /// `source_profile` is set to "test" so the resolver reads the
@@ -13568,10 +15152,11 @@ mod new_session_attach_mode {
     /// Write a global config.toml with the given attach mode so the
     /// resolver under test reads the user-configured value. Other
     /// fields stay at default.
-    fn write_global_attach_mode(mode: NewSessionAttachMode) {
-        let mut config = Config::default();
-        config.session.new_session_attach_mode = mode;
-        save_config(&config).unwrap();
+    fn write_global_attach_mode(mode: AttachMode) {
+        update_config(|config| {
+            config.session.default_attach_mode = mode;
+        })
+        .unwrap();
     }
 
     #[test]
@@ -13583,10 +15168,10 @@ mod new_session_attach_mode {
         // user's UX on upgrade.
         let mut env = create_test_env_empty();
         let id = add_session(&mut env.view, "session-one");
-        let mode = env.view.new_session_attach_mode(&id);
+        let mode = env.view.default_attach_mode(&id);
         assert_eq!(
             mode,
-            Some(NewSessionAttachMode::Tmux),
+            Some(AttachMode::Tmux),
             "default must be Tmux to preserve existing UX"
         );
     }
@@ -13594,14 +15179,14 @@ mod new_session_attach_mode {
     #[test]
     #[serial]
     fn returns_live_send_when_globally_configured() {
-        // User saved `new_session_attach_mode = "live_send"` in their
+        // User saved `default_attach_mode = "live_send"` in their
         // global config. The resolver must pick it up so the dispatch
         // path in app.rs routes to live mode instead of tmux attach.
         let mut env = create_test_env_empty();
-        write_global_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
-        let mode = env.view.new_session_attach_mode(&id);
-        assert_eq!(mode, Some(NewSessionAttachMode::LiveSend));
+        let mode = env.view.default_attach_mode(&id);
+        assert_eq!(mode, Some(AttachMode::LiveSend));
     }
 
     #[test]
@@ -13612,7 +15197,7 @@ mod new_session_attach_mode {
         // signals the caller to fall back to the structured view-aware
         // attach_session path rather than try to attach to a ghost.
         let env = create_test_env_empty();
-        let mode = env.view.new_session_attach_mode("nonexistent-id");
+        let mode = env.view.default_attach_mode("nonexistent-id");
         assert!(mode.is_none());
     }
 
@@ -13625,12 +15210,12 @@ mod new_session_attach_mode {
         // dispatch picks the (no-op) fallback explicitly, regardless of
         // what the user configured globally.
         let mut env = create_test_env_empty();
-        write_global_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "acp-one");
         env.view.mutate_instance(&id, |inst| {
             inst.view = crate::session::View::Structured;
         });
-        let mode = env.view.new_session_attach_mode(&id);
+        let mode = env.view.default_attach_mode(&id);
         assert!(mode.is_none(), "structured view sessions must return None");
     }
 
@@ -13660,6 +15245,7 @@ mod new_session_attach_mode {
             command_override: String::new(),
             scratch: false,
             fork_seed: None,
+            structured: false,
         }
     }
 
@@ -13667,7 +15253,7 @@ mod new_session_attach_mode {
     #[serial]
     fn sync_create_path_emits_attach_after_create_not_attach_session() {
         // Regression guard for the original bug. `Action::AttachSession`
-        // would skip the `new_session_attach_mode` dispatch; only
+        // would skip the attach-mode dispatch; only
         // `Action::AttachAfterCreate` routes through it. If a future
         // refactor flips this back, the live-mode setting silently
         // stops working on no-sandbox/no-hooks/no-worktree creates and
@@ -13692,7 +15278,7 @@ mod new_session_attach_mode {
 /// Structured view attaches to tmux or enters live-send mode.
 mod default_attach_mode {
     use super::*;
-    use crate::session::config::{save_config, Config, NewSessionAttachMode};
+    use crate::session::config::{update_config, AttachMode};
 
     fn add_session(view: &mut HomeView, title: &str) -> String {
         let mut inst = Instance::new(title, "/tmp/test");
@@ -13702,10 +15288,11 @@ mod default_attach_mode {
         id
     }
 
-    fn write_global_default_attach_mode(mode: NewSessionAttachMode) {
-        let mut config = Config::default();
-        config.session.default_attach_mode = mode;
-        save_config(&config).unwrap();
+    fn write_global_default_attach_mode(mode: AttachMode) {
+        update_config(|config| {
+            config.session.default_attach_mode = mode;
+        })
+        .unwrap();
     }
 
     #[test]
@@ -13717,7 +15304,7 @@ mod default_attach_mode {
         let mut env = create_test_env_empty();
         let id = add_session(&mut env.view, "session-one");
         let mode = env.view.default_attach_mode(&id);
-        assert_eq!(mode, Some(NewSessionAttachMode::Tmux));
+        assert_eq!(mode, Some(AttachMode::Tmux));
     }
 
     #[test]
@@ -13740,7 +15327,7 @@ mod default_attach_mode {
         // User opted into "Enter = live mode": activating an Agent-view
         // row must dispatch Action::EnterLiveSend instead of AttachSession.
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
@@ -13761,7 +15348,7 @@ mod default_attach_mode {
         // back to a full tmux attach whenever they were previewing a
         // terminal.
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
@@ -13800,7 +15387,7 @@ mod default_attach_mode {
         // escape hatch). Without this, the user would have no
         // single-key path to the underlying tmux session.
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
@@ -13830,7 +15417,7 @@ mod default_attach_mode {
         // live-send, Tab in Terminal view attaches the paired terminal
         // pane rather than the agent pane.
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
@@ -13894,6 +15481,161 @@ mod default_attach_mode {
 
     #[test]
     #[serial]
+    fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
+        // Reviewer-requested fix (CodeRabbit + Seluj78 on #2777):
+        // `refresh_tool_preview_cache_if_needed` must call
+        // `resize_live_pane_if_target` up front, the same as the
+        // Terminal/ContainerTerminal siblings, so a window resize while
+        // live-sent to a Tool pane (lazygit, yazi) reflows it instead of
+        // waiting for a live-mode re-enter. `resize_live_pane_if_target`
+        // records the dedup in `live_send_last_resize` even without a
+        // spawned worker, so that's the observable signal here.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let tmux_name = crate::tmux::ToolSession::new(&inst.id, &inst.title, "lazygit")
+            .session_name()
+            .to_string();
+        env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+            session_id: id.clone(),
+            title: inst.title.clone(),
+            tmux_name,
+            target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+        env.view.selected_session = Some(id);
+        assert_eq!(env.view.live_send_last_resize, None);
+
+        env.view
+            .refresh_tool_preview_cache_if_needed(80, 24, "lazygit");
+
+        assert_eq!(
+            env.view.live_send_last_resize,
+            Some((80, 24)),
+            "resize_live_pane_if_target must fire for a targeted Tool pane"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn start_live_send_in_tool_view_targets_tool_pane() {
+        // Tool-view counterpart of `start_live_send_in_terminal_view_targets_terminal_pane`:
+        // when previewing a named tool (lazygit, yazi, etc.), `start_live_send`
+        // must resolve to that tool's own paired pane, not fall back to the
+        // agent or bail out entirely.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Tool("lazygit".to_string());
+        let action = env.view.start_live_send();
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+        assert_eq!(
+            env.view.pending_live_send_target,
+            crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string())
+        );
+    }
+
+    fn write_live_send_on_view_switch(mode: AttachMode, on_view_switch: bool) {
+        update_config(|config| {
+            config.session.default_attach_mode = mode;
+            config.session.live_send_on_view_switch = on_view_switch;
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
+        // With `live_send_on_view_switch` on and `default_attach_mode =
+        // LiveSend`, pressing 't' (ToggleView) from Structured view must
+        // not just flip the preview to Terminal; it must also enter
+        // live-send immediately, without a separate Enter/Tab/click.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(AttachMode::LiveSend, true);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(
+            env.view.view_mode,
+            crate::tui::home::ViewMode::Terminal,
+            "ToggleView must still flip the preview to Terminal"
+        );
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_does_not_auto_start_live_send_when_setting_disabled() {
+        // The setting defaults to off: even with `default_attach_mode =
+        // LiveSend`, ToggleView must leave live-send alone and only
+        // change the preview.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(AttachMode::LiveSend, false);
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(env.view.view_mode, crate::tui::home::ViewMode::Terminal);
+        assert_eq!(
+            action, None,
+            "auto live-send must stay off when the setting is disabled"
+        );
+        assert!(env.view.live_send.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn toggle_view_auto_starts_live_send_regardless_of_default_attach_mode() {
+        // The setting is the only gate: with the historical Tmux
+        // default, ToggleView still auto-enters live-send when
+        // `live_send_on_view_switch` is enabled.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(AttachMode::Tmux, true);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(env.view.view_mode, crate::tui::home::ViewMode::Terminal);
+        assert_eq!(
+            action,
+            Some(Action::EnterLiveSend(id)),
+            "auto live-send must fire even when default_attach_mode is Tmux"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tool_hotkey_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
+        // Parallel case for the other explicit view-switch entry point:
+        // opening a tool via its configured hotkey must apply the same
+        // auto-entry check as ToggleView.
+        let mut env = create_test_env_empty();
+        write_live_send_on_view_switch(AttachMode::LiveSend, true);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.tool_hotkey_cache =
+            vec![("lazygit".to_string(), KeyCode::Char('g'), KeyModifiers::ALT)];
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT), None);
+        assert_eq!(
+            env.view.view_mode,
+            crate::tui::home::ViewMode::Tool("lazygit".to_string())
+        );
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
     fn help_live_on_enter_returns_none_when_no_session_selected() {
         // Cursor parked off any session row: the help overlay shouldn't
         // claim a session-attach behavior, so `help_live_on_enter`
@@ -13927,7 +15669,7 @@ mod default_attach_mode {
         // help_live_on_enter so the help overlay relabels Enter as
         // live mode and Tab as tmux attach.
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let _id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
@@ -13945,15 +15687,15 @@ mod default_attach_mode {
         let mut env = create_test_env_empty();
         assert_eq!(
             env.view.profile_default_attach_mode,
-            NewSessionAttachMode::Tmux,
+            AttachMode::Tmux,
             "cache should initialize to the historical Tmux default"
         );
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         env.view
             .refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(
             env.view.profile_default_attach_mode,
-            NewSessionAttachMode::LiveSend,
+            AttachMode::LiveSend,
             "refresh_from_config must pick up the saved LiveSend default"
         );
     }
@@ -13968,7 +15710,7 @@ mod default_attach_mode {
     #[serial]
     fn acp_session_ignores_default_attach_mode() {
         let mut env = create_test_env_empty();
-        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        write_global_default_attach_mode(AttachMode::LiveSend);
         let id = add_session(&mut env.view, "acp-one");
         env.view.mutate_instance(&id, |inst| {
             inst.view = crate::session::View::Structured;
@@ -13983,15 +15725,255 @@ mod default_attach_mode {
             action
         );
     }
+
+    /// Render the whole home screen into a string for placeholder /
+    /// badge assertions.
+    fn render_home(env: &mut TestEnv) -> String {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn structured_session_env() -> (TestEnv, String) {
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "acp-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+        });
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        (env, id)
+    }
+
+    /// A selected structured session has no agent tmux pane; the preview
+    /// must show the explanatory placeholder instead of a blank capture.
+    #[test]
+    #[serial]
+    fn structured_session_preview_shows_placeholder() {
+        let (mut env, _id) = structured_session_env();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("Structured view"),
+            "placeholder heading missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structured transcript"),
+            "placeholder body missing:\n{screen}"
+        );
+    }
+
+    /// The switch-view context entry offers the opposite view: terminal for
+    /// a structured row, structured for a terminal row whose tool is
+    /// ACP-capable (only when the structured-view opt-in is on), and nothing
+    /// for rows mid-lifecycle.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gates_by_view_and_state() {
+        use crate::session::config::update_config;
+        let (mut env, id) = structured_session_env();
+        update_config(|config| {
+            config.acp.offer_structured_in_new_session = true;
+        })
+        .unwrap();
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal row with an ACP-capable tool (claude): offer structured.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), Some(false));
+        // Mid-lifecycle rows are excluded.
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Creating;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Switching a terminal session INTO the structured view is gated on the
+    /// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable
+    /// terminal row offers no switch. A structured row can always switch back
+    /// to terminal regardless, so a session is never stranded.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_target_gated_on_structured_opt_in() {
+        use crate::session::config::update_config;
+        let (mut env, id) = structured_session_env();
+        update_config(|config| {
+            config.acp.offer_structured_in_new_session = false;
+        })
+        .unwrap();
+        // Structured -> terminal is always available (escape hatch).
+        assert_eq!(env.view.session_switch_view_target(&id), Some(true));
+        // Terminal -> structured is suppressed while the opt-in is off.
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+        });
+        assert_eq!(env.view.session_switch_view_target(&id), None);
+    }
+
+    /// Accepting the switch-view confirm emits the action with the stashed
+    /// session id, mirroring the other confirm-carrying actions.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn switch_view_confirm_dispatches_action_with_stashed_id() {
+        let (mut env, id) = structured_session_env();
+        env.view.prompt_switch_view_for_selected();
+        assert!(
+            env.view.confirm_dialog.is_some(),
+            "switch must confirm first (history is destroyed)"
+        );
+        let action = env.view.dispatch_confirm_submit("switch_view");
+        assert!(
+            matches!(action, Some(Action::SwitchSessionView(ref sid)) if *sid == id),
+            "expected SwitchSessionView({id}), got {action:?}"
+        );
+    }
+
+    /// The `[structured]` badge marks structured rows in the Terminal home
+    /// layout too (non-sandboxed rows have no container/host badge there),
+    /// so Enter opening the structured view is never a surprise.
+    #[test]
+    #[serial]
+    fn structured_badge_shows_in_terminal_view_mode() {
+        let (mut env, _id) = structured_session_env();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains("[structured]"),
+            "badge missing in Terminal view mode:\n{screen}"
+        );
+    }
+
+    fn render_footer(env: &mut TestEnv) -> String {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Tab is Enter's complement on a session row: whichever of
+    /// live-send / tmux-attach `default_attach_mode` doesn't route Enter
+    /// to. The footer must surface that complement so it isn't only
+    /// discoverable by reading the source or the `?` help overlay.
+    #[test]
+    #[serial]
+    fn footer_advertises_tab_as_live_when_default_is_tmux() {
+        let mut env = create_test_env_empty();
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let out = render_footer(&mut env);
+        assert!(
+            out.contains("↵  Attach"),
+            "Enter hint should stay tmux attach under the default mode.\n{out}"
+        );
+        assert!(
+            out.contains("⇥  Live"),
+            "Tab hint should advertise Live mode when Enter is pinned to tmux attach.\n{out}"
+        );
+    }
+
+    /// Inverse of the above: once `default_attach_mode = LiveSend` takes
+    /// over Enter, the two hints swap rather than both claiming "Attach".
+    /// Enter owns live-send and Tab becomes the tmux escape hatch, the
+    /// same swap the `?` overlay does for this pairing.
+    #[test]
+    #[serial]
+    fn footer_advertises_tab_as_attach_when_default_is_live_send() {
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(AttachMode::LiveSend);
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let out = render_footer(&mut env);
+        assert!(
+            out.contains("↵  Live"),
+            "Enter hint should say Live once it owns live-send.\n{out}"
+        );
+        assert!(
+            out.contains("⇥  Attach"),
+            "Tab hint should offer the tmux escape hatch once Enter owns live-send.\n{out}"
+        );
+    }
+
+    /// Acp/structured rows ignore `default_attach_mode` entirely (Tab
+    /// either mirrors Enter or no-ops), so the footer must not advertise
+    /// a Tab complement that doesn't actually do anything different.
+    #[test]
+    #[serial]
+    fn footer_hides_tab_hint_for_structured_sessions() {
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "acp-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+        });
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let out = render_footer(&mut env);
+        assert!(
+            !out.contains("⇥"),
+            "structured view rows must not show a Tab hint at all.\n{out}"
+        );
+        assert!(
+            out.contains("↵  Attach"),
+            "structured rows keep the plain Enter attach label.\n{out}"
+        );
+    }
 }
 
 mod save_field_merge {
     use super::*;
     use chrono::Utc;
 
-    fn boot_view_with_one_session(title: &str, path: &str) -> (TempDir, HomeView, String) {
+    fn boot_view_with_one_session(
+        title: &str,
+        path: &str,
+    ) -> (TempDir, AppDirGuard, HomeView, String) {
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let guard = setup_test_home(&temp);
         let storage = Storage::new_unwatched("test").unwrap();
         let inst = Instance::new(title, path);
         let id = inst.id.clone();
@@ -14010,13 +15992,13 @@ mod save_field_merge {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        (temp, view, id)
+        (temp, guard, view, id)
     }
 
     #[test]
     #[serial]
     fn test_save_preserves_peer_field_update() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         let peer_archived_at = Utc::now();
@@ -14043,7 +16025,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_preserves_peer_added_row() {
-        let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
+        let (_temp, _guard, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
@@ -14070,7 +16052,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_drops_explicitly_deleted_row() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
 
         view.remove_instance(&id);
         view.save().expect("save must propagate the delete");
@@ -14085,7 +16067,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_drains_pending_deletions_on_ok() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
 
         view.remove_instance(&id);
         assert!(
@@ -14106,7 +16088,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_preserves_peer_added_group() {
-        let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
+        let (_temp, _guard, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
@@ -14133,7 +16115,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_apply_user_action_persists_atomically() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("apply_user_action must persist");
@@ -14149,7 +16131,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_apply_user_action_does_not_clobber_peer_field() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
@@ -14177,7 +16159,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_apply_user_action_disk_and_memory_share_one_timestamp() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("apply_user_action must persist");
@@ -14209,7 +16191,7 @@ mod save_field_merge {
         // the TUI then archives, archive wins because it is the
         // indefinite sink; leaving both flags persisted would surface
         // contradictory triage state on the next render.
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
@@ -14241,7 +16223,7 @@ mod save_field_merge {
         // instead of archive so the snoozed_until field IS touched on
         // both sides and the test isolates the peer-field-survival
         // invariant from the archive XOR rules tested above.
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
@@ -14268,7 +16250,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_drops_peer_deleted_row_from_mirror() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/peer-rm");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/peer-rm");
 
         // Simulate `aoe session remove victim` from another process: peer
         // deletes the row from disk while TUI still has it in memory.
@@ -14301,7 +16283,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_pushes_tui_added_row_to_disk() {
-        let (_temp, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
+        let (_temp, _guard, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
 
         let mut new_inst = Instance::new("tui-added", "/tmp/added");
         new_inst.source_profile = "test".to_string();
@@ -14324,7 +16306,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_save_add_then_remove_in_same_cycle_does_not_persist() {
-        let (_temp, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
+        let (_temp, _guard, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
 
         let mut new_inst = Instance::new("ephemeral", "/tmp/ephemeral");
         new_inst.source_profile = "test".to_string();
@@ -14344,7 +16326,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_move_to_profile_marks_tombstone_and_pending_added() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
         view.storages.insert(
             "target".to_string(),
             Storage::new_unwatched("target").unwrap(),
@@ -14373,7 +16355,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_move_to_profile_save_roundtrip_persists_under_target() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
         view.storages.insert(
             "target".to_string(),
             Storage::new_unwatched("target").unwrap(),
@@ -14397,7 +16379,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_move_to_profile_same_profile_only_updates_group_path() {
-        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
 
         view.move_to_profile(&id, "test", "newgrp".to_string())
             .unwrap();
@@ -14413,7 +16395,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn test_reload_honors_peer_cleared_session_id() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/sid");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/sid");
 
         // Seed a stale sid via the in-memory mirror + persist.
         view.mutate_instance(&id, |inst| {
@@ -14454,7 +16436,7 @@ mod save_field_merge {
     fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
         use crate::session::{is_archived_section_path, Item};
 
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
 
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("seed archive must persist");
@@ -14504,7 +16486,7 @@ mod save_field_merge {
     #[test]
     #[serial]
     fn stamp_last_accessed_on_snoozed_row_persistently_clears_snooze() {
-        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
 
         view.apply_user_action(&id, |inst| inst.snooze(30))
             .expect("seed snooze must persist");
@@ -14713,7 +16695,10 @@ mod right_click_context_menu {
             .iter()
             .position(|it| matches!(it, Item::Session { id: i, .. } if i == &id))
             .expect("archived row must be visible");
-        let row = env.view.list_inner_area.y + idx as u16;
+        // The archived session row renders in the pinned shelf; render a real
+        // frame so the shelf rect is populated, then right-click that row.
+        render_geometry(&mut env.view);
+        let row = shelf_row_for_idx(&env.view, idx);
         assert!(env.view.handle_right_click(5, row));
         let labels: Vec<&str> = env
             .view
@@ -15233,7 +17218,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-publish";
         let inst = fresh_instance(profile, "apa");
@@ -15255,7 +17240,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-terminal-publish";
         let mut inst = fresh_instance(profile, "terminal-post-cas");
@@ -15280,7 +17265,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-excludes";
         let inst = fresh_instance(profile, "aer");
@@ -15325,7 +17310,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-skipped";
         let peer_sid = "019342aa-3333-7eee-8fff-aaaabbbbcccc";
@@ -15379,7 +17364,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-invalid";
         let inst = fresh_instance(profile, "aiv");
@@ -15413,7 +17398,7 @@ mod apply_session_id_updates {
             return;
         }
         let temp = TempDir::new().unwrap();
-        setup_test_home(&temp);
+        let _guard = setup_test_home(&temp);
 
         let profile = "apply-pane-dead";
         let inst = fresh_instance(profile, "apds");
@@ -15643,5 +17628,186 @@ mod stacked_single_seam {
                 border_rows,
             );
         }
+    }
+}
+
+mod permission_response_dialog {
+    use super::*;
+    use crate::session::Status;
+
+    fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String {
+        let mut inst = Instance::new(title, "/tmp/test");
+        inst.tool = tool.to_string();
+        let id = inst.id.clone();
+        view.add_instance(inst);
+        id
+    }
+
+    #[test]
+    #[serial]
+    fn no_selected_session_is_a_no_op() {
+        let mut env = create_test_env_empty();
+        env.view.selected_session = None;
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(env.view.permission_response_dialog.is_none());
+        assert!(env.view.info_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn unsupported_agent_shows_info_dialog_no_send() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "some-unmapped-tool");
+        env.view.selected_session = Some(id);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_none(),
+            "unsupported agent must not open the dialog"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "unsupported agent must surface an info dialog"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supported_agent_opens_dialog_regardless_of_status() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        env.view.selected_session = Some(id.clone());
+        // Prove there's no Status::Waiting gate: explicitly set a
+        // non-Waiting status before pressing the shortcut.
+        env.view
+            .mutate_instance(&id, |inst| inst.status = Status::Idle);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_some(),
+            "supported agent + valid target must open the dialog even when not Waiting"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn structured_session_is_a_no_op() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        env.view
+            .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+        env.view.selected_session = Some(id);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_none(),
+            "structured (ACP) session must not open the tmux-keystroke dialog"
+        );
+        assert!(
+            env.view.info_dialog.is_none(),
+            "structured session no-op must be silent, not surface an info dialog"
+        );
+    }
+}
+
+/// The Settings takeover owns the wheel and the scrollbar grab-drag. The
+/// bug these guard: with settings open, `has_dialog()` is true, so the
+/// generic scroll and drag paths used to swallow (scroll) or cancel
+/// (drag) the gesture, leaving the fields panel dead to the mouse.
+mod settings_scroll_wiring {
+    use super::*;
+    use crate::tui::home::DragKind;
+    use crate::tui::settings::SettingsView;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render the home view (with its settings takeover) at a deliberately
+    /// short height so the fields panel overflows and paints a scrollbar.
+    fn render_short(env: &mut TestEnv) {
+        let theme = crate::tui::styles::load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+    }
+
+    fn open_overflowing_settings(env: &mut TestEnv) {
+        env.view.settings_view = Some(SettingsView::new("test", None).unwrap());
+        render_short(env);
+    }
+
+    /// Locate a cell the settings scrollbar hit test accepts, so the drag
+    /// test doesn't hard-code render geometry.
+    fn scrollbar_hit(env: &TestEnv) -> Option<(u16, u16)> {
+        let sv = env.view.settings_view.as_ref()?;
+        for row in 0..14u16 {
+            for col in 0..100u16 {
+                if sv.hit_scrollbar(col, row) {
+                    return Some((col, row));
+                }
+            }
+        }
+        None
+    }
+
+    /// Wheel-down while Settings is open must be consumed by the fields
+    /// panel (returns true), not swallowed by the `has_dialog()` guard.
+    #[test]
+    #[serial]
+    fn wheel_routes_into_open_settings() {
+        let mut env = create_test_env_empty();
+        open_overflowing_settings(&mut env);
+        assert!(
+            scrollbar_hit(&env).is_some(),
+            "fields must overflow at this size so there is something to scroll"
+        );
+        assert!(
+            env.view.handle_scroll_down(10, 10),
+            "a wheel-down must scroll the settings fields panel"
+        );
+    }
+
+    /// Pressing the scrollbar starts a `SettingsScrollbar` drag, and a
+    /// subsequent move keeps it alive (the drag path no longer cancels on
+    /// `has_dialog()`), until release clears it.
+    #[test]
+    #[serial]
+    fn scrollbar_press_starts_a_drag_that_survives_moves() {
+        let mut env = create_test_env_empty();
+        open_overflowing_settings(&mut env);
+        let (col, row) = scrollbar_hit(&env).expect("scrollbar should render");
+
+        assert!(
+            env.view.handle_dialog_click(col, row),
+            "a scrollbar press is consumed by the settings takeover"
+        );
+        assert!(
+            matches!(env.view.drag_state, Some(DragKind::SettingsScrollbar)),
+            "the press seeds a scrollbar drag"
+        );
+
+        env.view.handle_drag_move(col, row.saturating_add(2));
+        assert!(
+            matches!(env.view.drag_state, Some(DragKind::SettingsScrollbar)),
+            "the drag must survive a move even though has_dialog() is true"
+        );
+
+        env.view.handle_drag_end();
+        assert!(env.view.drag_state.is_none(), "release ends the drag");
+    }
+
+    /// A plain click that misses the scrollbar must NOT start a scrollbar
+    /// drag; it falls through to the normal settings click routing.
+    #[test]
+    #[serial]
+    fn click_off_the_scrollbar_does_not_start_a_drag() {
+        let mut env = create_test_env_empty();
+        open_overflowing_settings(&mut env);
+        // Column 2 is deep in the categories panel, nowhere near the bar.
+        assert!(env.view.handle_dialog_click(2, 6));
+        assert!(
+            env.view.drag_state.is_none(),
+            "a click off the bar must not begin a scrollbar drag"
+        );
     }
 }

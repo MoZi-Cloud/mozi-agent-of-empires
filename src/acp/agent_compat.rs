@@ -16,8 +16,9 @@
 //! `OPENCODE_MIN_VERSION`, the release that stopped sending empty
 //! `rawInput` on `external_directory` permission requests so the approval
 //! card shows the path and command; AoE issue #1907, upstream #30567). The
-//! remaining agents
-//! get a permissive policy (protocol check only). Long-term aoe should
+//! Codex validates the maintained adapter package name but has no minimum
+//! version floor. aoe-agent, Gemini, Pi ACP, and unknown adapters get a
+//! permissive policy (protocol check only). Long-term aoe should
 //! prefer ACP capability flags over package-version gating; until upstream
 //! exposes those, package versions are the only precise contract.
 //!
@@ -66,9 +67,19 @@ fn opencode_min_version() -> semver::Version {
     semver::Version::parse(OPENCODE_MIN_VERSION).expect("OPENCODE_MIN_VERSION must be valid semver")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionGate {
+    pub expected: ExpectedAgent,
+    pub binary: &'static str,
+    pub package_name: &'static str,
+    pub min_version: &'static str,
+    pub install_command: &'static str,
+    pub auto_install: bool,
+}
+
 /// The adapter aoe is trying to launch. Drives which `CompatibilityPolicy`
 /// is applied at initialize-time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpectedAgent {
     ClaudeAgentAcp,
     CodexAcp,
@@ -156,16 +167,24 @@ impl ExpectedAgent {
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: true,
             },
+            Self::CodexAcp => CompatibilityPolicy {
+                // The deprecated @zed-industries package still exposes the
+                // same binary name, but lacks current Codex model metadata.
+                // Match the maintained package when agent_info is present;
+                // tolerate missing info because Codex has no version floor.
+                expected_name: Some("@agentclientprotocol/codex-acp"),
+                min_version: None,
+                required_protocol: ProtocolVersion::V1,
+                fail_on_missing_agent_info: false,
+            },
             // Other adapters: protocol check only. aoe doesn't yet
             // depend on a version-gated behavior in any of them.
-            Self::CodexAcp | Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => {
-                CompatibilityPolicy {
-                    expected_name: None,
-                    min_version: None,
-                    required_protocol: ProtocolVersion::V1,
-                    fail_on_missing_agent_info: false,
-                }
-            }
+            Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => CompatibilityPolicy {
+                expected_name: None,
+                min_version: None,
+                required_protocol: ProtocolVersion::V1,
+                fail_on_missing_agent_info: false,
+            },
         }
     }
 }
@@ -444,6 +463,33 @@ fn auto_install_for(expected: ExpectedAgent) -> bool {
         .is_some()
 }
 
+pub fn version_gate_for(expected: ExpectedAgent) -> Option<VersionGate> {
+    let (binary, package_name, min_version) = match expected {
+        ExpectedAgent::ClaudeAgentAcp => (
+            "claude-agent-acp",
+            "@agentclientprotocol/claude-agent-acp",
+            CLAUDE_AGENT_ACP_MIN_VERSION,
+        ),
+        ExpectedAgent::OpenCode => ("opencode", "OpenCode", OPENCODE_MIN_VERSION),
+        _ => return None,
+    };
+    Some(VersionGate {
+        expected,
+        binary,
+        package_name,
+        min_version,
+        install_command: crate::acp::install_hints::install_hint_for(binary)
+            .unwrap_or("(see project docs)"),
+        auto_install: crate::acp::install_hints::npm_package_for(binary).is_some(),
+    })
+}
+
+pub fn version_gates() -> impl Iterator<Item = VersionGate> {
+    [ExpectedAgent::ClaudeAgentAcp, ExpectedAgent::OpenCode]
+        .into_iter()
+        .filter_map(version_gate_for)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +534,24 @@ mod tests {
         assert!(!auto_install_for(ExpectedAgent::PiAcp));
         assert!(!auto_install_for(ExpectedAgent::AoeAgent));
         assert!(!auto_install_for(ExpectedAgent::Other));
+    }
+
+    #[test]
+    fn version_gates_expose_floor_metadata() {
+        let claude = version_gate_for(ExpectedAgent::ClaudeAgentAcp).unwrap();
+        assert_eq!(claude.binary, "claude-agent-acp");
+        assert_eq!(claude.package_name, "@agentclientprotocol/claude-agent-acp");
+        assert_eq!(claude.min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
+        assert!(claude.auto_install);
+
+        let opencode = version_gate_for(ExpectedAgent::OpenCode).unwrap();
+        assert_eq!(opencode.binary, "opencode");
+        assert_eq!(opencode.package_name, "OpenCode");
+        assert_eq!(opencode.min_version, OPENCODE_MIN_VERSION);
+        assert!(!opencode.auto_install);
+
+        assert!(version_gate_for(ExpectedAgent::CodexAcp).is_none());
+        assert!(version_gate_for(ExpectedAgent::Other).is_none());
     }
 
     #[test]
@@ -611,9 +675,22 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_permissive_on_old_version() {
+    fn codex_accepts_current_package_without_a_version_floor() {
         let init = make_init("@agentclientprotocol/codex-acp", "0.0.1");
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
+    }
+
+    #[test]
+    fn codex_rejects_legacy_adapter_reported_name() {
+        let init = make_init("codex-acp", "0.16.0");
+        let err = validate(ExpectedAgent::CodexAcp, &init).unwrap_err();
+        assert_eq!(err.kind(), "mismatched_agent_name");
+        assert!(err
+            .user_message()
+            .contains("@agentclientprotocol/codex-acp"));
+        assert!(err
+            .user_message()
+            .contains("npm install -g @agentclientprotocol/codex-acp@latest"));
     }
 
     #[test]

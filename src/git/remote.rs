@@ -200,73 +200,34 @@ pub fn clone_bare_repo_with_proxy(
         args = ?["clone", "--bare", &redacted_url, bare_str],
         "spawning git clone --bare"
     );
-    let mut command = std::process::Command::new("git");
-    apply_proxy_environment(&mut command, url, proxy)?;
-    configure_clone_process_group(&mut command);
-    let mut child = command
-        .args(["clone", "--bare", url, bare_str])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| GitError::CloneFailed(format!("Failed to run git clone --bare: {e}")))?;
+    // Stdin is piped to null so SSH passphrase prompts fail immediately;
+    // stdout/stderr draining and the kill-on-deadline are handled by
+    // run_with_timeout, so a grandchild holding the pipe (credential
+    // helper, pager) cannot block past the timeout.
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--bare", url, bare_str])
+        .stdin(std::process::Stdio::null());
+    apply_proxy_environment(&mut cmd, url, proxy)?;
+    let timeout = std::time::Duration::from_secs(300);
 
-    let mut timeout = NORMAL_CLONE_TIMEOUT;
-    let mut extended_for_large_repo = false;
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => {
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
-                        Some(buf)
-                    })
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let _ = std::fs::remove_dir_all(destination);
-                return Err(GitError::CloneFailed(stderr));
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    if !extended_for_large_repo
-                        && checked_out_file_count_at_least(
-                            destination,
-                            LARGE_REPOSITORY_FILE_THRESHOLD,
-                        )
-                    {
-                        extended_for_large_repo = true;
-                        timeout = LARGE_CLONE_TIMEOUT;
-                        tracing::info!(
-                            target: "git.fetch",
-                            path = %destination.display(),
-                            threshold = LARGE_REPOSITORY_FILE_THRESHOLD,
-                            "large repository detected; extending bare clone timeout to 20 minutes"
-                        );
-                        continue;
-                    }
-                    terminate_clone_process_tree(&mut child);
-                    let _ = std::fs::remove_dir_all(destination);
-                    return Err(GitError::CloneFailed(format!(
-                        "Bare clone timed out after {} minutes",
-                        timeout.as_secs() / 60
-                    )));
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(destination);
-                return Err(GitError::CloneFailed(format!(
-                    "Failed waiting for git clone --bare: {e}"
-                )));
-            }
+    match crate::process::run_with_timeout(&mut cmd, timeout) {
+        Ok(Some(output)) if output.status.success() => {}
+        Ok(Some(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(GitError::CloneFailed(stderr));
+        }
+        Ok(None) => {
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(GitError::CloneFailed(
+                "Bare clone timed out after 5 minutes".to_string(),
+            ));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(GitError::CloneFailed(format!(
+                "Failed to run git clone --bare: {e}"
+            )));
         }
     }
 
@@ -459,77 +420,32 @@ pub fn clone_repo_with_proxy(
         args = ?redacted_args,
         "spawning git clone"
     );
-    let mut command = std::process::Command::new("git");
-    apply_proxy_environment(&mut command, url, proxy)?;
-    configure_clone_process_group(&mut command);
-    let mut child = command
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| GitError::CloneFailed(format!("Failed to run git clone: {e}")))?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(&args).stdin(std::process::Stdio::null());
 
-    // Poll with a 5-minute timeout to avoid blocking the thread pool forever.
-    let mut timeout = NORMAL_CLONE_TIMEOUT;
-    let mut extended_for_large_repo = false;
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
+    // 5-minute timeout to avoid blocking the thread pool forever; output
+    // draining is deadline-bounded too, so a grandchild holding the pipe
+    // cannot hang the wait.
+    apply_proxy_environment(&mut cmd, url, proxy)?;
+    let timeout = std::time::Duration::from_secs(300);
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => {
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
-                        Some(buf)
-                    })
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let _ = std::fs::remove_dir_all(destination);
-                return Err(GitError::CloneFailed(stderr));
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    if !extended_for_large_repo
-                        && checked_out_file_count_at_least(
-                            destination,
-                            LARGE_REPOSITORY_FILE_THRESHOLD,
-                        )
-                    {
-                        extended_for_large_repo = true;
-                        timeout = LARGE_CLONE_TIMEOUT;
-                        tracing::info!(
-                            target: "git.fetch",
-                            path = %destination.display(),
-                            threshold = LARGE_REPOSITORY_FILE_THRESHOLD,
-                            "large repository detected; extending clone timeout to 20 minutes"
-                        );
-                        continue;
-                    }
-                    terminate_clone_process_tree(&mut child);
-                    if destination.exists() {
-                        let _ = std::fs::remove_dir_all(destination);
-                    }
-                    return Err(GitError::CloneFailed(format!(
-                        "Clone timed out after {} minutes",
-                        timeout.as_secs() / 60
-                    )));
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(destination);
-                return Err(GitError::CloneFailed(format!(
-                    "Failed waiting for git clone: {e}"
-                )));
-            }
+    match crate::process::run_with_timeout(&mut cmd, timeout) {
+        Ok(Some(output)) if output.status.success() => Ok(()),
+        Ok(Some(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(GitError::CloneFailed(stderr))
         }
+        Ok(None) => {
+            if destination.exists() {
+                let _ = std::fs::remove_dir_all(destination);
+            }
+            Err(GitError::CloneFailed(
+                "Clone timed out after 5 minutes".to_string(),
+            ))
+        }
+        Err(e) => Err(GitError::CloneFailed(format!(
+            "Failed to run git clone: {e}"
+        ))),
     }
 }
 

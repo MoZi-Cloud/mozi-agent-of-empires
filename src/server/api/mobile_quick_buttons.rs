@@ -11,7 +11,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::session::{save_config, Config, MobileQuickButton};
+use crate::session::{update_config, Config, MobileQuickButton};
 
 /// Per-button text is capped at 20,000 characters (the mobile edit modal sets
 /// the same `maxLength`); labels at 64. Button count mirrors the setting's
@@ -117,12 +117,13 @@ pub async fn put_mobile_quick_buttons(
 
     let buttons = payload.buttons;
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = Config::load_or_warn();
-        config.web.mobile_quick_buttons = buttons;
-        // Keep the schema-visible count in lockstep with the stored array so
-        // the Settings number field and the rendered toolbar never disagree.
-        config.web.mobile_quick_button_count = config.web.mobile_quick_buttons.len() as u8;
-        save_config(&config)?;
+        let config = update_config(|config| {
+            config.web.mobile_quick_buttons = buttons;
+            // Keep the schema-visible count in lockstep with the stored array so
+            // the Settings number field and the rendered toolbar never disagree.
+            config.web.mobile_quick_button_count = config.web.mobile_quick_buttons.len() as u8;
+            config.clone()
+        })?;
         Ok::<_, anyhow::Error>(config)
     })
     .await;

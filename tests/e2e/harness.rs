@@ -36,6 +36,57 @@ pub fn app_dir_in(home: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// HOME isolation guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at the harness's tempdir
+/// for the test process and restores the prior values on `Drop`.
+/// `#[serial]` on every caller linearizes this against other tests in
+/// the binary; without the restore, a later test could inherit this
+/// test's (by-then-dropped) tempdir path.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+pub struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    /// Snapshots the current `HOME`/`XDG_CONFIG_HOME` before overriding them,
+    /// so `Drop` can restore the caller's real environment.
+    pub fn new(home: &Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; #[serial] linearizes this against every
+        // other #[serial] test in the binary, so no concurrent
+        // reader/writer exists.
+        unsafe { std::env::set_var("HOME", home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        /// Restores `key` to its prior value, or removes it if it was
+        /// previously unset.
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; #[serial] guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tmux availability guard
 // ---------------------------------------------------------------------------
 
@@ -480,6 +531,41 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(delay));
     }
 
+    /// Create a detached tmux session named `name` running `cmd` on the
+    /// harness socket, carrying the same environment [`spawn`](Self::spawn)
+    /// uses.
+    ///
+    /// Tests that stand up an agent tmux session *before* `spawn_tui` (so TUI
+    /// startup sees it as already running) must go through this rather than
+    /// calling `tmux` directly. A tmux server's global environment is fixed by
+    /// whichever client first starts it, and `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AOE_TMUX_SOCKET` are not in tmux's `update-environment` list, so a
+    /// later client cannot override them. A bare `Command::new("tmux")`
+    /// pre-create therefore pins the *real* environment onto the server and
+    /// `spawn`'s env is silently ignored: the TUI reads the real `$HOME`
+    /// (no seeded `config.toml` or `sessions.json`, so a first-run intro over
+    /// an empty list) and talks to the wrong tmux socket.
+    pub fn tmux_new_detached(&self, name: &str, cmd: &str) {
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["new-session", "-d", "-s", name, "-x", "80", "-y", "24"])
+            .arg(cmd)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env("TERM", "xterm-256color")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .expect("failed to run tmux new-session");
+
+        assert!(
+            output.status.success(),
+            "tmux new-session failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
@@ -576,6 +662,21 @@ last_seen_version = "{}"
     /// if the default timeout (10s) is exceeded.
     pub fn wait_for(&self, text: &str) {
         self.wait_for_timeout(text, Duration::from_secs(10));
+    }
+
+    /// Wait for the TUI to reach its ready home screen (the ` aoe ` banner)
+    /// after startup.
+    ///
+    /// On a freshly-isolated `$HOME` the harness has no `.schema_version`, so
+    /// the process runs every pending data migration from `v0` behind a
+    /// `◐ Running data migrations...` spinner before the banner paints. That
+    /// first-run work can outlast the default 10s `wait_for` on a slow or
+    /// loaded CI box, so tests that probe the banner right after `spawn_tui`
+    /// should use this instead of `wait_for(" aoe ")`; the longer budget only
+    /// covers the one-time migration gap and does not relax the default for
+    /// the many fast, steady-state waits that follow.
+    pub fn wait_for_ready(&self) {
+        self.wait_for_timeout(" aoe ", Duration::from_secs(30));
     }
 
     /// Like `wait_for` but with a custom timeout.
@@ -781,13 +882,18 @@ last_seen_version = "{}"
         }
     }
 
-    fn kill_session(&self) {
+    /// Tear down the whole tmux server on this test's private socket. Unlike
+    /// `kill-session -t <name>`, this also reaps every extra session the test
+    /// spawned on the same socket (tool, terminal, container-terminal, and
+    /// pre-created agent sessions), so no session and no server process, plus
+    /// the child agents/`sleep`s they hold, leak past the test. The socket is
+    /// unique per test (`home_dir/tmux.sock`), so this can never touch another
+    /// test's server. Best-effort: a missing server is not an error.
+    fn kill_server(&self) {
         let _ = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
-            .arg("kill-session")
-            .arg("-t")
-            .arg(&self.session_name)
+            .arg("kill-server")
             .output();
     }
 }
@@ -802,9 +908,13 @@ impl Drop for TuiTestHarness {
             let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
-        if self.spawned {
-            self.kill_session();
-        }
+        // Kill the entire per-test tmux server, not just the primary session:
+        // tests also create tool / terminal / pre-created agent sessions on
+        // this same private socket, and `spawn` may never have been called
+        // (e.g. a CLI-only test that pre-creates sessions via
+        // `tmux_new_detached`). Tearing down the server reaps them all and
+        // stops the run from accumulating orphaned tmux servers.
+        self.kill_server();
 
         // Convert recording to GIF if one was produced.
         if let Some(cast_path) = &self.cast_path {

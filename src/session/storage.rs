@@ -75,7 +75,9 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 
-use super::{get_app_dir, get_profile_dir, Group, Instance};
+use super::{
+    get_app_dir, get_profile_dir, get_profile_dir_path, resolve_existing_profile, Group, Instance,
+};
 
 /// Sidecar lock file name for per-profile storage. Lives next to
 /// `sessions.json` and `groups.json` and covers both: every code path that
@@ -168,6 +170,72 @@ pub(crate) fn atomic_write_following_symlinks(path: &Path, content: &[u8]) -> Re
     atomic_write(&resolve_symlink_chain(path)?, content)
 }
 
+/// Serialized read-modify-write of a small standalone data file.
+///
+/// Acquires an exclusive cross-process `flock` on a sidecar
+/// (`<dir>/.<file>.lock`), then, under the lock: reads `path` (missing or
+/// blank content parses to `T::default()`), runs `mutate`, and persists the
+/// result via [`atomic_write`]. The sidecar is deliberate: `atomic_write`
+/// replaces the data file by `rename(2)`, which would leave a lock taken on
+/// the data file itself attached to the orphaned inode, letting the next
+/// writer lock the new inode concurrently.
+///
+/// The file lands owner-only (0o600) on Unix: a fresh file gets tempfile's
+/// 0o600 default via `atomic_write`, and pre-existing files are re-tightened
+/// because some callers store secrets (e.g. `mcp_state.json`).
+///
+/// When `mutate` returns `Err`, the file is left untouched and the error
+/// comes back in the inner `Result`; a mutation may modify `T` before
+/// noticing it must fail, and persisting that half-applied state would
+/// destroy data the caller never meant to touch. The outer `Result` carries
+/// lock, parse, and write failures.
+///
+/// Symlinks at `path` are resolved up front and everything (sidecar lock,
+/// read, write) operates on the target: users symlink these files into
+/// dotfile repos, and a rename over the symlink would replace it with a
+/// regular file; locking the target also keeps two processes that reach the
+/// same file through different symlink paths mutually exclusive.
+pub(crate) fn locked_update<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl FnOnce(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    let path = &resolve_symlink_chain(path)?;
+    let dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "locked_update needs a path with a parent: {}",
+            path.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("locked_update needs a file path: {}", path.display()))?;
+    let lock_name = format!(".{}.lock", file_name.to_string_lossy());
+    let _flock = acquire_storage_flock(dir, &lock_name)?;
+
+    let mut value = match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => T::default(),
+        Ok(content) => parse(&content)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let result = mutate(&mut value);
+    if result.is_ok() {
+        atomic_write(path, serialize(&value)?.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(result)
+}
+
 /// Process-wide registry of per-profile save mutexes. Every `Storage::new` for
 /// a given profile name resolves to the same `Arc<Mutex<()>>`, so independent
 /// `Storage` handles in different parts of the process serialise correctly.
@@ -194,7 +262,7 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 /// RAII guard for a held cross-process `flock`. Drops via `fs2::FileExt::unlock`,
 /// which is also performed by the kernel when the file descriptor is closed,
 /// so a panic during the critical section still releases the lock.
-struct StorageFlock {
+pub(crate) struct StorageFlock {
     file: fs::File,
 }
 
@@ -219,7 +287,7 @@ impl Drop for StorageFlock {
 /// the rest of `<app_dir>` regardless of the caller's umask. The kernel
 /// releases the lock on process exit (including SIGKILL), so a crashed peer
 /// cannot wedge us forever.
-fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
     fs::create_dir_all(dir)?;
     let path = dir.join(name);
     #[cfg(unix)]
@@ -341,6 +409,45 @@ impl Storage {
     /// `Arc<FileWatchService>` instead.
     pub fn new_unwatched(profile: &str) -> Result<Self> {
         Self::new(profile, FileWatchService::noop())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_path(profile: &str, sessions_path: PathBuf) -> Self {
+        Self {
+            profile: profile.to_string(),
+            sessions_path,
+            save_lock: save_lock_for(profile),
+            file_watch: FileWatchService::noop(),
+        }
+    }
+
+    /// Construct a `Storage` for an existing profile, never creating it.
+    ///
+    /// Use this instead of [`Storage::new`] anywhere the caller is
+    /// referencing a profile rather than birthing one (every CLI read/write
+    /// path except the one that creates a brand-new session): resolving an
+    /// unknown `-p <name>` through `new`'s `get_profile_dir` silently
+    /// materializes an empty `profiles/<name>/` directory as a side effect
+    /// of the read.
+    pub fn open(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
+        let profile_name = resolve_existing_profile(profile)?;
+        let profile_dir = get_profile_dir_path(&profile_name)?;
+        let sessions_path = profile_dir.join("sessions.json");
+        let save_lock = save_lock_for(&profile_name);
+
+        Ok(Self {
+            profile: profile_name,
+            sessions_path,
+            save_lock,
+            file_watch,
+        })
+    }
+
+    /// [`Storage::open`] wired to a noop `FileWatchService`. See
+    /// [`Storage::new_unwatched`] for why CLI subprocesses want the noop
+    /// watcher.
+    pub fn open_unwatched(profile: &str) -> Result<Self> {
+        Self::open(profile, FileWatchService::noop())
     }
 
     pub fn profile(&self) -> &str {
@@ -730,14 +837,143 @@ fn save_recent_projects(store: &RecentProjects) -> Result<()> {
 mod tests {
     use super::*;
     use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
     use crate::session::GroupTree;
     use serial_test::serial;
     use tempfile::tempdir;
 
-    fn setup_test_home(temp: &std::path::Path) {
-        std::env::set_var("HOME", temp);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
+        isolate_app_dir_at(temp)
+    }
+
+    /// True when the effective uid is 0. Root bypasses the Unix DAC permission
+    /// bits, so a test that injects a write failure by making a dir read-only
+    /// cannot make the write fail and must skip rather than assert `is_err()`.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        nix::unistd::geteuid().is_root()
+    }
+
+    fn parse_u64(s: &str) -> Result<u64> {
+        Ok(s.trim().parse::<u64>()?)
+    }
+
+    fn serialize_u64(v: &u64) -> Result<String> {
+        Ok(v.to_string())
+    }
+
+    #[test]
+    fn locked_update_missing_file_starts_from_default() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        let seen = locked_update(&path, parse_u64, serialize_u64, |v| {
+            let seen = *v;
+            *v += 1;
+            Ok::<_, anyhow::Error>(seen)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(seen, 0, "missing file must parse as T::default()");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+    }
+
+    #[test]
+    fn locked_update_round_trips_existing_content() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+        locked_update(&path, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "42");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "data file must land owner-only");
+        }
+    }
+
+    #[test]
+    fn locked_update_concurrent_writers_lose_no_updates() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        const THREADS: usize = 4;
+        const INCREMENTS: usize = 25;
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..INCREMENTS {
+                    locked_update(&path, parse_u64, serialize_u64, |v| {
+                        *v += 1;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            (THREADS * INCREMENTS).to_string(),
+            "every increment must land; the sidecar flock serializes read-modify-write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_update_preserves_symlinks() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real-counter.txt");
+        std::fs::write(&target, "41").unwrap();
+        let link = tmp.path().join("counter.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        locked_update(&link, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive; a rename over it would desync dotfile setups"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "42");
+    }
+
+    #[test]
+    fn locked_update_failed_mutation_leaves_file_untouched() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("counter.txt");
+        std::fs::write(&path, "41").unwrap();
+
+        let inner = locked_update(&path, parse_u64, serialize_u64, |v| {
+            *v += 1;
+            Err::<(), _>(anyhow!("validation failed after mutating"))
+        })
+        .unwrap();
+
+        assert!(inner.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "41",
+            "a failed mutation must not persist half-applied state"
+        );
     }
 
     #[cfg(unix)]
@@ -832,7 +1068,7 @@ mod tests {
     #[serial]
     fn test_storage_roundtrip() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-profile")?;
 
@@ -857,9 +1093,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_open_unwatched_errors_on_unknown_profile_without_creating_dir() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        let profile_dir = guard.path().join("profiles").join("ghost");
+        assert!(!profile_dir.exists());
+
+        let result = Storage::open_unwatched("ghost");
+        let err = match result {
+            Ok(_) => panic!("unknown profile must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(
+            !profile_dir.exists(),
+            "open_unwatched must not create profiles/<name>/ as a side effect",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_unwatched_succeeds_for_created_profile() {
+        let temp = tempdir().unwrap();
+        let _guard = setup_test_home(temp.path());
+        crate::session::create_profile("known").unwrap();
+
+        let storage = Storage::open_unwatched("known").expect("known profile must open");
+        assert_eq!(storage.profile(), "known");
+    }
+
+    #[test]
+    #[serial]
     fn test_load_skips_corrupt_row_and_quarantines() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-profile")?;
 
         // [ valid, malformed, valid ]: the malformed row is an object that
@@ -913,7 +1180,7 @@ mod tests {
     #[serial]
     fn test_load_top_level_corruption_still_errors() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-profile")?;
 
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
@@ -946,7 +1213,7 @@ mod tests {
         // resolves through `resolve_default_profile`, which bootstraps the
         // first profile. The name is "main", never the magic "default".
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("")?;
         assert_eq!(storage.profile(), "main");
@@ -959,7 +1226,7 @@ mod tests {
         // When profiles already exist, an empty profile argument resolves to
         // the first one (sorted), not a hard-coded name.
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         get_profile_dir("work")?;
         get_profile_dir("personal")?;
@@ -975,15 +1242,13 @@ mod tests {
         // An explicitly configured default_profile wins over the first-found
         // directory.
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         get_profile_dir("work")?;
         get_profile_dir("personal")?;
-        let config = super::super::config::Config {
-            default_profile: "work".to_string(),
-            ..Default::default()
-        };
-        super::super::config::save_config(&config)?;
+        super::super::config::update_config(|config| {
+            config.default_profile = "work".to_string();
+        })?;
 
         let storage = Storage::new_unwatched("")?;
         assert_eq!(storage.profile(), "work");
@@ -994,7 +1259,7 @@ mod tests {
     #[serial]
     fn test_storage_new_with_custom_profile() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("custom-profile")?;
         assert_eq!(storage.profile(), "custom-profile");
@@ -1005,7 +1270,7 @@ mod tests {
     #[serial]
     fn test_storage_load_nonexistent_file() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-empty")?;
         let loaded = storage.load()?;
@@ -1018,7 +1283,7 @@ mod tests {
     #[serial]
     fn test_storage_load_empty_file() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-empty-file")?;
 
@@ -1035,7 +1300,7 @@ mod tests {
     #[serial]
     fn test_storage_load_whitespace_only_file() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-whitespace")?;
 
@@ -1051,7 +1316,7 @@ mod tests {
     #[serial]
     fn test_storage_save_leaves_no_temp_files() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-no-debris")?;
 
@@ -1085,7 +1350,7 @@ mod tests {
     #[serial]
     fn test_storage_save_empty_array() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-empty-save")?;
         {
@@ -1106,7 +1371,7 @@ mod tests {
     #[serial]
     fn test_storage_load_with_groups_no_groups_file() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-no-groups")?;
 
@@ -1127,7 +1392,7 @@ mod tests {
     #[serial]
     fn test_storage_save_and_load_with_groups() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-with-groups")?;
 
@@ -1154,7 +1419,7 @@ mod tests {
     #[serial]
     fn test_load_with_groups_skips_corrupt_row_and_quarantines() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-groups-corrupt-row")?;
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
@@ -1206,7 +1471,7 @@ mod tests {
     #[serial]
     fn test_load_with_groups_repeated_read_overwrites_quarantine() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-groups-corrupt-row-repeat")?;
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
@@ -1240,7 +1505,7 @@ mod tests {
     #[serial]
     fn test_load_with_groups_top_level_corruption_still_errors() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-groups-top-level-corrupt")?;
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
@@ -1267,7 +1532,7 @@ mod tests {
     #[serial]
     fn test_storage_load_invalid_json() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-invalid")?;
 
@@ -1283,7 +1548,7 @@ mod tests {
     #[serial]
     fn test_storage_preserves_instance_fields() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-fields")?;
 
@@ -1316,7 +1581,7 @@ mod tests {
     #[serial]
     fn test_storage_profile_accessor() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Verify profiles are correctly named
         let storage1 = Storage::new_unwatched("profile-alpha")?;
@@ -1334,7 +1599,7 @@ mod tests {
     #[serial]
     fn test_storage_groups_file_empty() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-empty-groups")?;
 
@@ -1362,7 +1627,7 @@ mod tests {
     #[serial]
     fn test_workspace_ordering_roundtrip() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Empty by default.
         let empty = load_workspace_ordering()?;
@@ -1386,7 +1651,7 @@ mod tests {
     #[serial]
     fn test_workspace_ordering_overwrites_on_save() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         save_workspace_ordering(&WorkspaceOrdering {
             order: vec!["a".to_string(), "b".to_string()],
@@ -1404,7 +1669,7 @@ mod tests {
     #[serial]
     fn test_workspace_ordering_handles_empty_file() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let path = workspace_ordering_path()?;
         if let Some(parent) = path.parent() {
@@ -1421,7 +1686,7 @@ mod tests {
     #[serial]
     fn test_update_atomic_load_modify_save() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-update-roundtrip")?;
         storage.update(|i, g| {
@@ -1446,7 +1711,7 @@ mod tests {
     #[serial]
     fn test_update_propagates_closure_error() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-update-err")?;
         let initial = vec![Instance::new("keep", "/tmp/keep")];
@@ -1472,7 +1737,7 @@ mod tests {
     #[serial]
     fn test_update_serializes_concurrent_writers_same_profile() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-update-concurrent")?;
         storage.update(|i, g| {
@@ -1521,7 +1786,7 @@ mod tests {
     #[serial]
     fn test_update_does_not_serialize_across_profiles() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage_a = Storage::new_unwatched("test-update-profile-a")?;
         let storage_b = Storage::new_unwatched("test-update-profile-b")?;
@@ -1557,7 +1822,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-commit-lock")?;
         storage.update(|i, g| {
@@ -1620,7 +1885,7 @@ mod tests {
     #[serial]
     fn test_workspace_ordering_update_serializes() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         update_workspace_ordering(|ord| {
             ord.order.clear();
@@ -1655,7 +1920,7 @@ mod tests {
     #[serial]
     fn test_profile_lock_registry_returns_same_arc_for_same_profile() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let s1 = Storage::new_unwatched("test-registry-shared")?;
         let s2 = Storage::new_unwatched("test-registry-shared")?;
@@ -1670,7 +1935,7 @@ mod tests {
     #[serial]
     fn test_update_writes_both_sessions_and_groups_files() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-update-both-files")?;
         storage.update(|i, g| {
@@ -1699,7 +1964,7 @@ mod tests {
     #[serial]
     fn test_update_closure_err_leaves_both_files_untouched() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-update-err-untouched")?;
         let seed = vec![Instance::new("seed", "/tmp/seed")];
@@ -1734,8 +1999,16 @@ mod tests {
     async fn test_update_write_failure_emits_no_notify() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        if running_as_root() {
+            eprintln!(
+                "test_update_write_failure_emits_no_notify: skipping (running as root; \
+                 uid 0 bypasses the read-only dir bit, so the write cannot be made to fail)"
+            );
+            return Ok(());
+        }
+
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let svc = FileWatchService::new().expect("live svc");
         let storage = Storage::new("test-update-no-notify", svc.clone())?;
@@ -1813,7 +2086,7 @@ mod tests {
     #[serial]
     fn test_update_skips_groups_write_when_groups_unchanged() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-skip-groups-write")?;
         let seed_instances = [Instance::new("seed", "/tmp/seed")];
@@ -1845,7 +2118,7 @@ mod tests {
     #[serial]
     fn test_update_rewrites_groups_when_changed() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage = Storage::new_unwatched("test-rewrite-groups")?;
         let seed_instances = [Instance::new("seed", "/tmp/seed")];
@@ -1877,7 +2150,7 @@ mod tests {
     #[serial]
     fn test_save_lock_registry_recovers_from_poison() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         let storage_outer = Storage::new_unwatched("test-poison-recovery")?;
         let _ = std::thread::spawn(move || {
@@ -1930,7 +2203,7 @@ mod tests {
     #[serial]
     fn record_recent_project_upserts_sorts_and_caps() -> Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Capacity + 5 distinct projects, oldest first.
         for i in 0..(RECENT_PROJECTS_CAP + 5) {

@@ -7,10 +7,9 @@ import { SelectField, SliderField, TextField } from "./FormFields";
 
 /** Props every custom settings widget receives. A custom widget renders one
  *  schema field whose `widget.kind === "custom"`; it owns any bespoke encoding
- *  (e.g. the sound `mode` enum) and any widget-specific post-save side-effect
- *  (e.g. repainting the dashboard after a theme change). Section-level effects
- *  (the acp serverAbout refresh) live in SchemaSection's `onAfterSave`, not
- *  here. */
+ *  and any widget-specific post-save side-effect (e.g. repainting the
+ *  dashboard after a theme change). Section-level effects (the acp
+ *  serverAbout refresh) live in SchemaSection's `onAfterSave`, not here. */
 export interface CustomWidgetProps {
   descriptor: SettingsFieldDescriptor;
   value: unknown;
@@ -76,11 +75,12 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
   );
 }
 
-/** Smart-rename agent picker. Lists installed one-shot-capable agents plus a
- *  "Same as session" default (empty string), so the one-shot title call can be
- *  pointed at a cheaper or more obedient model than the session's own agent.
- *  Mirrors the TUI `smart-rename-agent` widget; the install + one-shot filter
- *  keeps the dropdown to agents the rename would actually work on. */
+/** Utility agent picker (smart rename + conversation summary). Lists
+ *  installed one-shot-capable agents plus a "Same as session" default (empty
+ *  string), so one-shot utility calls can be pointed at a cheaper or more
+ *  obedient model than the session's own agent. Mirrors the TUI
+ *  `smart-rename-agent` widget; the install + one-shot filter keeps the
+ *  dropdown to agents the one-shot would actually work on. */
 export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
   const { t } = useTranslation();
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -233,6 +233,57 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Per-agent model for the smart-rename title one-shot. The `smart_rename_model`
+ *  field is an `{ agent: model }` map; one free-text row per installed
+ *  one-shot-capable agent. Clearing a row removes the key, so the agent falls
+ *  back to its built-in default (claude pins `haiku`, others the CLI default).
+ *  The third "force CLI default" state (an explicit empty-string value, opting
+ *  out of the built-in pin) is only meaningful for claude and is settable via
+ *  the TUI or config.toml, not this widget. Ids are free-form because AoE pins
+ *  no CLI version. */
+export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidgetProps) {
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  useEffect(() => {
+    fetchAgents()
+      .then(setAgents)
+      .catch(() => setAgents([]));
+  }, []);
+  const models = (value ?? {}) as Record<string, string>;
+  const saveModel = (agent: string, model: string) => {
+    const next = { ...models };
+    const trimmed = model.trim();
+    if (trimmed === "") {
+      delete next[agent];
+    } else {
+      next[agent] = trimmed;
+    }
+    save(next);
+  };
+  const tunable = agents.filter((a) => a.installed && a.oneshot_capable);
+  return (
+    <div className="space-y-4">
+      <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>
+      {descriptor.description && <p className="text-xs text-text-dim">{descriptor.description}</p>}
+      {tunable.length === 0 ? (
+        <p className="text-xs text-text-dim">No one-shot-capable agents installed.</p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {tunable.map((a) => (
+            <TextField
+              key={a.name}
+              label={a.name}
+              value={models[a.name] ?? ""}
+              onChange={(v) => saveModel(a.name, v)}
+              placeholder="Built-in default"
+              mono
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

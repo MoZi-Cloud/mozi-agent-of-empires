@@ -77,23 +77,21 @@ pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
 }
 
 async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, groups) = storage.load_with_groups()?;
 
     let group_tree = GroupTree::new_with_groups(&instances, &groups);
+    let session_count = |path: &str| instances.iter().filter(|i| i.group_path == path).count();
 
     if args.json {
         let group_list: Vec<GroupInfo> = group_tree
             .get_all_groups()
             .iter()
-            .map(|g| {
-                let session_count = instances.iter().filter(|i| i.group_path == g.path).count();
-                GroupInfo {
-                    name: g.name.clone(),
-                    path: g.path.clone(),
-                    session_count,
-                    children: g.children.iter().map(|c| c.name.clone()).collect(),
-                }
+            .map(|g| GroupInfo {
+                name: g.name.clone(),
+                path: g.path.clone(),
+                session_count: session_count(&g.path),
+                children: g.children.iter().map(|c| c.name.clone()).collect(),
             })
             .collect();
         super::output::print_json(&group_list)?;
@@ -107,10 +105,7 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 
         println!("Groups:\n");
         for group in &all_groups {
-            let session_count = instances
-                .iter()
-                .filter(|i| i.group_path == group.path)
-                .count();
+            let session_count = session_count(&group.path);
             let indent = group.path.matches('/').count();
             println!(
                 "{}• {} ({} sessions)",
@@ -126,7 +121,7 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 }
 
 async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     let name = args.name.trim().to_string();
     let group_path = if let Some(parent) = &args.parent {
@@ -150,7 +145,7 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
 }
 
 async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let name = args.name.trim().to_string();
     let force = args.force;
 
@@ -195,18 +190,16 @@ async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
 }
 
 async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let identifier = args.identifier.trim().to_string();
     let group = args.group.trim().to_string();
 
     let old_group = storage.update(|instances, groups| {
-        let id = super::resolve_session(&identifier, instances)?.id.clone();
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .expect("resolve_session returned an id that is no longer in instances");
-        let old = inst.group_path.clone();
-        inst.group_path = group.clone();
+        let old = super::patch_instance(instances, &identifier, |inst| {
+            let old = inst.group_path.clone();
+            inst.group_path = group.clone();
+            Ok(old)
+        })?;
 
         if !group.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(instances, groups);

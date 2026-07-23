@@ -1620,6 +1620,30 @@ fn test_cli_add_scratch_conflicts_with_worktree_flag() {
     );
 }
 
+/// #1051: `aoe ps --json` is substrate-agnostic and fail-soft. On an empty
+/// profile with no tmux server it must emit an empty JSON array and exit 0,
+/// never abort because a substrate probe failed.
+#[test]
+#[serial]
+fn test_cli_ps_empty_json() {
+    let h = TuiTestHarness::new("cli_ps_empty_json");
+
+    let output = h.run_cli(&["ps", "--json"]);
+    assert!(
+        output.status.success(),
+        "aoe ps --json should succeed on an empty profile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("aoe ps --json must emit valid JSON");
+    assert!(
+        value.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "expected an empty JSON array, got:\n{stdout}"
+    );
+}
+
 /// `aoe stop` (with or without args) is a hidden trap, not a real command: it
 /// must exit non-zero and redirect the user to the scoped stop verbs and
 /// `killall` rather than silently doing nothing or triggering a teardown.

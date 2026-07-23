@@ -736,7 +736,7 @@ export async function dismissPluginUpdate(id: string, fingerprint: string): Prom
  *  validates it to this closed set; each surface maps it to a color. */
 export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
-/** The nine host-rendered slots, kebab-case as the host serializes them. */
+/** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
   | "row-badge"
@@ -745,7 +745,10 @@ export type PluginUiSlot =
   | "filter-facet"
   | "card"
   | "pane"
+  | "composer-action"
   | "detail-badge"
+  | "settings-page"
+  | "tool-card-badge"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by
@@ -767,6 +770,10 @@ export interface PluginUiNotification {
   title: string;
   body?: string;
   session_id?: string;
+  /** A URL a worker asked the surface to open (`ui.open_url`). When present the
+   *  toast is rendered as click-to-open: a browser blocks `window.open` from an
+   *  async push, so the open happens on the user's click. Always http/https. */
+  href?: string;
 }
 
 export interface PluginUiState {
@@ -807,19 +814,19 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
 }
 
 /** A worker accepted an action. `baselineRevision` is the scope's UI mutation
- *  counter the host read before forwarding; the pane holds its spinner until
- *  the polled counter moves off this value. `null` means the daemon did not
- *  report a baseline (older daemon), so the caller skips the wait and just
+ *  counter the host read before forwarding; the UI action can hold its spinner
+ *  until the polled counter moves off this value. `null` means the daemon did
+ *  not report a baseline (older daemon), so the caller skips the wait and just
  *  clears when the POST settles. */
 export interface PluginActionAccepted {
   baselineRevision: number | null;
 }
 
 /**
- * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
- * worker. Fire-and-forget at the worker: the worker runs the named method and
- * re-pushes its UI state, which a later ui-state poll renders. `sessionId`
- * scopes the baseline revision to the firing pane's session. Returns the
+ * Forward a plugin UI action (e.g. a "Refresh" or composer button) to the
+ * plugin's worker. Fire-and-forget at the worker: the worker runs the named
+ * method and re-pushes its UI state, which a later ui-state poll renders.
+ * `sessionId` scopes the baseline revision to the firing UI's session. Returns the
  * accepted baseline (or null if the daemon omitted one), or null on read-only
  * (403), no running worker (404), or network failure.
  */
@@ -843,6 +850,27 @@ export async function invokePluginAction(
     return { baselineRevision: rev };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Invoke an action-less plugin command (`POST /api/plugins/commands/{fqid}/invoke`).
+ * These commands (e.g. the GitHub plugin's `status` / `refresh`) carry no client
+ * `action`, so the host dispatches a fixed `plugin.command.invoke` notification
+ * to the worker. Fire-and-forget: `true` means the daemon accepted and
+ * dispatched it, `false` on read-only, unknown command/session, no worker, or
+ * network failure.
+ */
+export async function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -1190,21 +1218,6 @@ export interface ServerAbout {
    *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
   acp_show_tool_durations: boolean;
-  /** Resolved `acp.queue_drain_mode` from the active profile's
-   *  config. Selects how the composer drains client-side queued
-   *  follow-up prompts on Stopped: `combined` (default) joins them
-   *  with blank lines into a single prompt; `serial` fires one entry
-   *  at a time. See #1031. */
-  acp_queue_drain_mode: "combined" | "serial";
-  /** Resolved `acp.max_concurrent_resumes` from the active
-   *  profile's config. Upper bound on parallel acp worker
-   *  spawns/attaches the reconciler runs on `aoe serve` cold start.
-   *  See #1088. */
-  acp_max_concurrent_resumes: number;
-  /** Resolved `acp.force_end_turn_threshold_secs` from the active
-   *  profile's config. Seconds of streaming inactivity after which
-   *  the acp web UI offers a "Force end turn" button. See #1100. */
-  acp_force_end_turn_threshold_secs: number;
   /** Resolved `acp.replay_events` from the active profile's
    *  config. Per-session retention cap on the acp event log;
    *  0 means unlimited. Mirrored onto the in-memory activity buffer
@@ -1296,7 +1309,6 @@ export interface UpdateStatus {
   latest_version: string | null;
   update_available: boolean;
   release_url: string | null;
-  web_poll_interval_minutes: number;
   error: string | null;
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */
@@ -1441,6 +1453,31 @@ export async function switchAcpAgent(
   });
 }
 
+/** Response from the view-switch endpoints. `view` is the session's view
+ *  after the swap. */
+export interface ViewSwitchResponse {
+  session_id: string;
+  view?: "structured" | "terminal";
+}
+
+/** Switch a session into structured view (POST /acp/enable). For a claude
+ *  session with a resumable transcript the conversation is carried over; other
+ *  agents restart fresh. Resolves with the updated view or null on non-2xx. */
+export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, {
+    method: "POST",
+  });
+}
+
+/** Switch a session back to a terminal (POST /acp/disable). A claude session's
+ *  conversation continues via `claude --resume`; other agents restart fresh.
+ *  Resolves with the updated view or null on non-2xx. */
+export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
+    method: "POST",
+  });
+}
+
 // --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {
@@ -1566,6 +1603,30 @@ export async function browseFilesystem(
 
 export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+}
+
+/** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
+ *  `depends` carries the current values of the widget's `depends_on` siblings
+ *  in declaration order (for acp_models/acp_modes the first entry is the
+ *  selected agent). Returns [] on any failure so the picker degrades to an
+ *  empty list rather than throwing. */
+export async function resolvePluginOptions(
+  pluginId: string,
+  source: string,
+  depends: string[],
+): Promise<{ value: string; label: string }[]> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, depends }),
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { options?: { value: string; label: string }[] };
+    return body.options ?? [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
@@ -2011,6 +2072,33 @@ export async function smartRenameSession(id: string): Promise<{ ok: boolean; mes
 }
 
 /**
+ * Request an on-demand "summary of the conversation so far" for a
+ * structured-view session (see #2808). Best-effort: a 202 means the summary
+ * one-shot started, and the result arrives later as a ConversationSummary
+ * event over the structured-view WS. Returns the server's message on a gate
+ * failure (not structured, no one-shot agent, sandboxed) so the caller can
+ * surface it.
+ */
+export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller
@@ -2115,6 +2203,23 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
+/** Set (or clear, with `null`) a session's color label. Rendered as a colored
+ *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
+ *  settable from the CLI via `aoe session color`. See #2383. */
+export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/color`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ color }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Archive or unarchive a session. On archive (with `killPane` true or
  *  omitted), the server tears down all tmux sessions and shuts down the
  *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
@@ -2140,7 +2245,7 @@ export async function setSessionArchive(
 /** Move a session to the trash (#2489): stops the live session (ACP
  *  shutdown, which preserves the transcript, plus optional tmux teardown)
  *  and hides it from the normal list while keeping every durable artifact so
- *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+ *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/trash`, {
@@ -2269,30 +2374,57 @@ export interface DeleteSessionOptions {
   keep_scratch?: boolean;
 }
 
-export interface DeleteSessionResult {
+export interface WorkspaceDeleteFailure {
+  id: string;
+  error: string;
+}
+
+export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
   messages?: string[];
+  /** Ids the server actually deleted. */
+  deleted?: string[];
+  /** Sessions that could not be deleted, with their error. */
+  failed?: WorkspaceDeleteFailure[];
 }
 
-export async function deleteSession(id: string, options: DeleteSessionOptions = {}): Promise<DeleteSessionResult> {
+/** Atomically delete a whole multi-session workspace in one call (#2536).
+ *  `sessionIds` is the workspace's full session set in display order; the
+ *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
+ *  rest as record-only siblings. Replaces the old per-session delete fan-out,
+ *  so a mid-delete disconnect can no longer half-delete the workspace. */
+export async function deleteWorkspace(
+  sessionIds: string[],
+  options: DeleteSessionOptions = {},
+): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await fetch(`/api/workspaces`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options),
+      body: JSON.stringify({ session_ids: sessionIds, ...options }),
     });
+    const data = (await res.json().catch(() => ({}))) as {
+      message?: string;
+      messages?: string[];
+      deleted?: string[];
+      failed?: WorkspaceDeleteFailure[];
+    };
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
+        failed: data.failed,
       };
     }
-    const data = (await res.json().catch(() => ({}))) as {
-      messages?: string[];
-    };
-    return { ok: true, messages: data.messages };
+    // The endpoint always reports which sessions it removed. A 2xx without a
+    // `deleted` array is not a confirmed deletion, so treat it as a failure
+    // rather than dropping local state (drafts, caches) for sessions the
+    // server may not have touched.
+    if (!Array.isArray(data.deleted)) {
+      return { ok: false, error: "Server did not confirm which sessions were deleted" };
+    }
+    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
   } catch (e) {
     return {
       ok: false,
