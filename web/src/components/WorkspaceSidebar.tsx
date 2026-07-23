@@ -1302,7 +1302,10 @@ export const SessionRow = memo(function SessionRow({
   // stop/start API so the saved agent session id is resumed safely.
   const canInjectProxy =
     !readOnly &&
-    firstSession?.view === "terminal" &&
+    !!firstSession &&
+    // Terminal sessions omit `view` on the wire (only Structured is
+    // serialized), so terminal means "not structured", not === "terminal".
+    firstSession.view !== "structured" &&
     !firstSession.is_sandboxed &&
     ["Waiting", "Idle", "Stopped"].includes(sessionStatus);
 
