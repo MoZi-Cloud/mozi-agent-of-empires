@@ -121,14 +121,12 @@ impl ContainerRuntime {
                 // permission_denied markers without new fixtures silently
                 // breaks the classifier. See is_container_running above and
                 // the pinning comment at #2596 / #2652.
-                let output = self
-                    .base
-                    .command()
-                    .args(["container", "inspect", name])
-                    .output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["container", "inspect", name]);
+                let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_exists_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
                 Ok(true)
             }
@@ -148,10 +146,12 @@ impl ContainerRuntime {
                 // TODO: verify Apple `container logs` semantics on
                 //       stopped-but-existing containers (cf. #2730 for
                 //       fixture capture).
-                let output = self.base.command().args(["logs", name]).output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["logs", name]);
+                let output = self.base.probe_output(&mut cmd)?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_exists_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
                 Ok(true)
             }
@@ -166,15 +166,13 @@ impl ContainerRuntime {
                 // ("No such container" vs "No such object"), and DOCKER_MISSING
                 // in the runtime_base tests pins the former. Changing this argv
                 // silently breaks is_not_found classification. See #2596.
-                let output = self
-                    .base
-                    .command()
-                    .args(["container", "inspect", "-f", "{{.State.Running}}", name])
-                    .output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["container", "inspect", "-f", "{{.State.Running}}", name]);
+                let output = self.base.probe_output(&mut cmd)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_inspect_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -182,17 +180,22 @@ impl ContainerRuntime {
             }
             RuntimeKind::AppleContainer => {
                 // Apple's `container inspect` is the only inspect subcommand
-                // (no `container container inspect`), but the stderr wording
-                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers
-                // (`container with id`) and daemon_down_markers. Do not
-                // tighten this argv or those markers without capturing new
+                // (no `container container inspect`), and its stderr wording
+                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers:
+                // it covers both the inspect-specific shape
+                // (`container not found: <name>`) and the logs/delete shape
+                // (`container with ID <id> not found`). The classifier
+                // separately checks daemon_down_markers. Do not tighten this
+                // argv or either marker list without capturing new
                 // fixtures; same silent-break risk as the Docker/Podman
                 // comment above. See #2596.
-                let output = self.base.command().args(["inspect", name]).output()?;
+                let mut cmd = self.base.command();
+                cmd.args(["inspect", name]);
+                let output = self.base.probe_output(&mut cmd)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_inspect_failure(&stderr);
+                    return self.base.classify_probe_failure(&stderr);
                 }
 
                 let out_json: Value = serde_json::from_slice(&output.stdout)

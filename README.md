@@ -41,7 +41,7 @@ A session manager for AI coding agents on Linux and macOS, driven from the termi
 
 ## Features
 
-- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code
+- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code
 - **TUI dashboard**: visual interface to create, monitor, and manage sessions
 - **Web dashboard**: create, monitor, and control your agents from any browser, installable as a PWA
 - **Mobile web terminal copy**: select agent terminal text on a phone and a Copy button floats over the selection; tap to copy, works over plain HTTP on LAN/Tailscale where the browser clipboard API is unavailable (a limitation that blocks most xterm.js based web terminals on touch)
@@ -137,7 +137,7 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 
 ### Which AI tools are supported?
 
-Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code. AoE auto-detects which are installed on your system.
+Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code. AoE auto-detects which are installed on your system.
 
 ### Can I use AoE over SSH?
 

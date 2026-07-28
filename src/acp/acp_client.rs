@@ -23,9 +23,10 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    FileSystemCapabilities, ForkSessionRequest, ForkSessionResponse, ImageContent, Implementation,
+    InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
+    LoadSessionRequest, LoadSessionResponse, McpServer, MessageId, NewSessionRequest,
+    NewSessionResponse, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
@@ -63,6 +64,7 @@ use super::state::{
     StartupErrorDetail, ToolCall, ToolOutputBlock, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
+use crate::acp::control_protocol::{self, ControlBody};
 use crate::session::SandboxInfo;
 
 #[derive(Debug, Error)]
@@ -480,13 +482,12 @@ const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::fr
 /// See #1360, #1401, and upstream `agentclientprotocol/claude-agent-acp#336`.
 const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Accelerated silent-orphan grace fallback used when a cost-populated
+/// Accelerated silent-orphan grace used when a cost-populated
 /// `UsageUpdate` notification has arrived for the current prompt. The
 /// daemon treats that frame as claude-agent-acp's "wrap up accounting"
 /// terminal-candidate marker emitted just before `PromptResponse`;
 /// when the prompt response then fails to arrive, recovery doesn't
-/// need the full vendor-agnostic grace. Mirrors
-/// `AcpConfig::silent_orphan_fast_grace_secs` default. See
+/// need the full vendor-agnostic grace. See
 /// `silent_orphan_fast_grace()`.
 const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -685,6 +686,15 @@ pub(crate) enum LifecycleSignal {
     /// wall-clock jumps don't perturb the suppression. After the
     /// deadline the watchdog rearms with its normal grace. See #1401.
     WakeupPending { at: chrono::DateTime<chrono::Utc> },
+    /// The `/compact` cycle started ("Compacting..." text chunk). Latches
+    /// `OffProtocolWorkKind::Compaction` so the silent summarization window
+    /// keeps the off-protocol grace floor instead of the base grace, which
+    /// otherwise cancels a large compaction after 120s. See #2898.
+    CompactionStarted,
+    /// The `/compact` cycle finished ("Compacting completed." text chunk).
+    /// Clears the compaction suppression so any continued work in the same
+    /// turn recovers on the normal grace. See #2898.
+    CompactionCompleted,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -697,12 +707,28 @@ pub(crate) enum LifecycleSignal {
 fn classify_lifecycle_signal(
     update: &agent_client_protocol::schema::v1::SessionUpdate,
 ) -> Option<LifecycleSignal> {
-    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, ToolCallStatus};
     match update {
         SessionUpdate::UsageUpdate(u) if u.cost.is_some() => Some(LifecycleSignal::TerminalUsage),
-        SessionUpdate::AgentMessageChunk(_)
-        | SessionUpdate::AgentThoughtChunk(_)
-        | SessionUpdate::Plan(_) => Some(LifecycleSignal::Progress),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            // /compact surfaces only as text chunks; detect its start/end
+            // markers so the watchdog suppresses the silent summarization
+            // window instead of cancelling it. Check completion before start
+            // so a future marker-wording drift can't misroute the end as a
+            // fresh start. Everything else is ordinary progress. See #2898.
+            if let ContentBlock::Text(t) = &chunk.content {
+                if is_compact_completion(&t.text) {
+                    return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_start(&t.text) {
+                    return Some(LifecycleSignal::CompactionStarted);
+                }
+            }
+            Some(LifecycleSignal::Progress)
+        }
+        SessionUpdate::AgentThoughtChunk(_) | SessionUpdate::Plan(_) => {
+            Some(LifecycleSignal::Progress)
+        }
         SessionUpdate::ToolCall(tc) => {
             let is_background_task = tc
                 .raw_input
@@ -780,6 +806,14 @@ pub(crate) enum OffProtocolWorkKind {
     /// outlasts the turn's final accounting frame. See #1360, #1401, and
     /// the monitor-killed-by-watchdog regression.
     ScheduledWakeup,
+    /// The Claude adapter's `/compact` command. It hides a long context
+    /// summarization API call behind a single "Compacting..." text chunk
+    /// with no further ACP progress until "Compacting completed.". Bounded
+    /// by the turn: dropped on `TerminalUsage` (like `BackgroundCommand`)
+    /// and on the explicit completion marker, so a lost `PromptResponse`
+    /// still self-heals on the fast grace rather than holding the 30-minute
+    /// floor. See #2898.
+    Compaction,
 }
 
 /// Per-tool metadata stored in the silent-orphan watchdog's
@@ -870,6 +904,30 @@ impl SilentOrphanWatchdog {
                 self.cost_seen = false;
                 self.last_refresh_was_progress = true;
             }
+            LifecycleSignal::CompactionStarted => {
+                // Treat the "Compacting..." marker as progress for timer
+                // purposes, then latch the off-protocol floor so the quiet
+                // summarization window that follows is not read as a wedge.
+                // See #2898.
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+                self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
+            }
+            LifecycleSignal::CompactionCompleted => {
+                // Compaction finished; drop its suppression so any continued
+                // work in the same turn recovers on the normal grace. Guard
+                // the clear to Compaction so a completion marker cannot erase
+                // an unrelated off-protocol kind. See #2898.
+                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::Compaction) {
+                    self.off_protocol_work_seen = None;
+                }
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+            }
             LifecycleSignal::ToolStarted {
                 id,
                 is_background_task,
@@ -942,7 +1000,16 @@ impl SilentOrphanWatchdog {
                 // idles waiting and resumes in-band), so their floor is
                 // left intact to preserve the #1360 fix and the monitor
                 // fix; only the fire-and-forget BackgroundCommand drops.
-                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
+                //
+                // Compaction is likewise turn-bounded: the summarization
+                // call ends before the final accounting frame, so dropping
+                // it here lets a lost PromptResponse after `/compact` recover
+                // on the fast grace instead of holding the floor for 30
+                // minutes. See #2898.
+                if matches!(
+                    self.off_protocol_work_seen,
+                    Some(OffProtocolWorkKind::BackgroundCommand | OffProtocolWorkKind::Compaction)
+                ) {
                     self.off_protocol_work_seen = None;
                 }
             }
@@ -1229,6 +1296,25 @@ fn between_prompt_should_fire(
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
 
+/// Terminal `Stopped` reason for a between-prompt idle-watchdog fire.
+///
+/// An adopted turn (`Resume { in_flight_turn: true }`, #2899) has no owning
+/// `prompt_fut`, so this watchdog emits its terminal event. If it reached its
+/// cost-populated end-of-turn `UsageUpdate` (`cost_seen`), the turn completed
+/// cleanly: emit `prompt_complete`, the reason the owning connection would have
+/// emitted, which stays out of the supervisor's kill+respawn set so a pending
+/// build respawn proceeds on the idle boundary. If it fired without the cost
+/// marker, the adopted turn stalled mid-stream: route to `reattach_idle` for
+/// recovery. A non-adopted agent-initiated turn (Monitor / scheduled wake, #2325)
+/// keeps `agent_idle`.
+fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
+    match (adopted, cost_seen) {
+        (false, _) => "agent_idle",
+        (true, true) => "prompt_complete",
+        (true, false) => "reattach_idle",
+    }
+}
+
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
 /// `epoch` field is captured at signal-construction time from the
 /// shared `current_prompt_epoch` atomic; the prompt loop discards
@@ -1286,6 +1372,36 @@ async fn send_lifecycle_signal(
                 );
             }
         }
+    }
+}
+
+/// Forward a notification's watchdog signals to the per-prompt lifecycle
+/// channel, but only while a prompt is in flight.
+///
+/// The channel's sole consumer is the prompt loop: it drains during a
+/// `session/prompt` and flushes leftovers (discarding them by epoch) at
+/// the start of the next one. Between prompts nothing reads it, so a busy
+/// agent (a background Task subagent streaming child tool calls, or an
+/// agent-initiated turn) fills all slots and the next awaited send parks
+/// the notification handler until the next prompt; with dispatch
+/// serialized per connection, that freezes every subsequent notification
+/// and the session appears dead while the agent keeps working. Skipping
+/// the send loses nothing: a between-prompt envelope could only ever be
+/// flushed unread. The between-prompt watchdog is fed by atomics in the
+/// notification handler, not this channel. See #2888.
+async fn forward_lifecycle_signals(
+    prompt_active: bool,
+    tx: &mpsc::Sender<LifecycleEnvelope>,
+    epoch: u64,
+    lifecycle: Option<LifecycleSignal>,
+    wakeup: Option<LifecycleSignal>,
+    session_label: &str,
+) {
+    if !prompt_active {
+        return;
+    }
+    for signal in [lifecycle, wakeup].into_iter().flatten() {
+        send_lifecycle_signal(tx, LifecycleEnvelope { epoch, signal }, session_label).await;
     }
 }
 
@@ -1462,13 +1578,11 @@ fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
     }
 }
 
-/// Read the accelerated silent-orphan grace for the given source
-/// profile. Same env-var override pattern as `silent_orphan_grace`;
-/// reads `acp.silent_orphan_fast_grace_secs` from the profile-
-/// resolved config. A value of `0` disables the accelerator: the
-/// watchdog keeps using the default grace even after a cost-populated
-/// `UsageUpdate` arrives. Non-zero values smaller than 5s clamp up.
-fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
+/// Accelerated silent-orphan grace: `SILENT_ORPHAN_FAST_GRACE_DEFAULT`
+/// in production, overridable via env var in debug builds so the
+/// integration tests can exercise the accelerator without real
+/// 20-second waits.
+fn silent_orphan_fast_grace() -> std::time::Duration {
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_FAST_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
@@ -1478,17 +1592,7 @@ fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
-    match resolved_acp_config(profile) {
-        Some(acp) => {
-            let secs = acp.silent_orphan_fast_grace_secs;
-            if secs == 0 {
-                std::time::Duration::ZERO
-            } else {
-                std::time::Duration::from_secs(u64::from(secs).max(5))
-            }
-        }
-        None => SILENT_ORPHAN_FAST_GRACE_DEFAULT,
-    }
+    SILENT_ORPHAN_FAST_GRACE_DEFAULT
 }
 
 /// Read the silent-orphan polling cadence. Constant in production;
@@ -1925,7 +2029,7 @@ impl AcpClient {
             // runner's whole process group and clear its stale entry/socket
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
-            super::worker_registry::terminate(&session_id.0);
+            crate::process::worker_registry::terminate(&session_id.0);
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -2056,6 +2160,11 @@ impl AcpClient {
                 default_effort,
                 default_mode,
                 mcp_servers,
+                // Direct stdio agents have no runner and thus no control
+                // channel; the task owns its own terminal guard and speaks
+                // the full protocol over stdio.
+                None,
+                None,
             )
             .instrument(conn_span),
         );
@@ -2140,6 +2249,25 @@ impl AcpClient {
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
+        // #2976 Phase B: dial the runner's sibling control socket. A v2
+        // runner returns a control client the connection task uses to drive
+        // the handshake and every turn (the runner owns the ACP client side
+        // now). The shared terminal guard lets the client's reader deliver
+        // an adopted turn's completion on a mid-flight resume, so the
+        // resume-idle / between-prompt watchdogs stand down. An absent or
+        // older (v1) runner returns None: the task falls back to the
+        // byte-relay handshake and, for a mid-flight resume, the resume-idle
+        // watchdog (guard left None so it still fires).
+        let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control_client = connect_runner_control_v2(
+            &socket_path,
+            event_tx.clone(),
+            session_label.clone(),
+            guard.clone(),
+        )
+        .await;
+        let external_terminal_guard = control_client.as_ref().map(|_| guard);
+
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
         // See the sibling spawn in `spawn`: the connection task runs inside
@@ -2165,6 +2293,8 @@ impl AcpClient {
                 default_effort,
                 default_mode,
                 mcp_servers,
+                external_terminal_guard,
+                control_client,
             )
             .instrument(conn_span),
         );
@@ -2332,7 +2462,9 @@ impl AcpClient {
             .map_err(|_| AcpError::AgentExited)
     }
 
-    /// Switch the active session mode via ACP `session/set_mode`.
+    /// Switch the active session mode through the mode channel advertised
+    /// by the adapter. Config-option mode takes precedence over the legacy
+    /// `session/set_mode` channel when both are present.
     pub async fn set_mode(&self, mode_id: &str) -> Result<(), AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         cmd_tx
@@ -2668,7 +2800,7 @@ fn spawn_runner_detached(
     use std::process::Command as StdCommand;
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
-    let log_path = crate::acp::worker_registry::log_path_for(&session_id)
+    let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -3065,6 +3197,316 @@ async fn wait_for_socket(
         }
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         delay_ms = (delay_ms * 2).min(200);
+    }
+}
+
+/// Bidirectional client for the runner's sibling control socket
+/// (#2976 Phase B). The runner owns the ACP handshake and the turn, so the
+/// daemon drives `initialize` / `session/*` / `session/prompt` /
+/// `session/cancel` over this channel and receives the typed results,
+/// rather than speaking those methods over the byte relay.
+///
+/// `initialize` / `session/*` responses arrive sequentially on
+/// `handshake_rx`; a turn's `PromptCompleted` is routed to the oneshot in
+/// `completion` when a prompt is awaiting, else (an adopted turn on a
+/// mid-flight resume, where this daemon never issued the prompt) the reader
+/// CAS-claims the terminal guard and fires `Stopped` so the UI clears.
+struct DaemonControlClient {
+    write: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
+    completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+}
+
+impl DaemonControlClient {
+    async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
+        let mut w = self.write.lock().await;
+        control_protocol::write_frame(&mut *w, &body)
+            .await
+            .map_err(|e| AcpError::Spawn(format!("control write failed: {e}")))
+    }
+
+    /// Run the ACP `initialize` the runner owns; returns the raw result
+    /// value to deserialize into `InitializeResponse`. A `HandshakeFailed`
+    /// is surfaced as the reconstructed crate error so the caller propagates
+    /// the same `AgentStartupError` (with `data.details`) the relay path did.
+    async fn initialize(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        self.send(ControlBody::Initialize { request })
+            .await
+            .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
+        match self.handshake_rx.lock().await.recv().await {
+            Some(ControlBody::Initialized { result }) => Ok(result),
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            _ => Err(acp_internal_error(
+                "control channel closed during initialize".into(),
+            )),
+        }
+    }
+
+    /// Run the session-creation request the runner owns; returns
+    /// `(acp_session_id, raw result)` to deserialize into the matching
+    /// session response, or the reconstructed crate error on failure.
+    async fn establish_session(
+        &self,
+        method: &str,
+        request: serde_json::Value,
+    ) -> Result<(String, serde_json::Value), agent_client_protocol::Error> {
+        self.send(ControlBody::EstablishSession {
+            method: method.to_string(),
+            request,
+        })
+        .await
+        .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
+        match self.handshake_rx.lock().await.recv().await {
+            Some(ControlBody::SessionReady {
+                acp_session_id,
+                result,
+            }) => Ok((acp_session_id, result)),
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            _ => Err(acp_internal_error(
+                "control channel closed during session establishment".into(),
+            )),
+        }
+    }
+
+    /// Issue a turn: register the completion oneshot, send the `Prompt`
+    /// frame, and return the receiver the prompt loop awaits. The runner
+    /// assigns the `session/prompt` id and reports `PromptCompleted`.
+    async fn prompt(
+        &self,
+        request: serde_json::Value,
+    ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
+        let (tx, rx) = oneshot::channel();
+        *self.completion.lock().expect("completion mutex poisoned") = Some(tx);
+        if self.send(ControlBody::Prompt { request }).await.is_err() {
+            // Write failed: drop the parked sender so `rx` resolves to Err ->
+            // Aborted immediately instead of hanging until the cancel /
+            // orphan watchdog eventually unwedges the turn.
+            self.completion
+                .lock()
+                .expect("completion mutex poisoned")
+                .take();
+        }
+        rx
+    }
+
+    async fn cancel(&self) {
+        let _ = self.send(ControlBody::Cancel).await;
+    }
+}
+
+/// Dial the runner's sibling control socket and, if it speaks control
+/// protocol v2 (#2976), return a [`DaemonControlClient`] and spawn its
+/// reader. Returns None for an absent or older (v1) runner, whose caller
+/// falls back to the byte-relay handshake plus the resume-idle watchdog.
+async fn connect_runner_control_v2(
+    main_socket: &std::path::Path,
+    event_tx: mpsc::Sender<Event>,
+    session_label: String,
+    terminal_guard: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<Arc<DaemonControlClient>> {
+    use std::sync::atomic::Ordering;
+
+    let control_path = crate::process::worker::control_socket_sibling(main_socket);
+    // A single deadline covers connect plus the Hello read. The runner
+    // binds the control socket before the main relay socket the caller
+    // already waited for, so both steps are effectively immediate; the
+    // bound only caps a wedged runner that bound the socket but never
+    // greets. An old socketless runner fails connect at once and falls
+    // back to the byte-relay handshake.
+    let bound = std::time::Duration::from_secs(2);
+    let dial = async {
+        let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
+        let (mut read_half, mut write_half) = stream.into_split();
+        match control_protocol::read_frame(&mut read_half).await {
+            Ok(Some(ControlBody::Hello {
+                control_protocol_version,
+                ..
+            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+            _ => return None,
+        }
+        control_protocol::write_frame(
+            &mut write_half,
+            &ControlBody::Attach {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .ok()?;
+        Some((read_half, write_half))
+    };
+    let (mut read_half, write_half) = match tokio::time::timeout(bound, dial).await {
+        Ok(Some(halves)) => halves,
+        _ => {
+            debug!(
+                target: "acp.protocol",
+                session = %session_label,
+                "no usable v2 runner control socket; using byte-relay handshake + watchdog"
+            );
+            return None;
+        }
+    };
+
+    info!(
+        target: "acp.protocol",
+        session = %session_label,
+        "runner control channel v2 attached; runner owns handshake + turn"
+    );
+
+    let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
+    let completion: Arc<
+        std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let reader_completion = completion.clone();
+    let reader_session = session_label.clone();
+    tokio::spawn(async move {
+        loop {
+            match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(
+                    frame @ (ControlBody::Initialized { .. }
+                    | ControlBody::SessionReady { .. }
+                    | ControlBody::HandshakeFailed { .. }),
+                )) => {
+                    if hs_tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(ControlBody::PromptCompleted { outcome, .. })) => {
+                    let waiter = reader_completion
+                        .lock()
+                        .expect("completion mutex poisoned")
+                        .take();
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(outcome);
+                    } else if terminal_guard
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // Adopted turn on a mid-flight resume: this daemon
+                        // never issued the prompt, so surface the completion
+                        // as Stopped and stand the watchdogs down.
+                        let reason = control_outcome_reason(&outcome);
+                        let _ = event_tx.send(Event::Stopped { reason }).await;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(e) => {
+                    debug!(
+                        target: "acp.protocol",
+                        session = %reader_session,
+                        "runner control read ended: {e}"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+
+    Some(Arc::new(DaemonControlClient {
+        write: Mutex::new(write_half),
+        handshake_rx: Mutex::new(hs_rx),
+        completion,
+    }))
+}
+
+/// Map a runner-reported prompt outcome to an `Event::Stopped` reason. A
+/// completed turn renders as Idle regardless of stop reason, so the
+/// default is `prompt_complete`; the one reason with special downstream
+/// handling (`rate_limited`) is preserved when the agent reports it. An
+/// agent error-envelope or an aborted turn also renders Idle, so they map
+/// to `prompt_complete` as well; the turn is over either way.
+///
+/// The other ACP stop reasons (`cancelled`, `max_tokens`, `refusal`,
+/// `max_turn_requests`) collapse into `prompt_complete`, since they all
+/// render Idle today. Preserving their identity for the UI is tracked as a
+/// follow-up on the Phase C runner-terminator work (#2977).
+fn control_outcome_reason(outcome: &crate::acp::control_protocol::PromptOutcome) -> String {
+    use crate::acp::control_protocol::PromptOutcome;
+    match outcome {
+        PromptOutcome::Completed {
+            stop_reason: Some(r),
+        } if r == "rate_limited" || r == "rate_limit" => "rate_limited".to_string(),
+        _ => "prompt_complete".to_string(),
+    }
+}
+
+/// Build a crate `Error` carrying `message`, for the v2 control path where
+/// the daemon's handshake round-trip fails at the control channel rather
+/// than at a crate `send_request`.
+fn acp_internal_error(message: String) -> agent_client_protocol::Error {
+    let mut err = agent_client_protocol::Error::internal_error();
+    err.message = message;
+    err
+}
+
+/// Reconstruct a crate `Error` from the raw JSON-RPC error object the
+/// runner forwarded in `HandshakeFailed`. Preserves `code` / `message` /
+/// `data` so the downstream `AgentStartupError` surfaces the same
+/// `data.details` remediation the byte-relay handshake did; falls back to a
+/// generic internal error if the object is malformed.
+fn acp_error_from_value(error: serde_json::Value) -> agent_client_protocol::Error {
+    serde_json::from_value(error.clone())
+        .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
+}
+
+/// Drive a session-creation request over the v2 control channel and
+/// deserialize the runner's cached result into the crate response type,
+/// so each `session/new|load|fork` site's `Result<Resp, Error>` matches
+/// the crate `send_request` path it replaces (including the failure path:
+/// the runner-forwarded agent error propagates verbatim).
+async fn establish_session_v2<Resp: serde::de::DeserializeOwned>(
+    control: &DaemonControlClient,
+    method: &str,
+    request: &impl serde::Serialize,
+) -> Result<Resp, agent_client_protocol::Error> {
+    let params = serde_json::to_value(request)
+        .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
+    let (_id, result) = control.establish_session(method, params).await?;
+    serde_json::from_value(result)
+        .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
+}
+
+/// Adapt a runner-reported [`PromptOutcome`](control_protocol::PromptOutcome)
+/// into the `Result<PromptResponse, Error>` the prompt loop already
+/// consumes, so the loop body is identical for the v2 control path and the
+/// legacy crate path. A completed turn maps to its `StopReason`; an agent
+/// error-envelope reconstructs a crate `Error` (preserving `data` so
+/// `classify_rate_limit_error` still recognizes a rate limit); an aborted
+/// turn (runner lost the agent) ends the turn cleanly as `EndTurn`.
+fn prompt_outcome_to_response(
+    outcome: control_protocol::PromptOutcome,
+) -> Result<PromptResponse, agent_client_protocol::Error> {
+    use control_protocol::PromptOutcome;
+    // `PromptResponse` is `#[non_exhaustive]`, so build it by deserializing
+    // the ACP `stopReason` string the runner forwarded verbatim (e.g.
+    // "cancelled" / "max_tokens" / "end_turn") rather than a struct literal.
+    let build = |stop: &str| {
+        serde_json::from_value::<PromptResponse>(serde_json::json!({ "stopReason": stop }))
+            .map_err(|e| acp_internal_error(format!("build prompt response: {e}")))
+    };
+    match outcome {
+        PromptOutcome::Completed { stop_reason } => {
+            build(stop_reason.as_deref().unwrap_or("end_turn"))
+        }
+        // The runner lost the agent before it answered; end the turn.
+        PromptOutcome::Aborted => build("end_turn"),
+        // Reconstruct the crate error, preserving `data` so
+        // `classify_rate_limit_error` still recognizes a rate limit. The
+        // numeric `code` is informational and dropped (the crate `code` is
+        // a typed `ErrorCode`); message + data carry the signal.
+        PromptOutcome::Error {
+            code: _,
+            message,
+            data,
+        } => {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = message;
+            err.data = data;
+            Err(err)
+        }
     }
 }
 
@@ -3558,6 +4000,18 @@ fn strip_markdown_emphasis(s: &str) -> String {
 /// never destroy transcript data.
 fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
+}
+
+/// Heuristic detector for the start of a `/compact` cycle. The Claude ACP
+/// adapter emits "Compacting..." as a plain `agent_message_chunk` and then
+/// runs the summarization API call with no further ACP progress until
+/// "Compacting completed.". Without a signal, the silent-orphan watchdog
+/// reads that quiet window as a wedged agent and cancels the compaction
+/// after the base grace. Same fragility trade-off as `is_compact_completion`:
+/// a missed match only reverts to that false-positive kill, never data loss.
+/// See #2898.
+fn is_compact_start(text: &str) -> bool {
+    text.contains("Compacting...")
 }
 
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
@@ -4143,7 +4597,7 @@ fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> 
 
 /// Build a `ConfigOptionsUpdated` event from a session response's
 /// `config_options`, or `None` when the response carried none (so the
-/// cockpit's cached selectors persist). A present-but-empty list is a
+/// structured view's cached selectors persist). A present-but-empty list is a
 /// real full replacement and must propagate, otherwise stale selectors
 /// never clear when an adapter intentionally drops them (see #1403).
 ///
@@ -4160,23 +4614,66 @@ fn config_options_event(
     })
 }
 
-/// Route a `SetConfigOption` command to `session/set_config_option` and
-/// emit the resulting UI update. claude-agent-acp returns the full
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOptionDispatchPurpose {
+    Generic,
+    Mode,
+}
+
+fn config_option_success_events(
+    options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    value: String,
+    purpose: ConfigOptionDispatchPurpose,
+) -> Vec<Event> {
+    let mut events = config_options_event(Some(options))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if purpose == ConfigOptionDispatchPurpose::Mode {
+        events.push(Event::CurrentModeChanged {
+            current_mode_id: value,
+        });
+    }
+    events
+}
+
+fn config_option_failure_event(
+    config_id: String,
+    value: String,
+    reason: String,
+    purpose: ConfigOptionDispatchPurpose,
+) -> Event {
+    match purpose {
+        ConfigOptionDispatchPurpose::Generic => Event::ConfigOptionSwitchFailed {
+            config_id,
+            value,
+            reason,
+        },
+        ConfigOptionDispatchPurpose::Mode => Event::ModeSwitchFailed {
+            mode_id: value,
+            reason,
+        },
+    }
+}
+
+/// Route a config-option change to `session/set_config_option` and emit
+/// the resulting UI update. claude-agent-acp returns the full
 /// updated config_options list in the response but does NOT emit a
 /// follow-up `config_option_update` notification (see
 /// acp-agent.js:1358-1410), so the success path re-emits a
 /// `ConfigOptionsUpdated` snapshot from the response and the frontend
-/// reducer clears pending state. The round-trip is spawned detached so
-/// the command loop never blocks on it. See #1403.
+/// reducer clears pending state. Mode changes also preserve the semantic
+/// mode events consumed by the native structured view. The round-trip is
+/// spawned detached so the command loop never blocks on it. See #1403.
 fn dispatch_set_config_option(
     connection: &ConnectionTo<Agent>,
     acp_session_id: &SessionId,
     config_id: String,
     value: String,
+    purpose: ConfigOptionDispatchPurpose,
     event_tx: mpsc::Sender<Event>,
 ) {
     info!(
-        target: "cockpit.acp",
+        target: "acp.protocol",
         "sending session/set_config_option {config_id}={value}"
     );
     let sent = connection.send_request(SetSessionConfigOptionRequest::new(
@@ -4187,23 +4684,18 @@ fn dispatch_set_config_option(
     tokio::spawn(async move {
         match sent.block_task().await {
             Ok(resp) => {
-                if let Some(event) = config_options_event(Some(resp.config_options)) {
+                for event in config_option_success_events(resp.config_options, value, purpose) {
                     let _ = event_tx.send(event).await;
                 }
             }
             Err(e) => {
                 let reason = format!("{e}");
                 warn!(
-                    target: "cockpit.acp",
+                    target: "acp.protocol",
                     "session/set_config_option failed: {reason}"
                 );
-                let _ = event_tx
-                    .send(Event::ConfigOptionSwitchFailed {
-                        config_id,
-                        value,
-                        reason,
-                    })
-                    .await;
+                let event = config_option_failure_event(config_id, value, reason, purpose);
+                let _ = event_tx.send(event).await;
             }
         }
     });
@@ -4480,12 +4972,12 @@ fn extract_tool_content_text(
 /// ~3 MiB of bytes, comfortably above a typical screenshot.
 const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
 
-/// Bridge an ACP `ToolCallContent` array into the cockpit's renderable
+/// Bridge an ACP `ToolCallContent` array into the structured view's renderable
 /// `ToolOutputBlock` list, preserving non-text completion payloads (images,
 /// audio, resource links/contents) that `extract_tool_content_text` drops.
 /// Diff blocks are bridged separately (`extract_diffs_from_content`) and are
 /// skipped here; an embedded terminal surfaces as a text placeholder since
-/// cockpit does not own ACP terminals. Returns an EMPTY vec when every block
+/// the structured view does not own ACP terminals. Returns an EMPTY vec when every block
 /// is plain text (or diff): the existing `content` text path renders those,
 /// so the structured list only carries weight when real media is present.
 /// See #1818.
@@ -4744,29 +5236,118 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     out
 }
 
-/// Whether the agent advertised the given mode ID in its session modes
-/// or config-option mode category.
-///
-/// Returns `false` (skip) when:
-/// - `available_mode_ids` is `Some` and the normalized mode_id is not in the list, or
-/// - `available_mode_ids` is `None` and the agent uses config-option modes
-///   (session/set_mode won't work for arbitrary mode IDs).
-///
-/// Returns `true` (allow) only when there is no mode information at all
-/// (e.g. the test shim, which handles all set_mode requests).
-fn is_mode_advertised(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeSetTarget<'a> {
+    ConfigOption(&'a str),
+    SessionMode,
+}
+
+/// Pick the protocol method for a requested mode. Config-option modes
+/// take precedence because adapters that advertise both channels report
+/// their authoritative current value through config options. With no mode
+/// metadata, retain the legacy set_mode fallback for older adapters.
+fn resolve_mode_set_target<'a>(
     mode_id: &str,
     available_mode_ids: &Option<Vec<String>>,
-    has_config_option_mode: bool,
-) -> bool {
+    mode_config_option_id: Option<&'a str>,
+) -> Option<ModeSetTarget<'a>> {
+    if let Some(config_id) = mode_config_option_id {
+        return Some(ModeSetTarget::ConfigOption(config_id));
+    }
+
     match available_mode_ids {
         Some(ids) => {
             let normalized = mode_id.replace('_', "").to_lowercase();
             ids.iter()
                 .any(|id| id.replace('_', "").to_lowercase() == normalized)
+                .then_some(ModeSetTarget::SessionMode)
         }
-        None => !has_config_option_mode,
+        None => Some(ModeSetTarget::SessionMode),
     }
+}
+
+fn dispatch_set_mode(
+    connection: &ConnectionTo<Agent>,
+    acp_session_id: &SessionId,
+    mode_id: String,
+    available_mode_ids: &Option<Vec<String>>,
+    mode_config_option_id: Option<&str>,
+    event_tx: mpsc::Sender<Event>,
+    while_prompting: bool,
+) {
+    let Some(target) = resolve_mode_set_target(&mode_id, available_mode_ids, mode_config_option_id)
+    else {
+        debug!(
+            target: "acp.protocol",
+            "skipping mode switch mode={mode_id}: not advertised"
+        );
+        return;
+    };
+
+    if let ModeSetTarget::ConfigOption(config_id) = target {
+        dispatch_set_config_option(
+            connection,
+            acp_session_id,
+            config_id.to_string(),
+            mode_id,
+            ConfigOptionDispatchPurpose::Mode,
+            event_tx,
+        );
+        return;
+    }
+
+    if while_prompting {
+        info!(
+            target: "acp.protocol",
+            "sending session/set_mode mode={mode_id} during in-flight prompt"
+        );
+    } else {
+        info!(target: "acp.protocol", "sending session/set_mode mode={mode_id}");
+    }
+    let sent = connection.send_request(SetSessionModeRequest::new(
+        acp_session_id.clone(),
+        mode_id.clone(),
+    ));
+    tokio::spawn(async move {
+        match sent.block_task().await {
+            Ok(_) => {
+                let _ = event_tx
+                    .send(Event::CurrentModeChanged {
+                        current_mode_id: mode_id,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let reason = format!("{e}");
+                if while_prompting {
+                    warn!(
+                        target: "acp.protocol",
+                        "session/set_mode failed mid-turn: {reason}"
+                    );
+                } else {
+                    warn!(target: "acp.protocol", "session/set_mode failed: {reason}");
+                }
+                let _ = event_tx
+                    .send(Event::ModeSwitchFailed { mode_id, reason })
+                    .await;
+            }
+        }
+    });
+}
+
+/// The `cwd` to send on `session/new` / `session/load` / `session/fork`.
+///
+/// A sandboxed agent runs inside the container (via `docker exec`), so it
+/// must be given the container workdir, not the host project path; the host
+/// path does not exist in the container and the agent rejects it with
+/// "'cwd' does not exist on the machine running the agent" (#2871). The
+/// container workdir is the create-time-pinned value resolved by
+/// `SessionSandbox::from_info`. Non-sandbox sessions keep the host `cwd`.
+fn agent_request_cwd(
+    container_workdir: Option<&std::path::Path>,
+    host_cwd: &std::path::Path,
+) -> PathBuf {
+    container_workdir.unwrap_or(host_cwd).to_path_buf()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4788,6 +5369,20 @@ async fn run_connection_task<W, R>(
     default_effort: Option<String>,
     default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
+    // Shared terminal-Stopped guard, supplied when a runner control
+    // channel (#1054 Phase A) may deliver the adopted turn's completion
+    // natively. The control reader CAS-claims it before emitting
+    // `Stopped`, so the resume-idle and between-prompt watchdogs below
+    // see it already fired and stand down. `None` on paths with no
+    // control channel (direct stdio), where the task owns its own guard.
+    external_terminal_guard: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // #2976 Phase B: control client for a v2 runner. When Some, the task
+    // drives `initialize` / `session/*` / `session/prompt` / cancel over it
+    // instead of the crate connection (relay), which stays attached only
+    // for `session/update` notifications and server->client callbacks. None
+    // on the direct-stdio path and against an older (v1) runner, where the
+    // task speaks the full protocol over the relay as before.
+    control_client: Option<Arc<DaemonControlClient>>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -4840,6 +5435,15 @@ async fn run_connection_task<W, R>(
     let res_term_wait = resources.clone();
     let res_term_kill = resources.clone();
     let res_term_release = resources.clone();
+    // Sandboxed agents run in-container: the session/new|load|fork request
+    // must carry the container workdir, not the host path (#2871).
+    let agent_cwd = agent_request_cwd(
+        resources
+            .sandbox
+            .as_ref()
+            .map(|s| s.container_workdir.as_path()),
+        &cwd,
+    );
 
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
@@ -4874,7 +5478,19 @@ async fn run_connection_task<W, R>(
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
-    let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // Shared with the runner control reader (#1054 Phase A) when present,
+    // so a native `prompt_complete` from the runner and the resume-idle /
+    // between-prompt watchdogs all claim the same one-shot terminal guard.
+    let watchdog_fired =
+        external_terminal_guard.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
+    // a prior connection issued the `session/prompt`, so this connection has no
+    // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
+    // terminal Stopped. Set true once the handshake resolves the mode (below).
+    // Cleared when a real prompt starts or when a terminal path claims the
+    // `watchdog_fired` guard. Drives the cost-marker completion the between-
+    // prompt watchdog emits for the adopted turn. See #2899.
+    let adopted_turn_active = Arc::new(AtomicBool::new(false));
     // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
     // turn (Monitor / scheduled-wake resume) that runs with no aoe-issued
     // `session/prompt`, so the outer command loop's idle tick can synthesize
@@ -4919,6 +5535,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -4959,6 +5576,7 @@ async fn run_connection_task<W, R>(
                     between_prompt_off_protocol_for_notif.clone();
                 let between_prompt_bg_agents =
                     between_prompt_bg_agents_for_notif.clone();
+                let adopted_turn_active = adopted_turn_active_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
@@ -5013,6 +5631,7 @@ async fn run_connection_task<W, R>(
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
                     }
+                    let prompt_active = prompt_in_flight.load(Ordering::Relaxed);
                     // Between-prompt idle tracking (#2325). Only while no
                     // aoe-issued prompt is in flight: a lifecycle signal here
                     // means the agent resumed itself (Monitor / scheduled
@@ -5020,7 +5639,7 @@ async fn run_connection_task<W, R>(
                     // its cost/progress/wake semantics so the outer loop's
                     // idle tick applies the same grace. During a real prompt
                     // the per-prompt watchdog owns this, so skip.
-                    if !prompt_in_flight.load(Ordering::Relaxed) {
+                    if !prompt_active {
                         let now = chrono::Utc::now().timestamp_millis();
                         if let Some(u) = between_prompt_signal_update(
                             lifecycle_signal.as_ref(),
@@ -5086,6 +5705,34 @@ async fn run_connection_task<W, R>(
                                         .store(true, Ordering::Relaxed);
                                 }
                             }
+                            Some(LifecycleSignal::TerminalUsage)
+                                if adopted_turn_active.load(Ordering::Relaxed) =>
+                            {
+                                // Adopted-turn barrier (#2899). A tool that was
+                                // in flight across the reattach boundary had its
+                                // ToolCall start on the previous connection; this
+                                // connection may see a trailing InProgress update
+                                // (re-inserting it into between_prompt_tools) but
+                                // never the terminal Completed/Failed frame, which
+                                // went to the old connection or only rode the
+                                // dropped PromptResponse. That leaks a stuck entry
+                                // that pins `work_in_flight` true forever, so the
+                                // between-prompt watchdog can never fire. A cost-
+                                // populated end-of-turn UsageUpdate is the adapter's
+                                // authoritative "turn wrapped up" marker (same signal
+                                // the per-prompt watchdog trusts), so drop the
+                                // unreliable inherited tool + untracked-background
+                                // bookkeeping. A future scheduled wake
+                                // (between_prompt_wake_at) and precisely tracked
+                                // async agents (between_prompt_bg_agents) keep their
+                                // own suppression: they carry real continuation
+                                // semantics, unlike a stale ACP tool entry.
+                                between_prompt_tools
+                                    .lock()
+                                    .expect("between-prompt tools mutex poisoned")
+                                    .clear();
+                                between_prompt_off_protocol.store(false, Ordering::Relaxed);
+                            }
                             _ => {}
                         }
                     }
@@ -5102,29 +5749,20 @@ async fn run_connection_task<W, R>(
                     // cancel a legitimate wait. Watchdog correctness
                     // wins; UI ordering is reconciled by the event
                     // store's monotonic seq anyway. See #1401 post-
-                    // impl review.
-                    if let Some(sig) = lifecycle_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
-                    if let Some(sig) = wakeup_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
+                    // impl review. Skipped entirely between prompts:
+                    // nothing drains the channel then, so at capacity
+                    // the awaited send would wedge this handler, and
+                    // every notification behind it, until the next
+                    // prompt (#2888).
+                    forward_lifecycle_signals(
+                        prompt_active,
+                        &lifecycle_signal_tx,
+                        envelope_epoch,
+                        lifecycle_signal,
+                        wakeup_signal,
+                        &session_label,
+                    )
+                    .await;
                     for event in mapped_events {
                         // An async sub-agent launch: spawn a tailer that
                         // follows the agent's on-disk transcript and emits
@@ -5278,14 +5916,26 @@ async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            // `initialize` is sent in both Fresh and Resume modes.
-            // It's idempotent on every ACP agent we ship against
-            // (aoe-agent, claude-agent-acp); the response only carries
-            // capability metadata; so re-sending it on attach is safe.
-            let init = connection
-                .send_request(build_initialize_request())
-                .block_task()
-                .await?;
+            // #2976 Phase B: against a v2 runner the runner owns
+            // `initialize` (it runs it once and caches the result), so the
+            // daemon drives it over the control channel and deserializes the
+            // cached result. Against the direct-stdio path or an older (v1)
+            // runner, send it over the relay via the crate connection as
+            // before. `initialize` is idempotent on every ACP agent we ship
+            // against (aoe-agent, claude-agent-acp); the response only
+            // carries capability metadata.
+            let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
+                let params = serde_json::to_value(build_initialize_request())
+                    .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
+                let result = control.initialize(params).await?;
+                serde_json::from_value(result)
+                    .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
+            } else {
+                connection
+                    .send_request(build_initialize_request())
+                    .block_task()
+                    .await?
+            };
 
             // Per-adapter compatibility check (see src/acp/agent_compat.rs).
             // Currently only gates claude-agent-acp at >=0.37.0; other
@@ -5347,6 +5997,10 @@ async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            // Mark the adopted turn so the notification handler applies the
+            // cost-marker barrier and the between-prompt watchdog emits
+            // `prompt_complete` for it. Set before any turn events arrive. See #2899.
+            adopted_turn_active.store(arm_resume_watchdog, Ordering::Relaxed);
             info!(
                 target: "acp.protocol",
                 session = %session_label,
@@ -5370,15 +6024,11 @@ async fn run_connection_task<W, R>(
                 let _ = tx.send(Ok(()));
             }
 
-            // Track the mode channels the agent advertised so we can skip
-            // session/set_mode requests for modes the agent doesn't support.
-            // When new_session.modes is present, only those IDs are valid.
-            // When config-options have a Mode category, the agent uses
-            // session/set_config_option for modes instead of session/set_mode.
-            // If neither is present (e.g. test shim), allow all set_mode
-            // requests through.
+            // Track the mode channels the agent advertised so each switch uses
+            // the matching protocol method. Config-option mode is authoritative
+            // when present; otherwise SessionModeState constrains valid ids.
             let mut available_mode_ids: Option<Vec<String>> = None;
-            let mut has_config_option_mode: bool = false;
+            let mut mode_config_option_id: Option<String> = None;
 
             // Drop any http/sse servers the agent did not advertise before they
             // reach session/new or session/load; stdio is always kept. Computed
@@ -5464,9 +6114,23 @@ async fn run_connection_task<W, R>(
                             parent_acp_id = %parent,
                             "structured fork via session/fork"
                         );
-                        let req = ForkSessionRequest::new(parent.clone(), cwd.clone())
+                        let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
-                        match connection.send_request(req).block_task().await {
+                        // #2976 Phase B: a v2 runner owns session creation;
+                        // drive session/fork over the control channel and
+                        // deserialize the cached result. Else send over the
+                        // relay via the crate connection.
+                        let fork_result = if let Some(control) = control_client.as_ref() {
+                            establish_session_v2::<ForkSessionResponse>(
+                                control,
+                                "session/fork",
+                                &req,
+                            )
+                            .await
+                        } else {
+                            connection.send_request(req).block_task().await
+                        };
+                        match fork_result {
                             Ok(resp) => {
                                 let new_id = resp.session_id.clone();
                                 info!(
@@ -5479,8 +6143,8 @@ async fn run_connection_task<W, R>(
                                 // Capture available mode info and config-option
                                 // mode category from the fork response (it carries
                                 // the same modes/config_options as session/new), so
-                                // the SetMode handlers below skip modes the agent
-                                // has not advertised and the pickers hydrate.
+                                // SetMode chooses the authoritative channel and the
+                                // pickers hydrate.
                                 if let Some(modes) = resp.modes.as_ref() {
                                     available_mode_ids = Some(
                                         modes
@@ -5490,17 +6154,11 @@ async fn run_connection_task<W, R>(
                                             .collect(),
                                     );
                                 }
-                                if resp.config_options.as_ref().is_some_and(|opts| {
-                                    opts.iter().any(|o| {
-                                        o.category
-                                            == Some(
-                                                agent_client_protocol::schema::v1::
-                                                    SessionConfigOptionCategory::Mode,
-                                            )
-                                    })
-                                }) {
-                                    has_config_option_mode = true;
-                                }
+                                mode_config_option_id = resp
+                                    .config_options
+                                    .as_deref()
+                                    .and_then(mode_config_id)
+                                    .map(|id| id.0.to_string());
                                 // Surface agent-advertised modes (when carried in
                                 // the ACP `modes` field rather than the `mode`
                                 // config option), mirroring session/new so a fork
@@ -5601,9 +6259,20 @@ async fn run_connection_task<W, R>(
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
-                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
+                            let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
-                            match connection.send_request(req).block_task().await {
+                            // #2976 Phase B: v2 runner owns session/load.
+                            let load_result = if let Some(control) = control_client.as_ref() {
+                                establish_session_v2::<LoadSessionResponse>(
+                                    control,
+                                    "session/load",
+                                    &req,
+                                )
+                                .await
+                            } else {
+                                connection.send_request(req).block_task().await
+                            };
+                            match load_result {
                                 Ok(resp) => {
                                     info!(
                                         target: "acp.protocol",
@@ -5622,21 +6291,11 @@ async fn run_connection_task<W, R>(
                                     if modes.is_some() {
                                         available_mode_ids = modes;
                                     }
-                                    if resp
+                                    mode_config_option_id = resp
                                         .config_options
-                                        .as_ref()
-                                        .is_some_and(|opts| {
-                                            opts.iter().any(|o| {
-                                                o.category
-                                                    == Some(
-                                                        agent_client_protocol::schema::v1::
-                                                            SessionConfigOptionCategory::Mode,
-                                                    )
-                                            })
-                                        })
-                                    {
-                                        has_config_option_mode = true;
-                                    }
+                                        .as_deref()
+                                        .and_then(mode_config_id)
+                                        .map(|id| id.0.to_string());
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -5706,10 +6365,15 @@ async fn run_connection_task<W, R>(
                             session = %session_label,
                             "creating fresh session via session/new"
                         );
-                        let new_session = connection
-                            .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
-                            .block_task()
-                            .await?;
+                        let req =
+                            NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
+                        // #2976 Phase B: v2 runner owns session/new.
+                        let new_session = if let Some(control) = control_client.as_ref() {
+                            establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
+                                .await?
+                        } else {
+                            connection.send_request(req).block_task().await?
+                        };
                         let id = new_session.session_id.clone();
                         info!(
                             target: "acp.protocol",
@@ -5719,8 +6383,8 @@ async fn run_connection_task<W, R>(
                         );
 
                         // Capture available mode IDs and config-option mode
-                        // category so the SetMode handlers below can skip
-                        // modes the agent has not advertised.
+                        // category so SetMode can choose the authoritative
+                        // channel and gate legacy values.
                         if let Some(modes) = &new_session.modes {
                             available_mode_ids = Some(
                                 modes
@@ -5730,21 +6394,11 @@ async fn run_connection_task<W, R>(
                                     .collect(),
                             );
                         }
-                        if new_session
+                        mode_config_option_id = new_session
                             .config_options
-                            .as_ref()
-                            .is_some_and(|opts| {
-                                opts.iter().any(|o| {
-                                    o.category
-                                        == Some(
-                                            agent_client_protocol::schema::v1::
-                                                SessionConfigOptionCategory::Mode,
-                                        )
-                                })
-                            })
-                        {
-                            has_config_option_mode = true;
-                        }
+                            .as_deref()
+                            .and_then(mode_config_id)
+                            .map(|id| id.0.to_string());
 
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
@@ -5885,6 +6539,24 @@ async fn run_connection_task<W, R>(
                 }
             };
 
+            // #2976 Phase B: send session/cancel over the v2 control channel
+            // when the runner owns the turn, else as a crate notification
+            // over the relay. A macro (not a helper fn) so it expands at each
+            // call site with that site's error-handling shape, and yields the
+            // same `Result<(), Error>` the relay send did. Defined after
+            // `acp_session_id` binds because macro_rules! resolves free
+            // identifiers at the definition site, not the call site.
+            macro_rules! send_session_cancel {
+                () => {{
+                    if let Some(control) = control_client.as_ref() {
+                        control.cancel().await;
+                        Ok::<(), agent_client_protocol::Error>(())
+                    } else {
+                        connection.send_notification(CancelNotification::new(acp_session_id.clone()))
+                    }
+                }};
+            }
+
             // Arm the resume-idle watchdog. The agent's response to the
             // orphaned in-flight `session/prompt` (from the previous
             // daemon) carries a request id this client never issued and
@@ -5917,11 +6589,14 @@ async fn run_connection_task<W, R>(
                             // observable; any further silence is normal
                             // mid-turn reasoning (Task subagents, slow Bash,
                             // long reads) rather than an orphaned turn. Disarm
-                            // permanently. The narrow residual (the turn
-                            // completes after attach and its PromptResponse is
-                            // lost, leaving a stale spinner) is rare and
-                            // recoverable via force-end-turn / a new prompt.
-                            // See #1216.
+                            // permanently: completion of the observable adopted
+                            // turn is now owned by the between-prompt watchdog,
+                            // which emits `prompt_complete` once the cost-
+                            // populated end-of-turn UsageUpdate lands (the
+                            // barrier at the TerminalUsage arm above clears the
+                            // stale tool bookkeeping that used to pin it). This
+                            // task stays the recovery path only for the fully
+                            // silent case below. See #1216, #2899.
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
@@ -5932,13 +6607,27 @@ async fn run_connection_task<W, R>(
                         let last = last_event_at.load(Ordering::Relaxed);
                         let now = chrono::Utc::now().timestamp_millis();
                         if now - last >= grace_ms {
+                            // Claim the shared terminal guard so the between-
+                            // prompt watchdog can't also emit for this adopted
+                            // turn in the narrow window where the first event
+                            // and this grace expiry interleave. See #2899.
+                            if watchdog_fired
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
                                 idle_ms = now - last,
                                 "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
                             );
-                            watchdog_fired.store(true, Ordering::Relaxed);
                             let _ = event_tx_for_watchdog
                                 .send(Event::Stopped {
                                     reason: "reattach_idle".into(),
@@ -5982,17 +6671,40 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("between-prompt bg-agents mutex poisoned")
                             .is_empty();
+                        let cost_seen = between_prompt_cost_seen.load(Ordering::Relaxed);
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
-                            between_prompt_cost_seen.load(Ordering::Relaxed),
+                            cost_seen,
                             tools_in_flight || bg_agents_in_flight,
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
+                            // An adopted turn (#2899) has no owning prompt_fut, so
+                            // this watchdog owns its terminal Stopped. Claim the
+                            // shared `watchdog_fired` guard so the detached
+                            // resume-idle task can't also fire in the narrow window
+                            // where the first observable event and its grace expiry
+                            // interleave; if that task already claimed, still reset
+                            // state below but skip the emit. A non-adopted
+                            // agent-initiated turn is serialized on this loop and
+                            // needs no guard.
+                            let adopted = adopted_turn_active.load(Ordering::Relaxed);
+                            let claimed = !adopted
+                                || watchdog_fired
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok();
+                            if adopted {
+                                adopted_turn_active.store(false, Ordering::Relaxed);
+                            }
                             // Clear all between-prompt state so a stale expired
                             // wake can't accelerate (or an off-protocol latch
                             // can't pin) the next agent-initiated turn. See #2371.
@@ -6008,16 +6720,20 @@ async fn run_connection_task<W, R>(
                                 .lock()
                                 .expect("between-prompt bg-agents mutex poisoned")
                                 .clear();
-                            info!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                "between-prompt idle watchdog: synthesizing Stopped for completed agent-initiated turn"
-                            );
-                            let _ = event_tx_for_block
-                                .send(Event::Stopped {
-                                    reason: "agent_idle".into(),
-                                })
-                                .await;
+                            if claimed {
+                                let reason = between_prompt_stop_reason(adopted, cost_seen);
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    reason,
+                                    "between-prompt idle watchdog: synthesizing Stopped for completed turn"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: reason.into(),
+                                    })
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -6047,6 +6763,10 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
+                        // A real prompt supersedes an adopted in-flight turn: this
+                        // prompt's own PromptResponse owns the next Stopped, so the
+                        // adopted-turn completion path must stand down. See #2899.
+                        adopted_turn_active.store(false, Ordering::Relaxed);
                         // A real prompt supersedes any agent-initiated turn the
                         // between-prompt idle watchdog was tracking; this
                         // prompt's own Stopped will own the next transition.
@@ -6110,8 +6830,7 @@ async fn run_connection_task<W, R>(
 
                         let silent_orphan_grace_default =
                             silent_orphan_grace(source_profile.as_deref());
-                        let silent_orphan_grace_fast =
-                            silent_orphan_fast_grace(source_profile.as_deref());
+                        let silent_orphan_grace_fast = silent_orphan_fast_grace();
                         let silent_orphan_enabled =
                             silent_orphan_grace_default > std::time::Duration::ZERO;
                         let silent_orphan_check_period = silent_orphan_check_interval();
@@ -6125,10 +6844,52 @@ async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
-                        let prompt_fut = connection
-                            .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
-                            .block_task();
-                        tokio::pin!(prompt_fut);
+                        // #2976 Phase B: against a v2 runner the turn is
+                        // issued over the control channel (the runner assigns
+                        // the session/prompt id and reports PromptCompleted,
+                        // which the control reader routes into this future);
+                        // otherwise it goes over the relay via the crate
+                        // connection. Both arms resolve to the same
+                        // `Result<PromptResponse, Error>` so the select body
+                        // below is identical. Boxed as a `Pin<Box<dyn
+                        // Future>>` (Unpin) so no `tokio::pin!` is needed.
+                        let mut prompt_fut: std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Result<PromptResponse, agent_client_protocol::Error>,
+                                    > + Send,
+                            >,
+                        > = if let Some(control) = control_client.as_ref() {
+                            match serde_json::to_value(PromptRequest::new(
+                                acp_session_id.clone(),
+                                blocks,
+                            )) {
+                                Ok(params) => {
+                                    let rx = control.prompt(params).await;
+                                    Box::pin(async move {
+                                        match rx.await {
+                                            Ok(outcome) => prompt_outcome_to_response(outcome),
+                                            // Control channel closed before
+                                            // completion: end the turn
+                                            // cleanly; the dying connection
+                                            // surfaces the underlying failure.
+                                            Err(_) => prompt_outcome_to_response(
+                                                control_protocol::PromptOutcome::Aborted,
+                                            ),
+                                        }
+                                    })
+                                }
+                                Err(e) => Box::pin(async move {
+                                    Err(acp_internal_error(format!("serialize prompt params: {e}")))
+                                }),
+                            }
+                        } else {
+                            Box::pin(
+                                connection
+                                    .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
+                                    .block_task(),
+                            )
+                        };
 
                         // Debug-only fault injection: when this env var
                         // is set, the prompt_fut select arm is gated
@@ -6338,9 +7099,7 @@ async fn run_connection_task<W, R>(
                                         // the cancel_grace arm fires
                                         // and we synthesize Stopped
                                         // with reason "prompt_orphaned".
-                                        if let Err(err) = connection.send_notification(
-                                            CancelNotification::new(acp_session_id.clone()),
-                                        ) {
+                                        if let Err(err) = send_session_cancel!() {
                                             warn!(
                                                 target: "acp.protocol",
                                                 session = %session_label,
@@ -6384,9 +7143,7 @@ async fn run_connection_task<W, R>(
                                                 target: "acp.protocol",
                                                 "sending session/cancel during in-flight prompt"
                                             );
-                                            connection.send_notification(
-                                                CancelNotification::new(acp_session_id.clone()),
-                                            )?;
+                                            send_session_cancel!()?;
                                             // Arm the escalation watchdog on
                                             // the first cancel only; later
                                             // cancels just resend the
@@ -6425,9 +7182,7 @@ async fn run_connection_task<W, R>(
                                             // real lever is ending the turn so
                                             // the drain task kills the process
                                             // group and respawns. See #1727.
-                                            let _ = connection.send_notification(
-                                                CancelNotification::new(acp_session_id.clone()),
-                                            );
+                                            let _ = send_session_cancel!();
                                             force_stopped = true;
                                             shutdown = true;
                                             break;
@@ -6438,75 +7193,20 @@ async fn run_connection_task<W, R>(
                                                 &acp_session_id,
                                                 config_id,
                                                 value,
+                                                ConfigOptionDispatchPurpose::Generic,
                                                 event_tx_for_block.clone(),
                                             );
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
-                                            // Skip when the agent has not
-                                            // advertised this mode (see the
-                                            // mode-tracking comments above).
-                                            if !is_mode_advertised(
-                                                &mode_id,
+                                            dispatch_set_mode(
+                                                &connection,
+                                                &acp_session_id,
+                                                mode_id,
                                                 &available_mode_ids,
-                                                has_config_option_mode,
-                                            ) {
-                                                debug!(
-                                                    target: "acp.protocol",
-                                                    "skipping session/set_mode mode={mode_id}: not advertised (mid-turn)"
-                                                );
-                                                continue;
-                                            }
-                                            info!(
-                                                target: "acp.protocol",
-                                                "sending session/set_mode mode={mode_id} during in-flight prompt"
+                                                mode_config_option_id.as_deref(),
+                                                event_tx_for_block.clone(),
+                                                true,
                                             );
-                                            // Fire the request and hand the
-                                            // response handling to a detached
-                                            // task. Awaiting it here would
-                                            // freeze this select loop for the
-                                            // duration of the round-trip,
-                                            // defeating the point of polling
-                                            // cmd_rx concurrently; a Cancel
-                                            // arriving while set_mode is in
-                                            // flight would queue. The detached
-                                            // task mirrors the success into the
-                                            // event stream so the UI flips even
-                                            // when the adapter (e.g.
-                                            // claude-agent-acp) treats the
-                                            // response as authoritative and
-                                            // skips the follow-up
-                                            // current_mode_update notification.
-                                            let sent = connection.send_request(
-                                                SetSessionModeRequest::new(
-                                                    acp_session_id.clone(),
-                                                    mode_id.clone(),
-                                                ),
-                                            );
-                                            let tx = event_tx_for_block.clone();
-                                            tokio::spawn(async move {
-                                                match sent.block_task().await {
-                                                    Ok(_) => {
-                                                        let _ = tx
-                                                            .send(Event::CurrentModeChanged {
-                                                                current_mode_id: mode_id,
-                                                            })
-                                                            .await;
-                                                    }
-                                                    Err(e) => {
-                                                        let reason = format!("{e}");
-                                                        warn!(
-                                                            target: "acp.protocol",
-                                                            "session/set_mode failed mid-turn: {reason}"
-                                                        );
-                                                        let _ = tx
-                                                            .send(Event::ModeSwitchFailed {
-                                                                mode_id,
-                                                                reason,
-                                                            })
-                                                            .await;
-                                                    }
-                                                }
-                                            });
                                         }
                                         Some(ClientCmd::DeleteSession {
                                             acp_session_id: target_id,
@@ -6696,9 +7396,7 @@ async fn run_connection_task<W, R>(
                         // is exactly when the UI most needs the synthetic
                         // Stopped below to unstick. Propagating the error here
                         // would skip that emit and defeat the desync recovery.
-                        if let Err(e) = connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()))
-                        {
+                        if let Err(e) = send_session_cancel!() {
                             warn!(
                                 target: "acp.protocol",
                                 error = %e,
@@ -6716,6 +7414,15 @@ async fn run_connection_task<W, R>(
                         // already idle: the reducer caps lastStoppedSeq at
                         // pendingUserPromptSeq, so a spurious Stopped while
                         // idle is a no-op. See #2237.
+                        //
+                        // This cancel is now the turn's terminal, so stand down
+                        // every idle-completion path: claim the shared guard so
+                        // the detached resume-idle task can't fire, and clear the
+                        // adopted / between-prompt tracking so a later tick can't
+                        // add a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: "cancelled".into(),
@@ -6728,49 +7435,23 @@ async fn run_connection_task<W, R>(
                         // `Stopped` to free a wedged UI (#1100); we only send
                         // a best-effort cancel notification. See #1727.
                         info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
-                        let _ = connection
-                            .send_notification(CancelNotification::new(acp_session_id.clone()));
+                        // The supervisor owns the terminal here, so stand down the
+                        // local idle-completion paths to avoid a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
+                        let _ = send_session_cancel!();
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
-                        // Skip when the agent has not advertised this mode
-                        // (see the mode-tracking comments above).
-                        if !is_mode_advertised(
-                            &mode_id,
+                        dispatch_set_mode(
+                            &connection,
+                            &acp_session_id,
+                            mode_id,
                             &available_mode_ids,
-                            has_config_option_mode,
-                        ) {
-                            debug!(
-                                target: "acp.protocol",
-                                "skipping session/set_mode mode={mode_id}: not advertised"
-                            );
-                            continue;
-                        }
-                        info!(target: "acp.protocol", "sending session/set_mode mode={mode_id}");
-                        // Detached, same shape as the mid-turn path: don't
-                        // freeze the cmd_rx loop on the round-trip.
-                        let sent = connection.send_request(SetSessionModeRequest::new(
-                            acp_session_id.clone(),
-                            mode_id.clone(),
-                        ));
-                        let tx = event_tx_for_block.clone();
-                        tokio::spawn(async move {
-                            match sent.block_task().await {
-                                Ok(_) => {
-                                    let _ = tx
-                                        .send(Event::CurrentModeChanged {
-                                            current_mode_id: mode_id,
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    let reason = format!("{e}");
-                                    warn!(target: "acp.protocol", "session/set_mode failed: {reason}");
-                                    let _ = tx
-                                        .send(Event::ModeSwitchFailed { mode_id, reason })
-                                        .await;
-                                }
-                            }
-                        });
+                            mode_config_option_id.as_deref(),
+                            event_tx_for_block.clone(),
+                            false,
+                        );
                     }
                     Some(ClientCmd::DeleteSession {
                         acp_session_id: target_id,
@@ -6784,6 +7465,7 @@ async fn run_connection_task<W, R>(
                             &acp_session_id,
                             config_id,
                             value,
+                            ConfigOptionDispatchPurpose::Generic,
                             event_tx_for_block.clone(),
                         );
                     }
@@ -7475,7 +8157,7 @@ async fn handle_elicitation_request(
             // answer) would misrepresent it; Cancel tells the agent the
             // request could not be presented. Either way the turn does not
             // hang on a card we'll never show.
-            warn!(target: "cockpit.acp", "unsupported elicitation, cancelling: {e}");
+            warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
             return responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     };
@@ -7533,6 +8215,71 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[tokio::test]
+    async fn between_prompt_signals_do_not_block_on_a_full_lifecycle_channel() {
+        // Reproduces #2888: no prompt in flight means nothing drains the
+        // lifecycle channel; once it is full, an unguarded awaited send
+        // parks the notification handler forever and every notification
+        // behind it queues invisibly until the next prompt. The guard must
+        // skip the send entirely, so a between-prompt burst larger than
+        // the channel capacity completes without blocking.
+        let (tx, _rx) = mpsc::channel::<LifecycleEnvelope>(2);
+        for i in 0..2 {
+            tx.try_send(LifecycleEnvelope {
+                epoch: 0,
+                signal: LifecycleSignal::ToolStarted {
+                    id: format!("fill-{i}"),
+                    is_background_task: false,
+                },
+            })
+            .expect("pre-fill fits the channel");
+        }
+        let burst = async {
+            for i in 0..200 {
+                forward_lifecycle_signals(
+                    false,
+                    &tx,
+                    0,
+                    Some(LifecycleSignal::ToolStarted {
+                        id: i.to_string(),
+                        is_background_task: false,
+                    }),
+                    None,
+                    "test",
+                )
+                .await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), burst)
+            .await
+            .expect("between-prompt signals must not block on a full lifecycle channel");
+    }
+
+    #[tokio::test]
+    async fn active_prompt_signals_still_reach_the_lifecycle_channel() {
+        let (tx, mut rx) = mpsc::channel::<LifecycleEnvelope>(8);
+        forward_lifecycle_signals(
+            true,
+            &tx,
+            7,
+            Some(LifecycleSignal::Progress),
+            Some(LifecycleSignal::WakeupPending {
+                at: chrono::Utc::now(),
+            }),
+            "test",
+        )
+        .await;
+        let first = rx.try_recv().expect("lifecycle signal forwarded");
+        assert_eq!(first.epoch, 7);
+        assert!(matches!(first.signal, LifecycleSignal::Progress));
+        let second = rx.try_recv().expect("wakeup signal forwarded");
+        assert!(matches!(
+            second.signal,
+            LifecycleSignal::WakeupPending { .. }
+        ));
+        assert!(rx.try_recv().is_err(), "no extra envelopes");
+    }
 
     #[tokio::test]
     async fn fake_client_round_trips_events() {
@@ -7726,6 +8473,102 @@ mod tests {
         // Fast grace is 20s; 25s after the last progress with cost_seen
         // and no in-flight work must fire.
         assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    // #2898: /compact emits one "Compacting..." chunk then runs a long
+    // silent summarization call. Pre-fix that chunk classified as Progress,
+    // so the watchdog fired at the 120s base grace and cancelled the
+    // compaction. CompactionStarted must latch the off-protocol floor so a
+    // large compaction is never cut short, while still recovering on a true
+    // hang past the floor.
+    #[tokio::test]
+    async fn watchdog_compaction_uses_floor_not_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::Compaction)
+        );
+        // The exact failure timing from the issue: 120.4s of silence.
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must not be cancelled at the base grace"
+        );
+        // Still finite: a genuinely wedged compaction recovers past the floor.
+        assert!(
+            w.should_fire(t0 + std::time::Duration::from_secs(30 * 60 + 1), cfg),
+            "a hung compaction must eventually recover"
+        );
+    }
+
+    // #2898 reproduce-then-fix: drive the REAL classifier so this test
+    // compiles and runs on the pre-fix tree too. Pre-fix, "Compacting..."
+    // classifies as Progress and the watchdog fires at the 120s base grace
+    // (RED). Post-fix it classifies as CompactionStarted and survives (GREEN).
+    #[tokio::test]
+    async fn watchdog_does_not_cancel_compaction_via_classifier() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1")))
+            .expect("compact chunk must classify");
+        w.apply_signal(sig, t0, wall, cfg);
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must survive past the base grace"
+        );
+    }
+
+    // #2898: dropping Compaction on TerminalUsage preserves the #2237
+    // finished-but-unacked fast-grace recovery. Without the drop a lost
+    // PromptResponse after /compact would hold the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_terminal_usage_clears_compaction_floor() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(60),
+            wall,
+            cfg,
+        );
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "TerminalUsage must clear the compaction floor"
+        );
+        // Fast grace (20s) now governs, keyed off the last progress at t0.
+        // 25s in it fires, and the #2237 clean-completion guard applies
+        // because cost_seen holds with no off-protocol work.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+        assert!(w.cost_seen());
+    }
+
+    // #2898: the explicit completion marker clears the floor even without a
+    // cost frame, so continued work in the same turn recovers on the normal
+    // grace rather than the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_compaction_completed_restores_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        let done = t0 + std::time::Duration::from_secs(180);
+        w.apply_signal(LifecycleSignal::CompactionCompleted, done, wall, cfg);
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "completion marker must clear the compaction floor"
+        );
+        // Base grace (120s) governs from the completion timestamp.
+        assert!(!w.should_fire(done + std::time::Duration::from_secs(119), cfg));
+        assert!(w.should_fire(done + std::time::Duration::from_secs(121), cfg));
     }
 
     // #2237: when the watchdog fires on a turn that already emitted its
@@ -7956,6 +8799,44 @@ mod tests {
             FAST,
             FLOOR
         ));
+    }
+
+    #[test]
+    fn between_prompt_stop_reason_maps_adopted_and_agent_initiated() {
+        // #2899: a non-adopted agent-initiated turn (Monitor / scheduled wake,
+        // #2325) keeps agent_idle regardless of the cost marker.
+        assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");
+        assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
+        // An adopted turn that reached its cost-populated end-of-turn
+        // UsageUpdate completed cleanly: prompt_complete, which stays out of
+        // the supervisor's kill+respawn set so a pending build respawn proceeds.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
+        // An adopted turn that fired without the cost marker stalled
+        // mid-stream: route to reattach_idle for recovery, NOT a false
+        // prompt_complete that would tell the supervisor the turn succeeded.
+        assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+    }
+
+    #[test]
+    fn between_prompt_adopted_turn_completes_after_terminal_barrier_clears_stuck_tool() {
+        // #2899: a tool in flight across the adopt boundary leaks a stuck
+        // between_prompt_tools entry (its terminal frame went to the old
+        // connection), pinning work_in_flight true so the watchdog never fires
+        // and the session sits "Running" forever. The cost-populated
+        // end-of-turn UsageUpdate barrier clears that stale bookkeeping; the
+        // adopted turn then ends cleanly as prompt_complete.
+        let last = 1_000_000;
+        let past = last + FAST.as_millis() as i64 + 500;
+        // Stuck tool present -> work_in_flight true -> suppressed forever (bug).
+        assert!(!between_prompt_should_fire(
+            true, past, last, None, true, true, false, FAST, FLOOR
+        ));
+        // Barrier cleared the stale tools -> work_in_flight false -> fires.
+        assert!(between_prompt_should_fire(
+            true, past, last, None, true, false, false, FAST, FLOOR
+        ));
+        // The adopted, cost-seen completion is labeled prompt_complete.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
     }
 
     #[test]
@@ -8868,6 +9749,29 @@ mod tests {
         assert_eq!(computed, "/workspace/feature");
     }
 
+    /// #2871: a sandboxed agent runs in-container, so session/new|load|fork
+    /// must carry the container workdir, not the host path (which does not
+    /// exist inside the container, worktree `..` or not). Non-sandbox
+    /// sessions keep the host cwd.
+    #[test]
+    fn agent_request_cwd_prefers_container_workdir_when_sandboxed() {
+        let host = PathBuf::from(
+            "/Users/nbrake/scm/agent-of-empires/../agent-of-empires-worktrees/bohemians",
+        );
+        let container = PathBuf::from("/workspace/bohemians");
+
+        assert_eq!(
+            agent_request_cwd(Some(container.as_path()), &host),
+            container,
+            "sandboxed request must use the container workdir"
+        );
+        assert_eq!(
+            agent_request_cwd(None, &host),
+            host,
+            "non-sandbox request must use the host cwd unchanged"
+        );
+    }
+
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
@@ -9445,6 +10349,34 @@ mod tests {
         assert!(!is_compact_completion("Compacting..."));
         assert!(!is_compact_completion("compact done"));
         assert!(!is_compact_completion(""));
+    }
+
+    #[test]
+    fn is_compact_start_matches_adapter_string() {
+        assert!(is_compact_start("Compacting..."));
+        assert!(is_compact_start("\n\nCompacting...\n"));
+        // The completion marker must not be read as a fresh start.
+        assert!(!is_compact_start("Compacting completed."));
+        assert!(!is_compact_start("compacting"));
+        assert!(!is_compact_start(""));
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_routes_compaction_markers() {
+        // "Compacting..." arms the compaction floor; "Compacting completed."
+        // clears it; ordinary text stays plain progress. See #2898.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))),
+            Some(LifecycleSignal::CompactionStarted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting completed.", Some("m2"))),
+            Some(LifecycleSignal::CompactionCompleted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
+            Some(LifecycleSignal::Progress)
+        ));
     }
 
     #[test]
@@ -10381,23 +11313,33 @@ mod tests {
     }
 
     #[test]
-    fn is_mode_advertised_matches_normalized_ids() {
+    fn resolve_mode_set_target_matches_normalized_session_mode_ids() {
         let ids = Some(vec!["acceptEdits".to_string(), "plan".to_string()]);
         // Underscore + case folding both sides.
-        assert!(is_mode_advertised("accept_edits", &ids, false));
-        assert!(is_mode_advertised("acceptEdits", &ids, false));
-        assert!(is_mode_advertised("PLAN", &ids, false));
+        assert_eq!(
+            resolve_mode_set_target("accept_edits", &ids, None),
+            Some(ModeSetTarget::SessionMode)
+        );
+        assert_eq!(
+            resolve_mode_set_target("acceptEdits", &ids, None),
+            Some(ModeSetTarget::SessionMode)
+        );
+        assert_eq!(
+            resolve_mode_set_target("PLAN", &ids, None),
+            Some(ModeSetTarget::SessionMode)
+        );
         // Not in the advertised set.
-        assert!(!is_mode_advertised("bypassPermissions", &ids, false));
+        assert_eq!(
+            resolve_mode_set_target("bypassPermissions", &ids, None),
+            None
+        );
     }
 
     #[test]
     fn profile_yolo_mode_ids_pass_the_advertised_guard() {
         use super::super::agent_profiles;
-        // The supervisor's post-spawn `set_mode(profile.yolo_mode_id)` is
-        // gated by this same `is_mode_advertised` guard. Pin each adapter's
-        // YOLO id against the modes that adapter actually advertises, so a
-        // mismatch (the #1142 codex bug, or the
+        // Pin each adapter's YOLO id against the modes that adapter actually
+        // advertises, so a mismatch (the #1142 codex bug, or the
         // @agentclientprotocol/codex-acp `agent-full-access` rename) can't
         // silently get dropped again.
         let claude_modes = Some(vec![
@@ -10414,27 +11356,91 @@ mod tests {
         ]);
 
         let claude_yolo = agent_profiles::resolve("claude").yolo_mode_id.unwrap();
-        assert!(is_mode_advertised(claude_yolo, &claude_modes, false));
+        assert_eq!(
+            resolve_mode_set_target(claude_yolo, &claude_modes, None),
+            Some(ModeSetTarget::SessionMode)
+        );
 
         let codex_yolo = agent_profiles::resolve("codex").yolo_mode_id.unwrap();
-        assert!(is_mode_advertised(codex_yolo, &codex_modes, false));
+        assert_eq!(
+            resolve_mode_set_target(codex_yolo, &codex_modes, None),
+            Some(ModeSetTarget::SessionMode)
+        );
         // The old hard-coded id would NOT survive the guard for codex.
-        assert!(!is_mode_advertised(
-            "bypassPermissions",
-            &codex_modes,
-            false
-        ));
+        assert_eq!(
+            resolve_mode_set_target("bypassPermissions", &codex_modes, None),
+            None
+        );
         // The old Zed adapter id is stale for @agentclientprotocol/codex-acp.
-        assert!(!is_mode_advertised("full-access", &codex_modes, false));
+        assert_eq!(
+            resolve_mode_set_target("full-access", &codex_modes, None),
+            None
+        );
     }
 
     #[test]
-    fn is_mode_advertised_without_mode_list_defers_to_config_option() {
-        // No SessionMode list: the agent steers mode through a config option,
-        // so set_mode must NOT be sent (returns false). Without a config-option
-        // mode either, fall back to allowing the legacy set_mode (true).
-        assert!(!is_mode_advertised("plan", &None, true));
-        assert!(is_mode_advertised("plan", &None, false));
+    fn config_option_mode_is_authoritative() {
+        let ids = Some(
+            vec!["agent", "agent-full-access"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        assert_eq!(
+            resolve_mode_set_target("agent-full-access", &ids, Some("mode")),
+            Some(ModeSetTarget::ConfigOption("mode"))
+        );
+        assert_eq!(
+            resolve_mode_set_target("agent-full-access", &None, Some("mode")),
+            Some(ModeSetTarget::ConfigOption("mode"))
+        );
+        assert_eq!(
+            resolve_mode_set_target("plan", &None, None),
+            Some(ModeSetTarget::SessionMode)
+        );
+    }
+
+    #[test]
+    fn mode_config_dispatch_preserves_semantic_mode_events() {
+        let events = config_option_success_events(
+            Vec::new(),
+            "agent-full-access".to_string(),
+            ConfigOptionDispatchPurpose::Mode,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            Event::ConfigOptionsUpdated { options } if options.is_empty()
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::CurrentModeChanged { current_mode_id }
+                if current_mode_id == "agent-full-access"
+        ));
+
+        let failure = config_option_failure_event(
+            "mode".to_string(),
+            "agent-full-access".to_string(),
+            "rejected".to_string(),
+            ConfigOptionDispatchPurpose::Mode,
+        );
+        assert!(matches!(
+            failure,
+            Event::ModeSwitchFailed { mode_id, reason }
+                if mode_id == "agent-full-access" && reason == "rejected"
+        ));
+
+        let generic_failure = config_option_failure_event(
+            "model".to_string(),
+            "gpt-5".to_string(),
+            "rejected".to_string(),
+            ConfigOptionDispatchPurpose::Generic,
+        );
+        assert!(matches!(
+            generic_failure,
+            Event::ConfigOptionSwitchFailed { config_id, value, reason }
+                if config_id == "model" && value == "gpt-5" && reason == "rejected"
+        ));
     }
 
     #[test]
@@ -11175,5 +12181,143 @@ mod tests {
         for line in lines {
             assert_eq!(scrub_stderr_secrets(line), line);
         }
+    }
+
+    /// Daemon-side control consumer (#2976 Phase B): a v2 runner that greets
+    /// with a matching `Hello` and then reports `PromptCompleted` for an
+    /// adopted turn (no prompt awaiting on this daemon) drives an
+    /// `Event::Stopped { reason: "prompt_complete" }` and claims the shared
+    /// terminal guard so the resume-idle watchdog stands down.
+    #[tokio::test]
+    async fn runner_control_native_completion_fires_stopped() {
+        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main_socket = tmp.path().join("s.sock");
+        let control = crate::process::worker::control_socket_sibling(&main_socket);
+
+        let listener = UnixListener::bind(&control).unwrap();
+        let fake = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            control_protocol::write_frame(
+                &mut w,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "s".into(),
+                },
+            )
+            .await
+            .unwrap();
+            // Drain the daemon's Attach ack, then report completion.
+            let _ = control_protocol::read_frame(&mut r).await;
+            control_protocol::write_frame(
+                &mut w,
+                &ControlBody::PromptCompleted {
+                    prompt_req_id: 5,
+                    outcome: PromptOutcome::Completed {
+                        stop_reason: Some("end_turn".into()),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            // Hold the socket open so the reader delivers before EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
+        let guard = Arc::new(AtomicBool::new(false));
+        let client = connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone())
+            .await
+            .expect("v2 control client");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("timed out waiting for Stopped")
+            .expect("event channel closed");
+        assert!(matches!(ev, Event::Stopped { reason } if reason == "prompt_complete"));
+        assert!(
+            guard.load(Ordering::Relaxed),
+            "terminal guard must be claimed"
+        );
+        drop(client);
+        let _ = fake.await;
+    }
+
+    /// A runner whose `Hello` advertises an unknown control-protocol version
+    /// is not trusted: no `Stopped` is emitted and the guard stays unclaimed
+    /// so the legacy resume-idle watchdog still fires.
+    #[tokio::test]
+    async fn runner_control_version_mismatch_leaves_guard_unclaimed() {
+        use crate::acp::control_protocol::{self, ControlBody};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main_socket = tmp.path().join("s.sock");
+        let control = crate::process::worker::control_socket_sibling(&main_socket);
+
+        let listener = UnixListener::bind(&control).unwrap();
+        let fake = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_r, mut w) = stream.into_split();
+            let _ = control_protocol::write_frame(
+                &mut w,
+                &ControlBody::Hello {
+                    control_protocol_version: 999,
+                    session_id: "s".into(),
+                },
+            )
+            .await;
+        });
+
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
+        let guard = Arc::new(AtomicBool::new(false));
+        let client =
+            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+
+        assert!(
+            client.is_none(),
+            "unknown control version must not yield a v2 client"
+        );
+        assert!(
+            !guard.load(Ordering::Relaxed),
+            "unknown control version must not claim the guard"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no Stopped emitted on version mismatch"
+        );
+        let _ = fake.await;
+    }
+
+    /// The load-bearing backward-compat path: an old runner that never binds
+    /// the control socket leaves the guard unclaimed, so the resume-idle
+    /// watchdog remains the terminal authority.
+    #[tokio::test]
+    async fn runner_control_absent_socket_leaves_guard_unclaimed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // No control listener is bound at the sibling path.
+        let main_socket = tmp.path().join("s.sock");
+
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
+        let guard = Arc::new(AtomicBool::new(false));
+        let client =
+            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+
+        assert!(
+            client.is_none(),
+            "absent control socket must fall back to the watchdog"
+        );
+        assert!(
+            !guard.load(Ordering::Relaxed),
+            "absent control socket must fall back to the watchdog"
+        );
+        assert!(event_rx.try_recv().is_err());
     }
 }

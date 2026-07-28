@@ -19,8 +19,10 @@ pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;
 pub mod background_agent;
+pub mod capability_probe;
 pub mod client;
 pub mod context_primer;
+pub mod control_protocol;
 pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;
@@ -33,14 +35,15 @@ pub mod node;
 pub mod option_catalog;
 pub mod permissions;
 pub mod protocol;
-pub mod runner;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+pub mod session_paths;
 pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
-pub mod worker_registry;
+#[cfg(feature = "serve")]
+pub mod version_probe;
 
 pub use agent_registry::{AgentRegistry, AgentSpec};
 pub use approvals::{Approval, ApprovalDecision, Nonce};

@@ -325,6 +325,7 @@ interface Props {
   onRestoreSession?: (sessionIds: string[]) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
@@ -341,6 +342,7 @@ function bestSession(
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt: string | null;
+  dormant: boolean;
 } {
   const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   if (running)
@@ -348,6 +350,7 @@ function bestSession(
       status: running.status,
       createdAt: running.created_at,
       idleEnteredAt: running.idle_entered_at ?? null,
+      dormant: running.dormant,
     };
   const error = ws.sessions.find((s) => s.status === "Error");
   if (error)
@@ -355,12 +358,14 @@ function bestSession(
       status: "Error",
       createdAt: error.created_at,
       idleEnteredAt: null,
+      dormant: error.dormant,
     };
   const first = ws.sessions[0];
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
+    dormant: first?.dormant ?? false,
   };
 }
 
@@ -774,6 +779,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
@@ -918,6 +924,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   // Open the session wizard prefilled from this row's project (path, agent,
   // and the latest session's options), mirroring the per-project "+" button.
   onCreateSession?: (repoPath: string) => void;
@@ -938,11 +945,12 @@ export const SessionRow = memo(function SessionRow({
   const { t } = useTranslation();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
-  const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
+  const { status: sessionStatus, createdAt, idleEnteredAt, dormant } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
       idle_entered_at: idleEnteredAt,
+      dormant,
     },
     idleDecayWindowMs,
   );
@@ -2659,6 +2667,7 @@ export function WorkspaceSidebar({
   onRestoreSession,
   onStopSession,
   onStartSession,
+  onSwitchView,
   readOnly,
   sortMode,
   onSortModeChange,
@@ -3401,6 +3410,7 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onSwitchView={onSwitchView}
                                     onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
@@ -3509,6 +3519,7 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
+                                onSwitchView={onSwitchView}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -3583,6 +3594,7 @@ export function WorkspaceSidebar({
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
+                      onSwitchView={onSwitchView}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}

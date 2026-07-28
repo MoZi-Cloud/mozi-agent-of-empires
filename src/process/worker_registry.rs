@@ -283,6 +283,9 @@ pub fn delete(session_id: &str) -> Result<()> {
     }
     if let Ok(p) = socket_path_for(session_id) {
         let _ = std::fs::remove_file(&p);
+        // Sibling control socket (Phase A of #1054); best-effort, absent
+        // for runners that predate the control channel.
+        let _ = std::fs::remove_file(crate::process::worker::control_socket_sibling(&p));
     }
     if let Ok(p) = log_path_for(session_id) {
         if matches!(std::fs::metadata(&p), Ok(m) if m.len() == 0) {
@@ -428,10 +431,30 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
 /// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
 /// already-empty group is a harmless no-op. See #1689.
 pub fn terminate(session_id: &str) {
-    if let Some(pid) = pid_source_for(session_id) {
+    let terminated_pid = pid_source_for(session_id);
+    if let Some(pid) = terminated_pid {
         crate::process::worker::terminate_process_group(pid);
     }
-    delete(session_id).ok();
+    // Generation-aware cleanup: only remove the entry and socket if they
+    // still belong to the runner we just signalled. A replacement runner
+    // can bind the socket and `save` a new record (with a different pid)
+    // before we reach this line; deleting then would strand the successor,
+    // whose own watchdog would see "missing" and cascade. If the record is
+    // gone, unreadable, or still carries the terminated pid, the files are
+    // ours to clear.
+    match load(session_id) {
+        Ok(Some(rec)) if Some(rec.pid) != terminated_pid => {
+            debug!(
+                target: "acp.registry",
+                session = %session_id,
+                current_pid = rec.pid,
+                "skipping cleanup; registry entry now belongs to a replacement runner"
+            );
+        }
+        _ => {
+            delete(session_id).ok();
+        }
+    }
 }
 
 #[cfg(test)]

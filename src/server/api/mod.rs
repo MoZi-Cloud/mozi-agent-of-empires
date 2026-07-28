@@ -18,12 +18,15 @@ mod git;
 mod log_level;
 mod mcp;
 mod mobile_quick_buttons;
+pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
-mod sessions;
+pub(crate) mod sessions;
 pub(crate) mod system;
 mod telemetry;
 
+#[cfg(feature = "serve")]
+pub(crate) use acp::structured_spawn_error_message;
 #[cfg(feature = "serve")]
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
@@ -39,22 +42,24 @@ pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use mobile_quick_buttons::{get_mobile_quick_buttons, put_mobile_quick_buttons};
+pub use plugin_settings::resolve_options;
 pub use plugins::{
-    apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins,
-    plugin_commands, plugin_details, plugin_discover, plugin_job_status, plugin_ui_state,
-    plugin_update_preview, plugin_updates, preview_plugin_install, serve_plugin_icon,
-    set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
+    apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, invoke_plugin_command,
+    list_plugins, plugin_commands, plugin_details, plugin_discover, plugin_job_status,
+    plugin_ui_state, plugin_update_preview, plugin_updates, preview_plugin_install,
+    serve_plugin_icon, set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
-    create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
-    preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
-    send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
-    start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_proxy,
-    update_session_snooze, update_session_unread, update_workspace_ordering, CleanupDefaults,
-    OutputQuery, SendMessageRequest, SessionResponse,
+    create_session, delete_session, delete_workspace, ensure_container_terminal, ensure_session,
+    ensure_terminal, force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    paste_image, preview_volume_ignores_globs, read_output, rename_session, restore_session,
+    search_sessions, send_message, serve_session_artifact, session_diff_file, session_diff_files,
+    set_worktree_name, start_session, stop_session, summarize_session, trash_session,
+    update_session_archive, update_session_color, update_session_diff_base, update_session_group,
+    update_session_notifications, update_session_pin, update_session_proxy, update_session_snooze,
+    update_session_unread, update_workspace_ordering, CleanupDefaults, OutputQuery,
+    SendMessageRequest, SessionResponse,
 };
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
@@ -77,6 +82,48 @@ pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
+
+/// Canonical 404 for a session id that does not resolve to a live instance.
+/// Body shape (`error` discriminator + human `message`) matches the rest of
+/// the JSON error surface so the dashboard's generic `.message` handling and
+/// `.error` discrimination both keep working.
+pub(super) fn session_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found", "message": "Session not found" })),
+    )
+        .into_response()
+}
+
+/// Canonical 403 body for `aoe serve --read-only`.
+pub(super) fn read_only_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "read_only",
+            "message": "Server is in read-only mode"
+        })),
+    )
+        .into_response()
+}
+
+/// 404 for the persist-then-apply race: the write was persisted to disk, but
+/// the in-memory instance was concurrently removed before the apply step.
+/// This is a caller-visible "session no longer exists", not a persist
+/// failure, so it must not surface as a 500.
+pub(super) fn session_gone_after_persist() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "not_found",
+            "message": "Session was removed while the update was being applied"
+        })),
+    )
+        .into_response()
+}
 
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',
@@ -210,6 +257,7 @@ mod tests {
                     "update_session_notifications",
                     "update_session_diff_base",
                     "update_session_pin",
+                    "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",
                     "trash_session",
@@ -407,6 +455,7 @@ mod tests {
                     "update_session_notifications",
                     "update_session_diff_base",
                     "update_session_pin",
+                    "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",
                     "trash_session",
