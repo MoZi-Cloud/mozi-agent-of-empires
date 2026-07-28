@@ -693,7 +693,9 @@ export function SettingsView({
         return (
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
             <PluginsSettings onPluginsChanged={refreshPluginPages} />
-            {schemaGuard() ?? <PluginSettingsSections schema={localizedSchema} settings={settings} onSaved={loadSettings} />}
+            {schemaGuard() ?? (
+              <PluginSettingsSections schema={localizedSchema} settings={settings} onSaved={loadSettings} />
+            )}
           </div>
         );
 
