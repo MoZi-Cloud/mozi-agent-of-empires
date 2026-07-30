@@ -902,6 +902,7 @@ mod tests {
             sandbox: false,
             sandbox_image: None,
             yolo_mode: false,
+            host_proxy: None,
             extra_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
