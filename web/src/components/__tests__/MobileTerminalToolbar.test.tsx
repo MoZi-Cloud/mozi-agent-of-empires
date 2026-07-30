@@ -30,6 +30,7 @@ interface Overrides {
   keyboardOpen?: boolean;
   sendData?: (data: string) => void;
   count?: number;
+  columns?: number;
 }
 
 function renderToolbar(overrides: Overrides = {}) {
@@ -44,6 +45,7 @@ function renderToolbar(overrides: Overrides = {}) {
         modifiers={NO_MODIFIERS}
         onToggleModifier={vi.fn()}
         onClearModifiers={vi.fn()}
+        columns={overrides.columns}
       />
     </MobileQuickButtonCountContext.Provider>,
   );
@@ -161,5 +163,43 @@ describe("MobileTerminalToolbar custom buttons", () => {
   it("renders no custom buttons when count is 0", () => {
     renderToolbar({ count: 0 });
     expect(screen.queryByLabelText("text1")).toBeNull();
+  });
+});
+
+describe("MobileTerminalToolbar column layout", () => {
+  it("defaults to 8 columns (mobile)", () => {
+    const { container } = renderToolbar();
+    const strip = container.firstChild as HTMLElement;
+    expect(strip.style.gridTemplateColumns).toBe("repeat(8, minmax(0, 1fr))");
+  });
+
+  it("uses 16 columns on desktop", () => {
+    const { container } = renderToolbar({ columns: 16 });
+    const strip = container.firstChild as HTMLElement;
+    expect(strip.style.gridTemplateColumns).toBe("repeat(16, minmax(0, 1fr))");
+  });
+});
+
+describe("MobileTerminalToolbar paste over plain HTTP", () => {
+  afterEach(() => {
+    delete (window as { isSecureContext?: boolean }).isSecureContext;
+    try {
+      delete (navigator as unknown as { clipboard?: unknown }).clipboard;
+    } catch {
+      /* navigator.clipboard was non-configurable; leave as-is. */
+    }
+  });
+
+  it("reads the clipboard even when isSecureContext is false", async () => {
+    Object.defineProperty(window, "isSecureContext", { value: false, configurable: true });
+    const readText = vi.fn(async () => "pasted-over-http");
+    Object.defineProperty(navigator, "clipboard", { value: { readText }, configurable: true });
+
+    const { sendData } = renderToolbar();
+    fireEvent.click(screen.getByLabelText("Paste from clipboard"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(readText).toHaveBeenCalled();
+    expect(sendData).toHaveBeenCalledWith("pasted-over-http");
   });
 });

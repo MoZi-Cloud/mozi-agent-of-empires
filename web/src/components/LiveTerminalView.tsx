@@ -302,7 +302,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
 
-      {coarse && live.state.connected && (
+      {live.state.connected && (
         <MobileTerminalToolbar
           sendData={live.sendData}
           inputElRef={inputRef}
@@ -310,6 +310,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           modifiers={modifiers}
           onToggleModifier={toggleModifier}
           onClearModifiers={clearModifiers}
+          columns={coarse ? 8 : 16}
         />
       )}
     </div>
