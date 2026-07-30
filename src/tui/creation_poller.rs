@@ -342,6 +342,7 @@ mod tests {
             command_override: String::new(),
             scratch: false,
             fork_seed: Some(seed),
+            structured: false,
         }
     }
 
