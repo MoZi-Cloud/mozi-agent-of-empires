@@ -1662,11 +1662,12 @@ pub struct WebConfig {
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
 
-    /// How many user-defined quick-send buttons the mobile terminal toolbar
-    /// shows (laid out in rows of up to 7). Defaults to 0. Buttons are
-    /// customized by long-pressing them on the mobile toolbar; their contents
-    /// live in `mobile_quick_buttons` and sync across devices with the config.
-    #[serde(default)]
+    /// How many user-defined quick-send buttons the terminal toolbar shows
+    /// (8 per row on the touch toolbar, 16 per row on desktop). Defaults to 4,
+    /// so the text1 through text4 placeholder slots are visible out of the box;
+    /// long-press one to edit it. Contents live in `mobile_quick_buttons` and
+    /// sync across devices with the config.
+    #[serde(default = "default_mobile_quick_button_count")]
     #[setting(
         label = "Mobile quick buttons",
         widget = "number",
@@ -1694,10 +1695,14 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
-            mobile_quick_button_count: 0,
+            mobile_quick_button_count: 4,
             mobile_quick_buttons: Vec::new(),
         }
     }
+}
+
+fn default_mobile_quick_button_count() -> u8 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
