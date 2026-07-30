@@ -2056,6 +2056,7 @@ impl HomeView {
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
+        crate::session::set_favorites_first(resolved.session.favorites_first);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -3685,7 +3686,11 @@ impl HomeView {
             .instances
             .values()
             .filter(|inst| {
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let session_name = crate::tmux::resolve_agent_session_name_in(
+                    &pane_meta,
+                    &inst.id,
+                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
@@ -5118,10 +5123,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
-                &crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
-                &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
@@ -5283,10 +5288,10 @@ impl HomeView {
         let tmux_name = match &self.pending_live_send_target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
@@ -5437,10 +5442,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
@@ -6715,6 +6720,7 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
+        crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);

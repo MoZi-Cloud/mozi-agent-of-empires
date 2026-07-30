@@ -91,6 +91,24 @@ agent's history without leaving live mode or forwarding the keys. Bare
 `PageUp` / `PageDown` still pass through to the agent, so agents that
 page their own UI keep working.
 
+## Split windows
+
+If you split the session's tmux window by hand (`Ctrl+B %`, `Ctrl+B "`), or
+an agent splits it for you (a Claude Code agent team spawns one pane per
+teammate), the preview composites every pane onto the window grid with
+borders in the gaps, so nothing is hidden.
+
+Two things change while a window is split:
+
+- **Scrolling history is unavailable.** Panes keep independent scrollbacks
+  with no coherent way to stack them, so the composite covers the visible
+  window only and `Shift+PageUp` has nothing to scroll into. Close the extra
+  pane and history comes back.
+- **Input still goes to the first pane.** Keystrokes, clicks, and the scroll
+  wheel all reach the agent's own pane regardless of which pane you split
+  off, so a wheel or click aimed at a neighbouring pane does nothing. Attach
+  to the session to interact with the other panes.
+
 ## Inserting newlines
 
 `Shift+Enter` inserts a newline into the agent's input box on

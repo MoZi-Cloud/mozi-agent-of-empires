@@ -27,7 +27,6 @@ export const mobile = {
     failed: "Couldn't copy. Try selecting text in the terminal first.",
   },
   pasteToast: {
-    needsHttps: "Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.",
     failed: "Couldn't read clipboard. Try copying again, or open this dashboard in Safari.",
   },
   editModal: {

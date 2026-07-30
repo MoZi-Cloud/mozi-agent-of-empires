@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
+    composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
@@ -18,6 +19,7 @@ use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
+use crate::util::now_ms;
 
 pub struct Session {
     name: String,
@@ -55,15 +57,6 @@ pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
 /// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
 /// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
 pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
-
-/// Wall-clock millis since the unix epoch. The size-owner heartbeat is compared
-/// across processes, so it must be wall-clock, not a per-process monotonic.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
@@ -119,7 +112,28 @@ pub struct PaneCursor {
     /// works while an agent streams. `parse` sets it `true`; only the
     /// cross-probe check downgrades it.
     pub position_reliable: bool,
+    /// Pane 0's `(width, height)` within a COMPOSITED preview, or `None` when
+    /// the preview shows a single pane.
+    ///
+    /// Mouse forwarding maps the hovered cell into the previewed app's
+    /// coordinate space by treating the preview rect as the pane, which holds
+    /// while the two describe the same rectangle. A composite makes the rect the
+    /// whole window, so a pointer over a neighbouring pane maps to a column past
+    /// pane 0's right edge and is reported to the agent as though its own pane
+    /// were that wide. Pane 0 is the only pane that receives input (#435, #488),
+    /// so this carries its extent and the forward clamps to it, dropping events
+    /// that land outside.
+    ///
+    /// Only the extent is needed, never the origin: tmux keeps pane 0 at the
+    /// window origin, because pane indices follow layout order and closing pane
+    /// 0 renumbers whichever pane takes that corner.
+    pub composite_pane0: Option<(u16, u16)>,
 }
+
+/// tmux format line every cursor probe requests, parsed by
+/// [`PaneCursor::parse`]. Shared so the plain capture and the composited one
+/// cannot drift into asking for different fields.
+const CURSOR_FMT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
@@ -155,6 +169,9 @@ impl PaneCursor {
             // cross-probe check in `capture_pane_with_cursor` is the only
             // thing that downgrades this.
             position_reliable: true,
+            // A probe describes one pane. The composited paths overwrite this
+            // once they know the window really is split.
+            composite_pane0: None,
         })
     }
 }
@@ -190,6 +207,58 @@ fn merge_cursor_probes(
     }
 }
 
+/// Split the chained multi-pane capture into one [`CapturedPane`] per pane.
+///
+/// The output is a flat byte stream of `<sentinel + geometry>` lines each
+/// followed by that pane's `capture-pane` rows, so the sentinel is the only
+/// frame marker. A pane whose geometry line does not parse is dropped rather
+/// than shifting every later pane's content onto the wrong rectangle.
+fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
+    let mut panes: Vec<CapturedPane> = Vec::new();
+    let mut current: Option<(PaneGeom, Vec<&str>)> = None;
+
+    let flush = |panes: &mut Vec<CapturedPane>, entry: Option<(PaneGeom, Vec<&str>)>| {
+        if let Some((geom, lines)) = entry {
+            let body = lines.join("\n");
+            panes.push(CapturedPane {
+                rows: crate::tmux::vt::capture_rows_padded(
+                    body.as_bytes(),
+                    geom.width,
+                    geom.height,
+                ),
+                geom,
+            });
+        }
+    };
+
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix(sentinel) {
+            flush(&mut panes, current.take());
+            current = PaneGeom::parse(rest).map(|geom| (geom, Vec::new()));
+        } else if let Some((_, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    flush(&mut panes, current.take());
+    panes
+}
+
+/// Flag a cursor's POSITION as untrustworthy while keeping its always-valid
+/// mode flags, for the composite paths that fall through to a scrollback-bearing
+/// pane-0 capture.
+///
+/// [`Session::capture_pane_with_cursor`] earns the right to trust a position by
+/// probing twice around its capture and comparing; a single probe against
+/// content that includes scrollback has no such evidence, so the render skips
+/// painting rather than risk the row-drift bug while the wheel forward (which
+/// reads only the mode flags) keeps working.
+fn unreliable_position(cursor: Option<PaneCursor>) -> Option<PaneCursor> {
+    cursor.map(|c| PaneCursor {
+        position_reliable: false,
+        ..c
+    })
+}
+
 /// A delta beyond this many rows between a window and its pane is a multi-pane
 /// split (the missing rows are other panes), not window chrome.
 const MAX_CHROME_ROWS: u16 = 5;
@@ -214,7 +283,7 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
-            name: Self::generate_name(id, title),
+            name: Self::resolve_name(id, title),
         })
     }
 
@@ -225,6 +294,24 @@ impl Session {
         }
     }
 
+    /// The name of the tmux session to ACT on for this session id: the
+    /// title-derived name normally, or the live session carrying this id's
+    /// `_<id8>` tail when the stored title has moved out from under it (a
+    /// smart rename, or a manual rename whose tmux rename failed). See
+    /// `crate::tmux::live_session_name` (crate-private); every lifecycle operation
+    /// resolves through here so trash/archive/attach/status target the pane
+    /// that is actually running and `create` adopts it instead of spawning a
+    /// second agent beside it.
+    ///
+    /// Use [`Self::generate_name`] instead only to compute the name a session
+    /// should be renamed TO.
+    pub fn resolve_name(id: &str, title: &str) -> String {
+        crate::tmux::live_agent_session_name(id, &Self::generate_name(id, title))
+    }
+
+    /// Purely derive the tmux session name from a session id and title, with no
+    /// reference to what is live. Callers that want the session's CURRENT name
+    /// want [`Self::resolve_name`].
     pub fn generate_name(id: &str, title: &str) -> String {
         let safe_title = sanitize_session_name(title);
         format!("{}{}_{}", SESSION_PREFIX, safe_title, truncate_id(id, 8))
@@ -261,7 +348,17 @@ impl Session {
             return Ok(());
         }
 
-        let mut args = build_create_args(&self.name, working_dir, &[], command, size);
+        // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
+        // so an agent (and any browser it launches, e.g. for OIDC) can reach
+        // the user's desktop. tmux otherwise carries only its narrow
+        // `update-environment` set plus the server's frozen base env (#3075).
+        let desktop_env = crate::session::environment::forwarded_desktop_env();
+        let env_refs: Vec<(&str, &str)> = desktop_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -494,6 +591,260 @@ impl Session {
         }
     }
 
+    /// Capture the whole first window, panes composited, for the passive
+    /// preview.
+    ///
+    /// [`capture_pane`](Self::capture_pane) shows `^.0` and nothing else, so a
+    /// user who splits the window watches aoe go blind to everything but the
+    /// agent's own pane. This reads every pane and lays them back out on the
+    /// window grid. Input is untouched and still pinned to `^.0` (#435, #488):
+    /// compositing is read-only, so the mis-targeted-keystroke class of bug
+    /// that the pin exists to prevent cannot arise here.
+    ///
+    /// The single-pane case, which is almost every session, costs the same one
+    /// fork as before: the pane count rides along as a header on the capture
+    /// that was already being taken, and its bytes are returned verbatim
+    /// (scrollback and all). Only a genuinely split window pays a second fork,
+    /// and that one is chained so it stays a single `tmux` invocation no matter
+    /// how many panes there are.
+    ///
+    /// A zoomed pane (`C-b z`) is treated as unsplit and takes the same
+    /// single-pane path, because tmux reports zoomed panes at overlapping
+    /// rectangles that the compositor cannot tile.
+    ///
+    /// Splits lose scrollback: panes have independent histories, so there is no
+    /// coherent way to stack them, and the composite covers the visible window
+    /// only. The preview's scroll offset clamps itself to the shorter capture,
+    /// so this reads as "a split window doesn't scroll back" rather than
+    /// misbehaving.
+    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
+        Ok(self.capture_window_composited_with_cursor(lines)?.0)
+    }
+
+    /// [`capture_window_composited`](Self::capture_window_composited) plus pane
+    /// 0's cursor, for the live preview.
+    ///
+    /// Pane 0 owns the cursor because it is the pane that receives input, and
+    /// tmux puts it at the window origin, so its coordinates index the
+    /// composite untranslated. The probe targets `^.0` explicitly rather than
+    /// the window, whose format fields would resolve against whichever pane the
+    /// user happens to have selected.
+    ///
+    /// On a composite the cursor is rebased onto the window's dimensions: the
+    /// renderer anchors it by `pane_height` against the painted line count,
+    /// which is now the whole window rather than one pane.
+    pub fn capture_window_composited_with_cursor(
+        &self,
+        lines: usize,
+    ) -> Result<(String, Option<PaneCursor>)> {
+        /// Gates the window-dimensions line. A chained `display-message` can
+        /// silently produce nothing while the invocation still exits 0 (the
+        /// same hazard `is_probe_line` guards in the vt seed path), and without
+        /// a sentinel the capture's first row would be mistaken for the header
+        /// and dropped from the fallback content.
+        const WINDOW_SENTINEL: &str = "@@aoe-win@@";
+        /// Gates the cursor line, for the same reason.
+        const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
+
+        if !self.exists() {
+            return Ok((String::new(), None));
+        }
+
+        let window = format!("{}:^", self.name);
+        let pane0 = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &window,
+                "-F",
+                &format!(
+                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
+                ),
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                "-F",
+                &format!("{CURSOR_SENTINEL} {CURSOR_FMT}"),
+                ";",
+                "capture-pane",
+                "-t",
+                &pane0,
+                "-p",
+                "-e",
+                "-S",
+                &format!("-{}", lines),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Ok((String::new(), None));
+        }
+
+        // Consume the sentinel-tagged preamble line by line; the first line
+        // that carries neither sentinel is where the capture starts. Either
+        // probe going missing costs only its own information, never a row of
+        // pane content.
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let mut rest: &str = &raw;
+        let mut dims: Option<(u16, u16, u16)> = None;
+        let mut zoomed = false;
+        let mut cursor: Option<PaneCursor> = None;
+        while let Some((line, tail)) = rest.split_once('\n') {
+            if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
+                let mut f = fields.split_whitespace();
+                dims = match (f.next(), f.next(), f.next()) {
+                    (Some(c), Some(w), Some(h)) => {
+                        match (c.parse().ok(), w.parse().ok(), h.parse().ok()) {
+                            (Some(c), Some(w), Some(h)) => Some((c, w, h)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                // Absent (older tmux, or a truncated line) reads as not zoomed,
+                // which keeps the composite path rather than disabling it.
+                zoomed = f.next().is_some_and(|z| z != "0");
+            } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
+                cursor = PaneCursor::parse(fields.trim());
+            } else {
+                break;
+            }
+            rest = tail;
+        }
+        let pane0_content = rest.to_string();
+
+        let Some((count, window_width, window_height)) = dims else {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        };
+        if count <= 1 || window_width == 0 || window_height == 0 {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        }
+        // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
+        // reports every pane at the window's full rectangle, so the panes
+        // OVERLAP. The compositor's walk assumes a tiling, and handed overlap it
+        // paints one pane and fills the rest of the row with border glyphs,
+        // hiding the zoomed pane's content, which is the only thing the user is
+        // looking at in tmux. Treat zoomed as unsplit: pane 0's bytes are already
+        // in hand, scrollback included, which is what the preview showed before
+        // compositing existed.
+        if zoomed {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        }
+
+        // Any failure in the split path (fork error, unparseable layout) falls
+        // back to the pane-0 bytes already in hand, so a composite that cannot
+        // be built is never worse than the old single-pane preview.
+        let Some(layout) = self.capture_window_layout(count) else {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        };
+        // The composite is the visible window with no scrollback, so the row a
+        // single probe reported cannot have drifted underneath it, and the
+        // position stands.
+        let cursor = cursor.map(|mut c| {
+            c.pane_height = layout.window_height;
+            c.pane_width = layout.window_width;
+            c.history_size = 0;
+            // Rebasing the frame onto the window is what the renderer needs, but
+            // it also erases the only record of how wide the input pane is, which
+            // mouse forwarding maps into. Carry pane 0's extent alongside.
+            c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
+            c
+        });
+        Ok((layout.composite(), cursor))
+    }
+
+    /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
+    /// window dimensions plus geometry and visible capture for each of `count`
+    /// panes, chained into one `tmux` invocation.
+    ///
+    /// Pane indices are contiguous from 0 within a window (tmux renumbers them
+    /// as the layout changes, unlike window indices) and `pane-base-index` is
+    /// forced to 0 when the session is created, so `^.0..^.{count-1}` addresses
+    /// every pane without a prior `list-panes` round trip.
+    ///
+    /// Returned rather than composited on the spot so the live preview can
+    /// cache a layout across frames and re-render only pane 0 from its VT grid
+    /// (see [`WindowLayout::composite_with_first_pane_rows`]).
+    pub(crate) fn capture_window_layout(&self, count: u16) -> Option<WindowLayout> {
+        /// Marks the start of each pane's segment in the chained output. Pane
+        /// content could in principle contain this line, which would split one
+        /// pane's rows in two; the cost is a single garbled preview frame, and
+        /// the string is unusual enough to make that a non-event.
+        const SENTINEL: &str = "@@aoe-pane@@";
+        /// Leading line carrying the window's own dimensions, so a cached
+        /// layout is self-contained and needs no separate probe.
+        const WINDOW_SENTINEL: &str = "@@aoe-win@@";
+
+        let mut args: Vec<String> = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            format!("{}:^", self.name),
+            "-F".to_string(),
+            format!("{WINDOW_SENTINEL} #{{window_width}} #{{window_height}}"),
+        ];
+        for i in 0..count {
+            let target = format!("{}:^.{}", self.name, i);
+            args.push(";".to_string());
+            args.extend([
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                target.clone(),
+                "-F".to_string(),
+                format!("{SENTINEL} #{{pane_left}} #{{pane_top}} #{{pane_width}} #{{pane_height}}"),
+                ";".to_string(),
+                "capture-pane".to_string(),
+                "-t".to_string(),
+                target,
+                "-p".to_string(),
+                "-e".to_string(),
+            ]);
+        }
+
+        let output = crate::tmux::tmux_command().args(&args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let (header, rest) = raw.split_once('\n')?;
+        let dims = header.strip_prefix(WINDOW_SENTINEL)?;
+        let mut fields = dims.split_whitespace();
+        let window_width: u16 = fields.next().and_then(|f| f.parse().ok())?;
+        let window_height: u16 = fields.next().and_then(|f| f.parse().ok())?;
+        if window_width == 0 || window_height == 0 {
+            return None;
+        }
+
+        let mut panes = parse_pane_segments(rest, SENTINEL);
+        if panes.is_empty() {
+            return None;
+        }
+        // Backstop for the zoom guard in `capture_window_composited_with_cursor`
+        // and `probe_pane_count`: if any overlapping layout still reaches here,
+        // keep the first pane of each overlapping set rather than handing the
+        // compositor a non-tiling layout it would paint as border garbage. Pane 0
+        // comes first, so the pane that survives is always the one receiving
+        // input, and the frame degrades to "pane 0 plus empty space".
+        let mut kept: Vec<CapturedPane> = Vec::with_capacity(panes.len());
+        for pane in panes.drain(..) {
+            if !kept.iter().any(|k| k.geom.overlaps(&pane.geom)) {
+                kept.push(pane);
+            }
+        }
+        let panes = kept;
+        Some(WindowLayout {
+            window_width,
+            window_height,
+            panes,
+        })
+    }
+
     /// Capture the pane's full scrollback (from session start) with wrapped
     /// lines joined (`-J`) and no escape sequences (`-e` omitted), for
     /// summarizing the first turn in smart-rename. Unlike
@@ -540,8 +891,7 @@ impl Session {
 
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
-        const HEADER_FMT: &str =
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
+        const HEADER_FMT: &str = CURSOR_FMT;
         let output = crate::tmux::tmux_command()
             .args([
                 "display-message",
@@ -872,6 +1222,8 @@ impl Session {
         if !self.exists() {
             return false;
         }
+        // Heartbeats are compared across processes, so this must be wall-clock
+        // (crate::util::now_ms), never a per-process monotonic clock.
         let now = now_ms();
         let claimable = match self.owner_at(opt, hb_opt) {
             None => true,
@@ -952,6 +1304,39 @@ impl Session {
             Some((id, _)) if id == owner_id => {
                 self.resize_window(cols, rows);
                 true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether at least one tmux client is attached to this session, from
+    /// `#{session_attached}` (the attached client count, per session).
+    ///
+    /// The TUI's passive preview resize checks this so it stops sizing a
+    /// session the user just attached to. `has_active_size_owner` does not
+    /// cover that case: it only sees surfaces that claim the size-owner lock
+    /// (the web/mobile live views), and a plain `switch-client` attach claims
+    /// nothing, so the passive resize shrank the window back to the preview
+    /// pane's dimensions right after the attach (#3071).
+    ///
+    /// Best-effort: a tmux call that fails to spawn, exits non-zero, or prints
+    /// something unparseable reports "not attached". The caller leaves its
+    /// dedup unset when it skips, so a transient glitch costs one poll
+    /// interval of a clipped preview rather than wedging the resize forever.
+    pub fn is_attached(&self) -> bool {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_attached}",
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.trim().parse::<u32>().unwrap_or(0) > 0
             }
             _ => false,
         }
@@ -1170,6 +1555,93 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Create a detached session for the composite tests, applying the guards
+    /// the rest of this module treats as mandatory:
+    ///
+    /// * `pane-base-index 0` chained into the create, so the `^.0` targets
+    ///   these paths use resolve on a host that sets `pane-base-index 1`
+    ///   globally (#488, #2231).
+    /// * [`refresh_session_cache`] afterwards, because every capture entry point
+    ///   is `exists()`-gated and a cache refreshed concurrently by another test
+    ///   would make the call a silent `Ok("")` rather than a visible failure.
+    fn start_composite_session(name: &str, cols: u16, rows: u16, cmd: &str) -> Session {
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+                cmd,
+                ";",
+                "set-option",
+                "-t",
+                name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success(), "failed to create {name}");
+        refresh_session_cache();
+        Session::from_name(name)
+    }
+
+    /// Split `session` horizontally and refresh the cache, mirroring
+    /// [`start_composite_session`]'s guards for the second pane.
+    fn split_composite_session(session: &Session, cmd: &str) {
+        let status = crate::tmux::tmux_command()
+            .args(["split-window", "-h", "-t", &session.name, cmd])
+            .status()
+            .expect("tmux split-window");
+        assert!(status.success(), "failed to split {}", session.name);
+        refresh_session_cache();
+    }
+
+    /// Poll until the pane has painted `needle`. A fixed sleep is flaky under
+    /// parallel suite load: the shell must spawn and the command run before a
+    /// capture sees anything. Mirrors
+    /// `capture_pane_with_cursor_returns_content_and_cursor`.
+    fn wait_for_pane_text(session: &Session, needle: &str) {
+        wait_for_text(session, needle, "pane", |s| s.capture_pane(20));
+    }
+
+    /// Poll until the composited capture contains `needle`, for the panes a
+    /// plain `capture_pane` cannot see.
+    fn wait_for_composite_text(session: &Session, needle: &str) {
+        wait_for_text(session, needle, "composite", |s| {
+            s.capture_window_composited(20)
+        });
+    }
+
+    /// Shared poll loop. Reports the LAST OBSERVED capture on timeout rather
+    /// than taking a fresh one, which is the thing you want when this trips in
+    /// CI: a re-capture at panic time can show different content than the poll
+    /// ever saw, which sends the reader chasing the wrong thing.
+    fn wait_for_text(
+        session: &Session,
+        needle: &str,
+        what: &str,
+        capture: impl Fn(&Session) -> Result<String>,
+    ) {
+        let mut last = None;
+        for _ in 0..50 {
+            let seen = capture(session).unwrap_or_default();
+            if seen.contains(needle) {
+                return;
+            }
+            last = Some(seen);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "{what} for {} never painted {needle:?}; last seen: {last:?}",
+            session.name
+        );
+    }
+
     #[test]
     fn raw_byte_batches_chunks_and_preserves_order() {
         let payload: Vec<u8> = (0..=255u8)
@@ -1213,6 +1685,40 @@ mod tests {
     }
 
     #[test]
+    fn pane_segments_split_the_chained_capture_by_sentinel() {
+        // Shape of the chained fork's stdout: a geometry line per pane, each
+        // followed by that pane's rows.
+        let raw = "@@s@@ 0 0 6 2\nleft1\nleft2\n@@s@@ 7 0 6 2\nright1\nright2\n";
+        let panes = parse_pane_segments(raw, "@@s@@");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].geom.left, 0);
+        assert_eq!(panes[1].geom.left, 7);
+        // Rows come back padded to the pane's width, which is what lets the
+        // compositor concatenate them without measuring.
+        assert_eq!(panes[0].rows.len(), 2);
+        assert!(panes[0].rows[0].contains("left1"));
+        assert!(panes[1].rows[1].contains("right2"));
+    }
+
+    #[test]
+    fn pane_segments_drop_a_pane_with_unparseable_geometry() {
+        // A bad geometry line must not push its rows onto the next pane's
+        // rectangle; the pane is dropped and the rest still parse.
+        let raw = "@@s@@ bogus\norphan\n@@s@@ 0 0 4 1\nkeep\n";
+        let panes = parse_pane_segments(raw, "@@s@@");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].geom.width, 4);
+        assert!(panes[0].rows[0].contains("keep"));
+    }
+
+    #[test]
+    fn pane_segments_are_empty_when_no_sentinel_appears() {
+        // A tmux that emitted nothing recognisable must yield no panes, so the
+        // caller falls back to its already-captured pane-0 bytes.
+        assert!(parse_pane_segments("just some output\n", "@@s@@").is_empty());
+    }
+
+    #[test]
     fn raw_byte_batches_large_paste_roundtrips_in_order() {
         // Regression for the silently-dropped large paste (#1942-era
         // live-send bug, now shared with the web live view): a ~100 KB
@@ -1250,6 +1756,7 @@ mod tests {
                 mouse_sgr: true,
                 mouse_all: true,
                 position_reliable: true,
+                composite_pane0: None,
             }
         );
         // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
@@ -1736,6 +2243,156 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_create_forwards_desktop_env_to_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        // A var only this test reads, caught by the `XDG_` forwarding rule, so
+        // it never collides with real config or another test's assertions.
+        let key = "XDG_AOE_ENV_TEST_3075";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "sentinel-value");
+
+        let guard = TmuxTestSession::new("aoe_test_env_fwd");
+        let session = super::Session::from_name(guard.name());
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+
+        let shown = crate::tmux::tmux_command()
+            .args(["show-environment", "-t", guard.name(), key])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        created.expect("create session");
+        assert_eq!(
+            shown.as_deref(),
+            Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
+            "a created agent session must carry the forwarded desktop/session env (#3075)"
+        );
+    }
+
+    /// #3071: `is_attached` gates the TUI's passive preview resize, so it has
+    /// to be right in both directions. The detached half is the cheap one; the
+    /// attached half needs a real tmux client, which the sibling test below
+    /// gets by running one inside a second tmux session.
+    #[test]
+    #[serial_test::serial]
+    fn test_is_attached_false_for_detached_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_attached");
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        let session = Session::from_name(guard.name());
+        assert!(
+            !session.is_attached(),
+            "Detached session should report is_attached() == false"
+        );
+    }
+
+    /// The attached half of the #3071 guard. A `-d` session can host a real
+    /// tmux client without a controlling terminal: give a second session a
+    /// command that unsets `$TMUX` and attaches to the first, and the first
+    /// session's `session_attached` count goes to 1. Without this the detached
+    /// test alone would pass against a hard-coded `false`, which is the exact
+    /// inversion that reintroduces the bug.
+    #[test]
+    #[serial_test::serial]
+    fn test_is_attached_true_with_live_client() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let target = TmuxTestSession::new("aoe_test_attached_target");
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                target.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+
+        // Rebuild this build's tmux argv (program plus any `-S`/`-L` socket
+        // flags) so the nested client lands on the same server the test
+        // isolates onto, and force a usable TERM: the server's base env can
+        // carry `dumb` in CI, which tmux refuses to attach with.
+        let probe = crate::tmux::tmux_command();
+        let mut argv = vec![probe.get_program().to_string_lossy().into_owned()];
+        argv.extend(probe.get_args().map(|a| a.to_string_lossy().into_owned()));
+        let attach_cmd = format!(
+            "unset TMUX; TERM=xterm-256color exec {} attach-session -t {}",
+            argv.join(" "),
+            target.name()
+        );
+
+        let client = TmuxTestSession::new("aoe_test_attached_client");
+        let spawned = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                client.name(),
+                "-x",
+                "100",
+                "-y",
+                "40",
+                &attach_cmd,
+            ])
+            .output()
+            .expect("tmux new-session (client)");
+        assert!(spawned.status.success());
+
+        let session = Session::from_name(target.name());
+        let mut attached = false;
+        for _ in 0..40 {
+            if session.is_attached() {
+                attached = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            attached,
+            "a session with a live tmux client must report is_attached() == true"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_is_pane_dead_on_running_session() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -1922,6 +2579,379 @@ mod tests {
         assert!(
             !session.is_pane_running_shell(),
             "is_pane_running_shell should check first window (sleep), not active window (sh)"
+        );
+    }
+
+    /// An unsplit window must composite to exactly what `capture_pane`
+    /// returns, so the overwhelmingly common case is provably unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_matches_capture_pane_when_unsplit() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_single");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+
+        let plain = session.capture_pane(10).expect("capture_pane");
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+        assert!(plain.contains("ALPHA"), "control capture empty: {plain:?}");
+        assert_eq!(
+            composited, plain,
+            "an unsplit window must pass the pane bytes through untouched"
+        );
+    }
+
+    /// The point of the feature: a pane the user split off by hand shows up in
+    /// the preview instead of being invisible.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_includes_a_split_off_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_split");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        // `C-b %`: a second pane beside the first.
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+
+        let plain = session.capture_pane(10).expect("capture_pane");
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+
+        // The old behaviour: pane 0 only, split pane invisible.
+        assert!(plain.contains("ALPHA"));
+        assert!(
+            !plain.contains("BRAVO"),
+            "control: capture_pane should not see the split pane"
+        );
+        // The new behaviour: both panes, side by side on the same rows.
+        assert!(
+            composited.contains("ALPHA") && composited.contains("BRAVO"),
+            "composite missed a pane:\n{composited}"
+        );
+        let seam_row = composited
+            .lines()
+            .find(|l| l.contains("ALPHA"))
+            .expect("row with ALPHA");
+        assert!(
+            seam_row.contains("BRAVO"),
+            "panes should share a row, not stack:\n{seam_row:?}"
+        );
+    }
+
+    /// `C-b z` keeps `window_panes` at its real count while reporting every pane
+    /// at the window's FULL rectangle, so the rectangles overlap and the
+    /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
+    /// its unzoomed width and filled the rest of every row with `─`, hiding the
+    /// zoomed pane, which is the only thing the user sees in tmux. The frame was
+    /// strictly worse than the pane-0-only preview it replaced, and permanently
+    /// so, since nothing self-heals a zoom.
+    ///
+    /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
+    /// the plain capture.
+    #[test]
+    #[serial_test::serial]
+    fn a_zoomed_pane_falls_back_to_the_plain_capture() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_zoom");
+        let session = start_composite_session(guard.name(), 40, 8, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+
+        // Control: unzoomed, both panes, and one line per window row.
+        let unzoomed = session
+            .capture_window_composited(10)
+            .expect("composite unzoomed");
+        assert!(
+            unzoomed.contains("ALPHA") && unzoomed.contains("BRAVO"),
+            "control: split should composite both panes:\n{unzoomed}"
+        );
+
+        let zoom = crate::tmux::tmux_command()
+            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+            .status()
+            .expect("tmux resize-pane -Z");
+        assert!(zoom.success(), "zoom must land or this tests nothing");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &crate::tmux::tmux_command()
+                    .args([
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &format!("{}:^", session.name),
+                        "-F",
+                        "#{window_zoomed_flag}",
+                    ])
+                    .output()
+                    .expect("zoom probe")
+                    .stdout
+            )
+            .trim(),
+            "1",
+            "tmux did not report the window as zoomed"
+        );
+
+        let zoomed = session
+            .capture_window_composited(10)
+            .expect("composite zoomed");
+        assert!(
+            !zoomed.contains('─') && !zoomed.contains('│'),
+            "zoomed frame painted border fill over the window:\n{zoomed}"
+        );
+        assert_eq!(
+            zoomed,
+            session.capture_pane(10).expect("plain capture"),
+            "zoomed must be byte-identical to the pane-0 capture"
+        );
+
+        // Unzooming restores the composite rather than latching the fallback.
+        assert!(crate::tmux::tmux_command()
+            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+            .status()
+            .expect("tmux unzoom")
+            .success());
+        let restored = session
+            .capture_window_composited(10)
+            .expect("composite after unzoom");
+        assert!(
+            restored.contains("ALPHA") && restored.contains("BRAVO"),
+            "unzoom did not restore the composite:\n{restored}"
+        );
+    }
+
+    /// A composited capture must carry one line per window row. It is handed to
+    /// the preview cache like a `capture-pane` result and the cursor is rebased
+    /// onto `window_height`, so a row lost off the bottom paints the cursor one
+    /// row too high. A stacked split with an idle shell underneath is the case
+    /// that produced it: the bottom row is blank, and joining rows rather than
+    /// terminating them let the renderer drop it.
+    #[test]
+    #[serial_test::serial]
+    fn a_stacked_split_composites_one_line_per_window_row() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_rows");
+        let session = start_composite_session(guard.name(), 30, 10, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        // `C-b "`: stacked, so the bottom pane's last row is blank.
+        let split = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-v",
+                "-t",
+                &session.name,
+                "sh -c 'sleep 30'",
+            ])
+            .status()
+            .expect("tmux split-window -v");
+        assert!(split.success(), "failed to split {}", session.name);
+        refresh_session_cache();
+        wait_for_composite_text(&session, "ALPHA");
+
+        let composited = session.capture_window_composited(10).expect("composite");
+        assert_eq!(
+            composited.lines().count(),
+            10,
+            "composite must be window_height lines:\n{composited}"
+        );
+    }
+
+    /// The live path caches a layout and re-renders only pane 0 from its VT
+    /// grid, so the layout must come back with pane 0 first, at the window
+    /// origin, and with rectangles that tile the real window.
+    #[test]
+    #[serial_test::serial]
+    fn captured_layout_puts_pane_zero_first_at_the_origin() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_layout_order");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+        // Make the SECOND pane active: pane 0 must still come back first. The
+        // select must be asserted, or a failure leaves pane 0 active and the
+        // assertions below pass for the boring reason, silently retiring the
+        // premise this test exists to check.
+        let selected = crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &format!("{}:^.1", session.name)])
+            .output()
+            .expect("tmux select-pane");
+        assert!(
+            selected.status.success(),
+            "select-pane must land, or this degrades to the pane-0-already-active case"
+        );
+        let active = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:^", session.name),
+                "-F",
+                "#{pane_index}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        assert_eq!(
+            String::from_utf8_lossy(&active.stdout).trim(),
+            "1",
+            "pane 1 should be the active pane before the layout is captured"
+        );
+        let layout = session
+            .capture_window_layout(2)
+            .expect("layout for a split window");
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.window_width, 80);
+        let first = layout.first_pane().expect("first pane");
+        assert_eq!(
+            (first.left, first.top),
+            (0, 0),
+            "pane 0 must sit at the window origin for the cursor math to hold"
+        );
+        // Pane 0 is the agent's, even though pane 1 is the active one.
+        assert!(
+            layout.panes[0].rows.iter().any(|r| r.contains("ALPHA")),
+            "pane 0 rows: {:?}",
+            layout.panes[0].rows
+        );
+        assert!(layout.panes[1].rows.iter().any(|r| r.contains("BRAVO")));
+        // Every row is padded to its own pane's width, which is what lets the
+        // compositor concatenate them.
+        for (i, pane) in layout.panes.iter().enumerate() {
+            for row in &pane.rows {
+                assert_eq!(
+                    crate::tmux::utils::strip_ansi(row).chars().count(),
+                    pane.geom.width as usize,
+                    "pane {i} row not padded to {}: {row:?}",
+                    pane.geom.width
+                );
+            }
+        }
+    }
+
+    /// A composited capture must return the pane's cursor, and on an unsplit
+    /// window it must return the same bytes and cursor mode flags the plain
+    /// cursor-bearing capture does.
+    ///
+    /// The cursor matters because this is live-send's transport whenever no VT
+    /// channel is available: without it a split preview loses both its painted
+    /// cursor and the alternate-screen / mouse flags the wheel forward reads.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_carries_the_pane_cursor() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_cursor");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+
+        let (content, cursor) = session
+            .capture_window_composited_with_cursor(20)
+            .expect("composited capture");
+        let plain = session.capture_pane(20).expect("capture_pane");
+        assert_eq!(
+            content, plain,
+            "unsplit window must still pass pane bytes through untouched"
+        );
+        assert!(
+            content.contains("ALPHA"),
+            "first captured row went missing: {content:?}"
+        );
+        let cursor = cursor.expect("a cursor for a live pane");
+        assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+
+        // Now split, and the cursor must be rebased onto the window so the
+        // renderer's `pane_height` anchoring still lines up with the composite.
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+
+        let (content, cursor) = session
+            .capture_window_composited_with_cursor(20)
+            .expect("composited capture");
+        assert!(content.contains("ALPHA") && content.contains("BRAVO"));
+        let cursor = cursor.expect("a cursor for the split window");
+        assert_eq!(
+            cursor.pane_width, 80,
+            "rebased onto the window, not pane 0 (which is now ~39 wide)"
+        );
+        assert_eq!(
+            cursor.history_size, 0,
+            "a composite has no scrollback to advertise"
+        );
+        assert!(
+            cursor.position_reliable,
+            "visible-only composite cannot have drifted"
+        );
+    }
+
+    /// The two composite transports must agree byte for byte on a static
+    /// window.
+    ///
+    /// The live path renders a cached layout with pane 0 swapped for its VT
+    /// grid rows, while the passive fallback re-forks every pane. Any
+    /// divergence in shape between them shows up as the preview flickering
+    /// between two renderings as one path takes over from the other, which is
+    /// exactly the bug that shipped when the fallback still captured pane 0
+    /// alone: the split was visible for one frame after each keystroke and
+    /// vanished during idle.
+    #[test]
+    #[serial_test::serial]
+    fn both_composite_transports_agree_on_a_static_window() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_agree");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+
+        // Passive fallback: one fork per pane, composited on the spot.
+        let fallback = session
+            .capture_window_composited(24)
+            .expect("capture_window_composited");
+        let layout = session.capture_window_layout(2).expect("layout");
+        // Live path, minus the grid: swapping pane 0's own captured rows back
+        // in must be a no-op, which is what makes the swap safe to do with
+        // fresher rows every frame.
+        let swapped = layout.composite_with_first_pane_rows(&layout.panes[0].rows.clone());
+
+        assert_eq!(
+            fallback,
+            layout.composite(),
+            "fork-per-frame and cached-layout renderings diverged"
+        );
+        assert_eq!(
+            fallback, swapped,
+            "swapping pane 0's rows for identical rows changed the frame"
         );
     }
 

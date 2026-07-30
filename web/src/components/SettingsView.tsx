@@ -325,7 +325,16 @@ export function SettingsView({
   useEffect(() => {
     void refreshPluginPages();
   }, [refreshPluginPages]);
-  const sidebar = buildSidebar(pluginPages);
+  // Translate sidebar labels at the source (the item's `label` field) so both
+  // the rendered button text and `currentTabLabel` (which reads `.label`) see
+  // the translated value. `defaultValue` falls back to the English label for
+  // entries with no catalog key: the main-only "panels" tab, the "Plugin pages"
+  // divider, and plugin-contributed pages (whose label is the plugin name).
+  const sidebar = buildSidebar(pluginPages).map((item) =>
+    item.kind === "tab"
+      ? { ...item, label: t(`settings:tab.${item.id}`, { defaultValue: item.label }) }
+      : { ...item, label: t(`settings:divider.${item.label}`, { defaultValue: item.label }) },
+  );
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
   // The declared nav entry a plugin-page route resolves to, or undefined when
@@ -795,7 +804,7 @@ export function SettingsView({
                 }`}
               >
                 {item.icon}
-                {t(`settings:tab.${item.id}`)}
+                {item.label}
               </button>
             ),
           )}
@@ -812,7 +821,7 @@ export function SettingsView({
                 key={item.label}
                 className={`px-4 pt-3 pb-1 text-[10px] font-mono uppercase tracking-widest text-text-dim ${i > 0 ? "mt-2 border-t border-surface-700/40" : ""}`}
               >
-                {t(`settings:divider.${item.label}`)}
+                {item.label}
               </div>
             ) : (
               <button
@@ -825,7 +834,7 @@ export function SettingsView({
                 }`}
               >
                 {item.icon}
-                {t(`settings:tab.${item.id}`)}
+                {item.label}
               </button>
             ),
           )}

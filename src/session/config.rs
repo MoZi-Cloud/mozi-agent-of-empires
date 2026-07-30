@@ -1218,6 +1218,49 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
+    /// Show per-session color labels: the colored dot on sidebar rows and the
+    /// `Color` section in the session context menu. Web dashboard only; the TUI
+    /// does not render session colors. Turning this off hides them without
+    /// forbidding anything, `aoe session color` and the REST endpoint keep
+    /// working and stored values are preserved, so flipping back reveals them
+    /// again.
+    ///
+    /// `global_only`: the dashboard resolves one settings object for the whole
+    /// client, not one per workspace, and the sidebar mixes sessions from
+    /// several profiles in the all-profiles view. A per-profile override would
+    /// advertise semantics the web cannot honor.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Session Color Labels",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub show_session_colors: bool,
+
+    /// Pin favorited sessions to the top of their sibling scope in every sort
+    /// order of the TUI session list, not just Attention. A group holding a
+    /// favorited session is pinned the same way. When on (default), favoriting
+    /// is a general "keep this where I can find it" marker; when off, the star
+    /// only biases the Attention sort (its tier-local tiebreak) and the
+    /// favorite key is inert everywhere else, which is the pre-1.14 behavior.
+    ///
+    /// Governs the TUI list only. The web dashboard keeps favorite as a
+    /// within-tier Attention signal and has its own pin control.
+    ///
+    /// `global_only`: read through a single process-wide flag
+    /// (`crate::session::favorites_first`) on the sort hot path, so a
+    /// per-profile override could not be honored. Same reasoning as
+    /// `unread_indicator`.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Favorites First",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub favorites_first: bool,
+
     /// Show occasional discovery tips: the `💡` badge in the footer, the
     /// browsable tips overlay, and the one-time earned pop. Turn this off to
     /// hide the badge and stop tips from popping; seen/earned state still lives
@@ -1428,6 +1471,8 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
+            show_session_colors: true,
+            favorites_first: true,
             show_tips: true,
             tie_workdir_to_name: true,
         }
@@ -1662,11 +1707,12 @@ pub struct WebConfig {
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
 
-    /// How many user-defined quick-send buttons the mobile terminal toolbar
-    /// shows (laid out in rows of up to 7). Defaults to 0. Buttons are
-    /// customized by long-pressing them on the mobile toolbar; their contents
-    /// live in `mobile_quick_buttons` and sync across devices with the config.
-    #[serde(default)]
+    /// How many user-defined quick-send buttons the terminal toolbar shows
+    /// (8 per row on the touch toolbar, 16 per row on desktop). Defaults to 4,
+    /// so the text1 through text4 placeholder slots are visible out of the box;
+    /// long-press one to edit it. Contents live in `mobile_quick_buttons` and
+    /// sync across devices with the config.
+    #[serde(default = "default_mobile_quick_button_count")]
     #[setting(
         label = "Mobile quick buttons",
         widget = "number",
@@ -1684,6 +1730,15 @@ pub struct WebConfig {
     #[serde(default)]
     #[setting(skip)]
     pub mobile_quick_buttons: Vec<MobileQuickButton>,
+
+    /// When on, the web terminal does not forward mouse clicks/drags to the
+    /// running app, even one that enabled mouse reporting (Claude Code's TUI
+    /// does). Plain mouse drags then select text and pop the floating Copy
+    /// button, as they do in a shell; the mouse wheel still scrolls the app.
+    /// Trade-off: you can no longer click inside such a TUI, use the keyboard.
+    #[serde(default)]
+    #[setting(label = "Disable mouse forwarding", widget = "toggle", global_only)]
+    pub disable_mouse_forwarding: bool,
 }
 
 impl Default for WebConfig {
@@ -1694,10 +1749,15 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
-            mobile_quick_button_count: 0,
+            mobile_quick_button_count: 4,
             mobile_quick_buttons: Vec::new(),
+            disable_mouse_forwarding: false,
         }
     }
+}
+
+fn default_mobile_quick_button_count() -> u8 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
@@ -2434,15 +2494,6 @@ pub fn should_apply_tmux_clipboard() -> bool {
         TmuxClipboardMode::Disabled => false,
         TmuxClipboardMode::Auto => !user_has_tmux_config(),
     }
-}
-
-/// Whether live views may use the VT transport (`[tmux] vt_live`, default
-/// on). Read from the global config at each gate: the TUI capture worker
-/// samples it through its config-refresh path, and the web live socket
-/// checks it per connection, so flipping the setting applies without a
-/// restart (existing web connections keep their transport until reconnect).
-pub fn vt_live_enabled() -> bool {
-    Config::load_or_warn().tmux.vt_live
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {

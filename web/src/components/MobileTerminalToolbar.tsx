@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { type CSSProperties, useCallback, useState } from "react";
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useLongPressEdit } from "../hooks/useLongPressEdit";
@@ -52,6 +52,8 @@ interface Props {
   onClearModifiers: () => void;
   /** The live view's hidden input element, which owns keyboard focus. */
   inputElRef: RefObject<HTMLTextAreaElement | null>;
+  /** Buttons per row. 8 for the mobile (touch) toolbar, 16 for desktop. */
+  columns?: number;
 }
 
 type SystemKey = "up" | "down" | "left" | "right" | "tab" | "esc" | "enter" | "fn";
@@ -63,6 +65,7 @@ export function MobileTerminalToolbar({
   onToggleModifier,
   onClearModifiers,
   inputElRef,
+  columns = 8,
 }: Props) {
   const { t } = useTranslation();
   const count = useMobileQuickButtonCount();
@@ -147,17 +150,21 @@ export function MobileTerminalToolbar({
     refocusTerminal();
   }, [haptic, t, refocusTerminal]);
 
-  // Cell base class: 1/7 of the strip width so 7 buttons fill a row and the
-  // grid wraps cleanly (system rows + Fn + custom buttons share the grid).
+  // The strip is a CSS grid with `columns` equal-width tracks, so exactly
+  // `columns` buttons fill every row regardless of the gap (flex+wrap would
+  // drop the Nth button to a new row once the gaps ate into the basis). 8 for
+  // the mobile (touch) toolbar, 16 for desktop.
   const cell =
-    "flex items-center justify-center h-11 basis-[14.28%] min-w-0 px-1 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation active:bg-surface-700/50 active:scale-95 truncate";
-  const strip = "shrink-0 flex flex-wrap items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
+    "flex items-center justify-center h-11 min-w-0 px-1 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation active:bg-surface-700/50 active:scale-95 truncate";
+  const strip = "shrink-0 grid gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
+  const stripStyle = { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` } as CSSProperties;
   const modActive = (on: boolean) => (on ? `${cell} text-brand-400 bg-brand-600/20 ring-1 ring-brand-500/40` : cell);
   const modAria = (label: string, on: boolean) => (on ? `${label}${t("mobile:toolbar.activeSuffix")}` : label);
 
   return (
     <div
       className={strip}
+      style={stripStyle}
       // Prevent toolbar taps from stealing focus away from the proxy input.
       onMouseDown={(e) => e.preventDefault()}
     >
@@ -276,7 +283,7 @@ export function MobileTerminalToolbar({
         <span className="font-mono text-sm">~</span>
       </button>
 
-      {/* Custom quick buttons (one row per 7). Default label text1..textN. */}
+      {/* Custom quick buttons (one row per `columns`). Default label text1..textN. */}
       {buttons.map((b, i) => (
         <CustomButton
           key={i}
@@ -324,9 +331,8 @@ function CustomButton({
   );
 }
 
-// Paste is large enough (Clipboard API + insecure-context execCommand
-// fallback) to deserve its own component. Kept byte-equivalent to the original
-// toolbar paste handler; only the toast strings are localized.
+// Paste is large enough (Clipboard API + execCommand fallback for contexts
+// where the async Clipboard API is unavailable) to deserve its own component.
 function PasteButton({
   sendData,
   keyboardOpen,
@@ -341,7 +347,7 @@ function PasteButton({
   t: (key: string) => string;
 }) {
   const cell =
-    "flex items-center justify-center h-11 basis-[14.28%] min-w-0 px-1 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation active:bg-surface-700/50 active:scale-95";
+    "flex items-center justify-center h-11 min-w-0 px-1 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation active:bg-surface-700/50 active:scale-95";
   return (
     <button
       type="button"
@@ -351,32 +357,34 @@ function PasteButton({
         haptic();
         const toast = toastBus.handler;
 
-        if (window.isSecureContext) {
-          try {
-            if (navigator.clipboard?.read) {
-              const items = await navigator.clipboard.read();
-              for (const item of items) {
-                for (const ty of CLIPBOARD_TEXT_TYPES) {
-                  if (!item.types.includes(ty)) continue;
-                  const blob = await item.getType(ty);
-                  const raw = await blob.text();
-                  const text = normalizeClipboardData(ty, raw);
-                  if (text) {
-                    sendData(text);
-                    return;
-                  }
+        // Always attempt the async Clipboard API, including over plain HTTP.
+        // On an insecure origin navigator.clipboard is undefined, so the
+        // optional chaining no-ops and we fall through to the execCommand
+        // fallback below; the button stays usable on a plain-HTTP tailnet URL.
+        try {
+          if (navigator.clipboard?.read) {
+            const items = await navigator.clipboard.read();
+            for (const item of items) {
+              for (const ty of CLIPBOARD_TEXT_TYPES) {
+                if (!item.types.includes(ty)) continue;
+                const blob = await item.getType(ty);
+                const raw = await blob.text();
+                const text = normalizeClipboardData(ty, raw);
+                if (text) {
+                  sendData(text);
+                  return;
                 }
               }
-            } else if (navigator.clipboard?.readText) {
-              const text = await navigator.clipboard.readText();
-              if (text) {
-                sendData(text);
-                return;
-              }
             }
-          } catch {
-            // Permission denied, no focus, etc. Fall through to execCommand.
+          } else if (navigator.clipboard?.readText) {
+            const text = await navigator.clipboard.readText();
+            if (text) {
+              sendData(text);
+              return;
+            }
           }
+        } catch {
+          // Permission denied, no focus, etc. Fall through to execCommand.
         }
 
         const activeEl = document.activeElement;
@@ -424,11 +432,7 @@ function PasteButton({
           }
         }
 
-        if (!window.isSecureContext) {
-          toast?.error(t("mobile:pasteToast.needsHttps"));
-        } else {
-          toast?.error(t("mobile:pasteToast.failed"));
-        }
+        toast?.error(t("mobile:pasteToast.failed"));
       }}
     >
       <svg

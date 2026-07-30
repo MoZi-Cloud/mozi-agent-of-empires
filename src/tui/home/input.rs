@@ -203,6 +203,62 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// The rectangle mouse coordinates are mapped into, or `None` when the pointer
+/// is not over the pane that receives input.
+///
+/// Normally the previewed pane is sized to the preview output rect, so the rect
+/// IS the pane. On a composited preview (the user split the window) the rect is
+/// the whole window while input still goes to pane 0 alone (#435, #488), so the
+/// pane-0 sub-rectangle is the right target: mapping against the full rect would
+/// report a column past pane 0's right edge to the agent as though its own pane
+/// were window-wide. A pointer outside pane 0 has no meaningful coordinate to
+/// report at all, so it is dropped rather than clamped to the nearest edge,
+/// which would otherwise synthesise a click or hover on pane 0's border.
+///
+/// Pane 0 sits at the window origin, so the sub-rectangle shares the preview's
+/// top-left corner and only its extent differs.
+fn mouse_target_rect(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<ratatui::layout::Rect> {
+    // Unsplit: the rect IS the pane, and containment stays the caller's business
+    // (`hit_preview` gates the press) with `map_pane_cell` clamping the rest, so
+    // this must not start rejecting cells that used to clamp.
+    if cursor.composite_pane0.is_none() {
+        return Some(pane);
+    }
+    let pane0 = mouse_pane_rect(cursor, pane);
+    let inside = col >= pane0.x
+        && col < pane0.x.saturating_add(pane0.width)
+        && row >= pane0.y
+        && row < pane0.y.saturating_add(pane0.height);
+    inside.then_some(pane0)
+}
+
+/// The input pane's rectangle within the preview, with no containment test:
+/// pane 0's sub-rectangle on a composited preview, else the whole preview rect.
+///
+/// Split from [`mouse_target_rect`] for the mid-gesture case. A drag or release
+/// is deliberately not position-gated so a gesture that began on pane 0 still
+/// completes, and those events need a clamped coordinate even after the pointer
+/// has wandered off pane 0.
+fn mouse_pane_rect(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    match cursor.composite_pane0 {
+        Some((width, height)) => ratatui::layout::Rect {
+            x: pane.x,
+            y: pane.y,
+            width: width.min(pane.width),
+            height: height.min(pane.height),
+        },
+        None => pane,
+    }
+}
+
 /// Map a hovered screen cell `(col, row)` into a forwarded app's 1-based
 /// mouse coordinate space, relative to its pane `pane` (the live-send target
 /// is sized to the preview output rect, so this maps directly), clamped
@@ -290,8 +346,9 @@ fn hover_forward_bytes(
     col: u16,
     row: u16,
 ) -> Option<Vec<u8>> {
+    let target = mouse_target_rect(cursor, pane, col, row)?;
     (cursor.alternate_on && cursor.mouse_all)
-        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, pane, col, row))
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
 }
 
 /// Page presses delivered per wheel notch for a no-mouse full-screen app.
@@ -315,11 +372,15 @@ fn wheel_forward_key(
     if !cursor.alternate_on {
         return None;
     }
+    // Outside pane 0 on a composited preview there is nothing to drive: the
+    // pointer is over a pane that receives no input, and paging pane 0 because
+    // the wheel turned somewhere else would be a scroll the user did not aim.
+    let target = mouse_target_rect(cursor, pane, col, row)?;
     if cursor.mouse_tracking {
         Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
             up,
             cursor.mouse_sgr,
-            pane,
+            target,
             col,
             row,
         )))
@@ -2807,6 +2868,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::AutoName => return self.auto_name_selected(),
         }
         None
     }
@@ -3455,6 +3517,63 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    /// "Auto-name now": run the agent one-shot title generator for the
+    /// selected still-default-named session, on demand and even when
+    /// auto-rename-on-start is disabled (#3039). Terminal sessions rename via a
+    /// detached child; structured sessions go through the daemon (serve builds).
+    /// Best-effort: a 202-style "started", not a synchronous rename.
+    fn auto_name_selected(&mut self) -> Option<Action> {
+        let Some(id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to auto-name it.",
+            ));
+            return None;
+        };
+        let Some((title, structured, profile)) = self.get_instance(&id).map(|inst| {
+            (
+                inst.title.clone(),
+                inst.is_structured(),
+                inst.source_profile.clone(),
+            )
+        }) else {
+            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
+            return None;
+        };
+
+        // Gate on a still-default name, mirroring the web action: never
+        // overwrite a title the user (or a prior rename) already chose.
+        if !crate::session::civilizations::is_default_civ_name(&title) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Already Named",
+                "This session already has a custom name, so it will not be auto-named.",
+            ));
+            return None;
+        }
+
+        if structured {
+            #[cfg(feature = "serve")]
+            {
+                return Some(Action::SmartRenameNow(id));
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Unavailable",
+                    "Auto-naming a structured-view session needs a serve-enabled build.",
+                ));
+                return None;
+            }
+        }
+
+        crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
+        // Transient status (not a modal), matching the structured path's
+        // feedback so the two on-demand triggers behave the same.
+        Some(Action::SetTransientStatus(format!(
+            "auto-naming \"{title}\"…"
+        )))
     }
 
     fn open_serve(&mut self) {
@@ -4343,13 +4462,23 @@ impl HomeView {
             self.mouse_forward_btn = None;
             return false;
         };
+        // On a composited preview only pane 0 takes input, so a PRESS outside it
+        // must not open a gesture: the pointer is over a pane the agent does not
+        // own, and forwarding would report the click at a clamped cell pane 0
+        // never saw. Drags and releases stay ungated so a gesture that began on
+        // pane 0 still completes.
+        let press = !release && !motion;
+        if press && mouse_target_rect(&cursor, self.preview_text_view.pane, col, row).is_none() {
+            self.mouse_forward_btn = None;
+            return false;
+        }
         self.mouse_forward_btn = if release { None } else { Some(base_button) };
         let bytes = mouse_event_bytes(
             base_button,
             release,
             motion,
             cursor.mouse_sgr,
-            self.preview_text_view.pane,
+            mouse_pane_rect(&cursor, self.preview_text_view.pane),
             col,
             row,
         );
@@ -5414,19 +5543,17 @@ impl HomeView {
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
-                    // The click only moves the cursor, but if we're live-sending
-                    // to a *different* row, leave live mode rather than stranding
-                    // keystrokes on the old session while the cursor / preview
-                    // walks away. In `LiveSend` mode the `start_live_send` branch
-                    // below already retargets, so this only matters for the
-                    // select-only (and archived) gesture, which is precisely a
-                    // "stop touching that, let me look at this" intent.
-                    if let Some(state) = self
-                        .live_send
-                        .as_ref()
-                        .filter(|s| s.session_id != id)
-                        .cloned()
-                    {
+                    // The click only moves the cursor and, if we're live-sending,
+                    // leaves live mode. This holds whether the click lands on a
+                    // *different* row (keystrokes were aimed at the old session
+                    // while the cursor / preview walk away) or on the row that's
+                    // already live: a single click here is a "stop touching that,
+                    // let me look at this" gesture, so clicking the active session
+                    // exits live mode rather than doing nothing. In `LiveSend`
+                    // mode the `start_live_send` branch below retargets instead;
+                    // this exit only runs for the select-only (and archived)
+                    // gesture.
+                    if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     None
@@ -6015,6 +6142,16 @@ impl HomeView {
     fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
+        self.teardown_live_send();
+    }
+
+    /// Shared live-send teardown; touches no tmux sizing. Normal exits
+    /// call it via `exit_live_send_and_restore_sizing`; the lost-lock exit
+    /// (`poll_live_send_takeover`) calls it directly, because the surface
+    /// that took over has already sized the window to its own grid and
+    /// re-asserting `window-size latest` would stomp it (the exact flap
+    /// the size-owner lock exists to kill).
+    fn teardown_live_send(&mut self) {
         self.live_send = None;
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
@@ -6046,8 +6183,10 @@ impl HomeView {
     /// from under us between entry and now. Three drift modes:
     /// - Instance row deleted (peer / web structured view / another aoe killed
     ///   it).
-    /// - Title renamed (which regenerates the tmux session name; the
-    ///   worker is now targeting a stale name).
+    /// - Title renamed AND the tmux session renamed with it, so the worker is
+    ///   now targeting a stale name. A retitle whose tmux rename did not land
+    ///   is not drift: `Session::resolve_name` still resolves onto the pane the
+    ///   worker holds, which is the session's pane.
     /// - tmux session itself is gone (`tmux kill-session`, server
     ///   restart) even though our instance row says otherwise. We use
     ///   the existing `session_exists_from_cache` lookup so this costs
@@ -6065,13 +6204,13 @@ impl HomeView {
         };
         let current_name = match &state.target {
             live_send::LiveSendTarget::Agent => {
-                crate::tmux::Session::generate_name(&inst.id, &inst.title)
+                crate::tmux::Session::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
@@ -6086,6 +6225,55 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Poll the live-send worker's lock-loss flag (set off-thread when
+    /// another surface takes the size-owner lock) and exit live mode when
+    /// it trips, mirroring the web live view's demote-on-heartbeat. Called
+    /// from the main loop each tick so the exit does not wait for a
+    /// keystroke. Returns true when live mode was exited (a repaint is
+    /// needed).
+    ///
+    /// Deliberately does NOT restore the window's sizing: the new owner
+    /// already resized the window to its grid, and `window-size latest`
+    /// would stomp it.
+    pub(in crate::tui) fn poll_live_send_takeover(&mut self) -> bool {
+        if !self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::lock_lost)
+        {
+            return false;
+        }
+        let Some(state) = self.live_send.clone() else {
+            // Worker outlived the live-send state (already torn down some
+            // other way); just drop it.
+            self.live_send_worker = None;
+            return false;
+        };
+        // A dead or renamed session also fails the worker's ownership
+        // refresh; prefer the accurate drift message over blaming a
+        // takeover that never happened.
+        if let Some(reason) = self.live_send_drift_reason(&state) {
+            self.exit_live_send_and_restore_sizing(&state);
+            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+            return true;
+        }
+        // Name the thief where the owner id makes it unambiguous. The web
+        // dashboard's live viewers register as `live-*`
+        // (src/server/live_ws.rs); other aoe TUIs as `tui-*`.
+        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
+            Some((id, _)) if id.starts_with("live-") => {
+                "The web dashboard took over this session's live view."
+            }
+            Some((id, _)) if id.starts_with("tui-") => {
+                "Another aoe TUI took over this session's live view."
+            }
+            _ => "Another surface took over this session's live view.",
+        };
+        self.teardown_live_send();
+        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        true
     }
 
     /// Open the permission-response dialog for the currently-selected
@@ -6662,6 +6850,7 @@ mod tests {
             mouse_sgr,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 
@@ -6696,6 +6885,75 @@ mod tests {
         let mut normal = cursor_for(false, true, true);
         normal.mouse_all = true;
         assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
+    }
+
+    /// On a composited preview the rect is the whole window while input still
+    /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
+    /// mapped against the full rect: that reported a column past pane 0's right
+    /// edge to the agent as though its own pane were window-wide.
+    #[test]
+    fn composited_preview_maps_the_mouse_into_pane_zero_only() {
+        use ratatui::layout::Rect;
+        // An 80x24 preview showing a window split at column 40.
+        let pane = Rect::new(0, 0, 80, 24);
+        let mut split = cursor_for(true, true, true);
+        split.mouse_all = true;
+        split.composite_pane0 = Some((40, 24));
+
+        // Inside pane 0: maps as before, 1-based.
+        assert_eq!(
+            hover_forward_bytes(&split, pane, 10, 5).as_deref(),
+            Some(b"\x1b[<35;11;6M".as_slice())
+        );
+        // Over the neighbour: dropped, not clamped to pane 0's border, which
+        // would synthesise a hover on a cell the pointer never touched.
+        assert_eq!(hover_forward_bytes(&split, pane, 60, 5), None);
+        assert_eq!(wheel_forward_key(&split, true, pane, 60, 5), None);
+        // The last column of pane 0 is still inside it; the first past it is not.
+        assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
+        assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
+
+        // A no-mouse full-screen agent gets no page key from a wheel aimed at
+        // the neighbour either, but keeps it over pane 0.
+        let mut no_mouse = cursor_for(true, false, false);
+        no_mouse.composite_pane0 = Some((40, 24));
+        assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
+        assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
+
+        // Unsplit is unchanged: no composite extent, so the whole rect maps.
+        let unsplit = {
+            let mut c = cursor_for(true, true, true);
+            c.mouse_all = true;
+            c
+        };
+        assert_eq!(
+            hover_forward_bytes(&unsplit, pane, 60, 5).as_deref(),
+            Some(b"\x1b[<35;61;6M".as_slice())
+        );
+        // And an unsplit cell OUTSIDE the rect must still CLAMP, not drop. The
+        // press is gated by `hit_preview`, and these helpers have always relied
+        // on `map_pane_cell` to clamp whatever reaches them, so adding the
+        // pane-0 containment test must not leak into the single-pane path.
+        assert_eq!(
+            hover_forward_bytes(&unsplit, pane, 999, 999).as_deref(),
+            Some(b"\x1b[<35;80;24M".as_slice()),
+            "unsplit coordinates clamp to the rect, they do not get dropped"
+        );
+    }
+
+    /// A pane 0 extent larger than the preview rect (the window is bigger than
+    /// the area it is being shown in, e.g. an attached client keeping its own
+    /// size) must clamp to the rect rather than admitting cells outside it.
+    #[test]
+    fn composite_pane_rect_clamps_to_the_preview() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(2, 3, 20, 10);
+        let mut cursor = cursor_for(true, true, true);
+        cursor.composite_pane0 = Some((999, 999));
+        assert_eq!(mouse_pane_rect(&cursor, pane), pane);
+        // And the origin is honoured: a cell above/left of the rect is outside.
+        assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
+        assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must

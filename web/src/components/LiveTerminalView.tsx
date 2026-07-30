@@ -7,6 +7,8 @@ import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
+import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
+import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
 import { type Modifiers, NO_MODIFIERS } from "../lib/modifierKeys";
 import {
@@ -61,12 +63,30 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
-  const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath);
-  // Only the iOS-regular-Safari bottom inset comes from the viewport
-  // hook. Keyboard open/closed state does NOT: on a touch device the
-  // keyboard is open exactly when our input has focus, and focus events
-  // are ground truth where viewport-occlusion heuristics misread.
-  const { keyboardHeight } = useMobileKeyboard();
+  const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
+  const receiveAgentClipboard = useCallback((text: string) => {
+    const armed = clipboardArmRef.current;
+    clipboardArmRef.current = null;
+    if (!armed?.resolve(text)) void writeClipboard(text);
+  }, []);
+  const armAgentClipboard = useCallback(() => {
+    clipboardArmRef.current?.cancel();
+    clipboardArmRef.current = armClipboardWrite();
+  }, []);
+  useEffect(
+    () => () => {
+      clipboardArmRef.current?.cancel();
+      clipboardArmRef.current = null;
+    },
+    [],
+  );
+  const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath, receiveAgentClipboard);
+  // The viewport hook supplies the iOS-regular-Safari bottom inset and
+  // the occlusion-based keyboardOpen used to gate the pane's sizing
+  // latch (occlusion is what shrinks the container, whichever element is
+  // focused). The CHROME's open/closed state still comes from input
+  // focus below, which is exact where occlusion heuristics misread.
+  const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   // Mobile toolbar modifier latches (Shift/Ctrl/Alt/Cmd). One-shot: the next
@@ -281,6 +301,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       >
         <MobileLiveTerminal
           frame={live.state.frame}
+          armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
           reading={live.state.reading}
@@ -298,11 +319,12 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}
+          keyboardOpen={keyboardOpen}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
 
-      {coarse && live.state.connected && (
+      {live.state.connected && (
         <MobileTerminalToolbar
           sendData={live.sendData}
           inputElRef={inputRef}
@@ -310,6 +332,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           modifiers={modifiers}
           onToggleModifier={toggleModifier}
           onClearModifiers={clearModifiers}
+          columns={coarse ? 8 : 16}
         />
       )}
     </div>

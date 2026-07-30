@@ -25,7 +25,6 @@ export const mobile = {
     failed: "无法复制。请先在终端中选中文字。",
   },
   pasteToast: {
-    needsHttps: "粘贴需要 HTTPS。请运行 `aoe serve --remote` 获取 Tailscale 或 Cloudflare 的 HTTPS 地址。",
     failed: "无法读取剪贴板。请重新复制,或在 Safari 中打开此控制台。",
   },
   editModal: {

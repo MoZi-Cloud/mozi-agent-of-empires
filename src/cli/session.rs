@@ -55,9 +55,12 @@ pub enum SessionCommands {
     /// Wake a snoozed session immediately
     Unsnooze(SessionIdArgs),
 
-    /// Mark a session as a favorite. Favorited rows pin to the top of
-    /// their status tier in the Attention sort and render with a leading
-    /// `* ` glyph plus bold + underline.
+    /// Mark a session as a favorite. With `session.favorites_first` on (the
+    /// default), favorited rows pin to the top of their sibling scope in every
+    /// sort order; with it off, they pin within their status tier in the
+    /// Attention sort only. Either way the row renders with a leading `*`
+    /// marker plus bold and underline wherever the pin applies. Snoozing a
+    /// favorite suspends the pin until it wakes.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.
@@ -1434,10 +1437,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         if let Some(session_name) = current_session {
             instances
                 .iter()
-                .find(|i| {
-                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
-                    tmux_name == session_name
-                })
+                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1496,10 +1496,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         if let Some(session_name) = current_session {
             instances
                 .iter()
-                .find(|i| {
-                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
-                    tmux_name == session_name
-                })
+                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1585,10 +1582,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         if let Some(session_name) = current_session {
             instances
                 .iter()
-                .find(|i| {
-                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
-                    tmux_name == session_name
-                })
+                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1752,10 +1746,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         if let Some(session_name) = current_session {
             instances
                 .iter()
-                .find(|i| {
-                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
-                    tmux_name == session_name
-                })
+                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1854,10 +1845,10 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
     for profile_name in &profiles {
         if let Ok(storage) = Storage::open_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
-                if let Some(inst) = instances.iter().find(|i| {
-                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
-                    tmux_name == session_name
-                }) {
+                if let Some(inst) = instances
+                    .iter()
+                    .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
+                {
                     if args.json {
                         #[derive(Serialize)]
                         struct CurrentInfo {
