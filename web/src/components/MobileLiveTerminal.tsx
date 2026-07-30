@@ -8,6 +8,7 @@ import { encodePrintable, hasAnyModifier, type Modifiers } from "../lib/modifier
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
+import { useDisableMouseForwarding } from "../lib/disableMouseForwarding";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -635,10 +636,18 @@ export function MobileLiveTerminal({
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
   const forwardModeRef = useRef(forwardMode);
   const mouseSgrRef = useRef(mouseSgr);
+  // Pointer forwarding (clicks/drags to the app) is gated separately from the
+  // wheel so "Disable mouse forwarding" can let drags select text while the
+  // wheel still scrolls a mouse-grabbing TUI. forwardMode keeps driving layout
+  // (overflow, spacer) so an alt-screen app stays pinned to its live edge.
+  const disableMouseForwarding = useDisableMouseForwarding();
+  const forwardPointer = forwardMode && !disableMouseForwarding;
+  const forwardPointerRef = useRef(forwardPointer);
   useEffect(() => {
     forwardModeRef.current = forwardMode;
     mouseSgrRef.current = mouseSgr;
-  }, [forwardMode, mouseSgr]);
+    forwardPointerRef.current = forwardPointer;
+  }, [forwardMode, mouseSgr, forwardPointer]);
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
@@ -946,7 +955,7 @@ export function MobileLiveTerminal({
   // the user can still select page text. Coordinates come from `pointerCell`.
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
-      if (e.pointerType !== "mouse" || !forwardModeRef.current || e.shiftKey) return;
+      if (e.pointerType !== "mouse" || !forwardPointerRef.current || e.shiftKey) return;
       const base = e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 0 ? 0 : -1;
       if (base < 0) return;
       e.preventDefault();
@@ -1471,7 +1480,7 @@ export function MobileLiveTerminal({
         // A forwarded right-click is the app's to handle; don't pop the
         // browser context menu over it.
         onContextMenu={(e) => {
-          if (forwardModeRef.current) e.preventDefault();
+          if (forwardPointerRef.current) e.preventDefault();
         }}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}

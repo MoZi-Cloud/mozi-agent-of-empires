@@ -1685,6 +1685,15 @@ pub struct WebConfig {
     #[serde(default)]
     #[setting(skip)]
     pub mobile_quick_buttons: Vec<MobileQuickButton>,
+
+    /// When on, the web terminal does not forward mouse clicks/drags to the
+    /// running app, even one that enabled mouse reporting (Claude Code's TUI
+    /// does). Plain mouse drags then select text and pop the floating Copy
+    /// button, as they do in a shell; the mouse wheel still scrolls the app.
+    /// Trade-off: you can no longer click inside such a TUI, use the keyboard.
+    #[serde(default)]
+    #[setting(label = "Disable mouse forwarding", widget = "toggle", global_only)]
+    pub disable_mouse_forwarding: bool,
 }
 
 impl Default for WebConfig {
@@ -1697,6 +1706,7 @@ impl Default for WebConfig {
             notify_on_wake_fire: true,
             mobile_quick_button_count: 4,
             mobile_quick_buttons: Vec::new(),
+            disable_mouse_forwarding: false,
         }
     }
 }

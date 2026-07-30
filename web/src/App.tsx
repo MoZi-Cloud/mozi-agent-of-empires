@@ -79,6 +79,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } 
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { MobileQuickButtonCountContext, parseMobileQuickButtonCount } from "./lib/mobileQuickButtons";
+import { DisableMouseForwardingContext, parseDisableMouseForwarding } from "./lib/disableMouseForwarding";
 import { toastBus, reportError } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -157,12 +158,14 @@ export default function App() {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
   const [mobileQuickButtonCount, setMobileQuickButtonCount] = useState(0);
+  const [disableMouseForwarding, setDisableMouseForwarding] = useState(false);
 
   const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
     setMobileQuickButtonCount(parseMobileQuickButtonCount(settings));
+    setDisableMouseForwarding(parseDisableMouseForwarding(settings));
   }, []);
 
   const refreshAppSettings = useCallback(async () => {
@@ -239,17 +242,19 @@ export default function App() {
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
           <MobileQuickButtonCountContext.Provider value={mobileQuickButtonCount}>
-            {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+            <DisableMouseForwardingContext.Provider value={disableMouseForwarding}>
+              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
                 the plugin UI snapshot (usePluginPanes), so the provider can't live
                 inside its own return. */}
-            <PluginUiProvider>
-              <AppContent
-                loginRequired={loginRequired}
-                onLogout={handleLogout}
-                onSettingsRefresh={refreshAppSettings}
-              />
-            </PluginUiProvider>
-            <ElevationPrompt />
+              <PluginUiProvider>
+                <AppContent
+                  loginRequired={loginRequired}
+                  onLogout={handleLogout}
+                  onSettingsRefresh={refreshAppSettings}
+                />
+              </PluginUiProvider>
+              <ElevationPrompt />
+            </DisableMouseForwardingContext.Provider>
           </MobileQuickButtonCountContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>

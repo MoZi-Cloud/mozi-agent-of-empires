@@ -293,6 +293,10 @@ export const fields: Record<string, ZhFieldEntry | undefined> = {
     label: "手机快捷按钮数",
     desc: "终端工具栏显示的自定义快捷按钮数量（触屏工具栏每行 8 个，桌面工具栏每行 16 个，最多 28 个）。默认 4，因此开箱即有 text1 到 text4 四个占位按钮；长按某个按钮可编辑其标题、要发送的文本（≤2 万字符）以及是否在发送后自动加回车；按钮内容随服务器配置跨设备同步。",
   },
+  "web.disable_mouse_forwarding": {
+    label: "禁用鼠标转发",
+    desc: "开启后，终端不再把鼠标点击/拖拽转发给正在运行的程序，即使该程序开启了鼠标上报（例如 Claude Code 的 TUI）。这样普通鼠标拖拽就会选中文本并弹出 Copy 悬浮按钮，和在 shell 里一样；鼠标滚轮仍会滚动程序界面。代价：无法再用鼠标点击该 TUI 内部，需改用键盘。",
+  },
 
   // ===== auth =====
   "auth.persist_sessions": {
