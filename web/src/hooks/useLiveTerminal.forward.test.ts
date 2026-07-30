@@ -111,4 +111,36 @@ describe("useLiveTerminal forwardWheel", () => {
     expect(result.current.state.frame?.mouse).toBe(true);
     expect(result.current.state.frame?.mouseSgr).toBe(false);
   });
+
+  it("delivers every clipboard event even when the copied text repeats", () => {
+    const onClipboard = vi.fn();
+    renderHook(() => useLiveTerminal("s", "live-ws", onClipboard));
+    const ws = FakeWS.last!;
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ type: "clipboard", text: "same text" }) });
+    });
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ type: "clipboard", text: "same text" }) });
+    });
+    expect(onClipboard).toHaveBeenNthCalledWith(1, "same text");
+    expect(onClipboard).toHaveBeenNthCalledWith(2, "same text");
+  });
+
+  it("uses the latest clipboard callback without reconnecting", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { rerender } = renderHook(({ onClipboard }) => useLiveTerminal("s", "live-ws", onClipboard), {
+      initialProps: { onClipboard: first },
+    });
+    const ws = FakeWS.last!;
+
+    rerender({ onClipboard: second });
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ type: "clipboard", text: "updated callback" }) });
+    });
+
+    expect(FakeWS.last).toBe(ws);
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith("updated callback");
+  });
 });

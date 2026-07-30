@@ -1371,6 +1371,11 @@ impl HomeView {
         // the dedicated bottom-pinned "Archived" section regardless of
         // sort mode.
         let in_attention = self.sort_order == SortOrder::Attention;
+        // Favorite is a pin in every sort order once favorites-first is on, so
+        // its decoration follows the same predicate as the keybinding
+        // (`Context::FavoritesUsable`). Snooze and urgent stay Attention-only:
+        // both are tied to the tier model, which only exists there.
+        let show_favorite = in_attention || crate::session::favorites_first();
 
         use std::borrow::Cow;
 
@@ -1562,26 +1567,26 @@ impl HomeView {
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if in_attention && inst.is_favorited() {
-                                // Favorite decoration is Attention-only,
-                                // since favorites are within-tier pins.
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
                             // Prefix priority: archive (no prefix) wins
                             // over snooze (`z `) wins over urgent (`! `)
-                            // wins over favorite (`* `). All three
-                            // prefixes are Attention-mode-only so users
-                            // in Newest / AZ / etc. don't see decoration
-                            // for state they didn't opt into managing.
+                            // wins over favorite (`* `). Snooze and urgent
+                            // are Attention-mode-only so users in Newest /
+                            // AZ / etc. don't see decoration for state they
+                            // didn't opt into managing; the favorite star
+                            // also shows elsewhere, because favorites-first
+                            // pins the row there too.
                             let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
                             } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())
@@ -1634,7 +1639,7 @@ impl HomeView {
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
@@ -1645,7 +1650,7 @@ impl HomeView {
                                 Cow::Owned(format!("z {}", inst.title))
                             } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if in_attention && inst.is_favorited() {
+                            } else if show_favorite && crate::session::is_live_favorite(inst) {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())
@@ -1662,8 +1667,17 @@ impl HomeView {
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let style = Style::default().fg(color);
-                            (icon, Cow::Owned(inst.title.clone()), style)
+                            let mut style = Style::default().fg(color);
+                            let title_text =
+                                if show_favorite && crate::session::is_live_favorite(inst) {
+                                    style = style
+                                        .add_modifier(ratatui::style::Modifier::BOLD)
+                                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
+                                    Cow::Owned(format!("* {}", inst.title))
+                                } else {
+                                    Cow::Owned(inst.title.clone())
+                                };
+                            (icon, title_text, style)
                         }
                     }
                 } else {
@@ -1937,7 +1951,7 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Structured => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Structured => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
@@ -1946,10 +1960,10 @@ impl HomeView {
                 };
                 match mode {
                     TerminalMode::Host => {
-                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                     TerminalMode::Container => {
-                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                 }
             }
@@ -2152,13 +2166,25 @@ impl HomeView {
                             .and_then(|inst| inst.tmux_session().ok())
                             .filter(|s| s.exists())
                         {
-                            // Defer to an active size owner (a phone/desktop live
-                            // client, or this TUI's own live-send below). The
-                            // detached preview is a passive display, so it only
-                            // sizes a session nobody else is driving and never
-                            // claims the lock itself; leaving the dedup unset
-                            // retries once the owner disconnects.
-                            if !session.has_active_size_owner() {
+                            // Defer to anything actually driving this session's
+                            // size: a real tmux client (this TUI's own
+                            // `switch-client` attach registers no size owner, so
+                            // without the `is_attached` check the passive resize
+                            // shrank the window the user just attached to back to
+                            // the preview dimensions, #3071), or an active size
+                            // owner (a phone/desktop live client, or this TUI's
+                            // own live-send below). The detached preview is a
+                            // passive display, so it only sizes a session nobody
+                            // else is driving and never claims the lock itself;
+                            // leaving the dedup unset retries once the client
+                            // detaches or the owner disconnects.
+                            //
+                            // `is_attached` is checked first: it is one tmux call
+                            // against `has_active_size_owner`'s two, and being
+                            // attached is the sticky state here (the skip leaves
+                            // the pending slot armed, so this block re-runs every
+                            // poll for as long as the user stays attached).
+                            if !session.is_attached() && !session.has_active_size_owner() {
                                 session.resize_window(width, height);
                                 self.preview_pane_synced = Some(want);
                                 self.preview_pane_pending = None;
@@ -2210,9 +2236,16 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
+                // Composited in BOTH modes, matching what the worker publishes.
+                // This fallback also runs on every idle refresh (the worker
+                // dedups unchanged frames, so it has nothing to hand over), so a
+                // pane-0-only capture here would clobber the worker's composite
+                // a beat after each keystroke and leave the split visible for
+                // only one frame at a time. On an unsplit window this returns
+                // the pane bytes verbatim, so nothing changes there.
                 let fork_capture = s
                     .get_instance(id)
-                    .and_then(|inst| inst.capture_output(capture_lines).ok());
+                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2247,7 +2280,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2276,7 +2309,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.container_terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2310,7 +2343,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
-                        .capture_pane(capture_lines)
+                        .capture_window_composited(capture_lines)
                         .unwrap_or_default()
                 })
             },
@@ -3756,11 +3789,11 @@ impl HomeView {
                 mk(if strict { "D" } else { "d" }, "Del"),
             ));
         }
-        // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
-        // when the user is in Attention sort. They are only useful for
-        // shaping the Attention queue; in Newest / Created / Last Accessed
-        // they just take footer space without changing what the user sees.
-        if self.sort_order == SortOrder::Attention {
+        // Archive / Snooze only render in Attention sort: they shape the
+        // Attention queue and do nothing visible in Newest / Created / Last
+        // Accessed, so they would just take footer space there.
+        let in_attention = self.sort_order == SortOrder::Attention;
+        if in_attention {
             if !self.flat_items.is_empty() {
                 groups.push((
                     1,
@@ -3771,15 +3804,20 @@ impl HomeView {
             if self.selected_session.is_some() {
                 groups.push((
                     1,
-                    kc(if strict { 'F' } else { 'f' }),
-                    mk(if strict { "F" } else { "f" }, "Fav"),
-                ));
-                groups.push((
-                    1,
                     kc(if strict { 'H' } else { 'h' }),
                     mk(if strict { "H" } else { "h" }, "Snooze"),
                 ));
             }
+        }
+        // Fav follows the key's own gate (`Context::FavoritesUsable`): usable in
+        // Attention, or in any sort order while `favorites_first` is on, so the
+        // footer advertises it wherever `f` actually does something.
+        if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
+            groups.push((
+                1,
+                kc(if strict { 'F' } else { 'f' }),
+                mk(if strict { "F" } else { "f" }, "Fav"),
+            ));
         }
 
         // Committed-search cue: spell out that `n` cycles matches and `Esc`
@@ -3989,6 +4027,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 

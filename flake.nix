@@ -9,7 +9,7 @@
 
   outputs = inputs @ { flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       perSystem = { config, self', inputs', pkgs, system, ... }:
         let
@@ -75,7 +75,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-jlIOP3fAnhvCS4WqEy6ev9Gt4WWUPjfnXFSgZjZLRYw=";
+            npmDepsHash = "sha256-Tnyl4vgsRY08Gi8R4SwRxNKj/oHQWFYjrh6a8oE5OOk=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

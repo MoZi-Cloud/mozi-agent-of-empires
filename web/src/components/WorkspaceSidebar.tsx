@@ -30,7 +30,9 @@ import {
   Play,
   Plus,
   RotateCcw,
+  ScrollText,
   Sparkles,
+  SquareTerminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -71,23 +73,24 @@ import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
+import { useSessionColorsEnabled } from "../lib/sessionColors";
+import { SidebarCompactContext, useSidebarCompact } from "../lib/sidebarCompact";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
   renameSession,
-  setSessionProxy,
+  setSessionColor,
   setSessionNotifications,
-  startSession,
-  stopSession,
   setWorktreeName,
   smartRenameSession,
+  summarizeSession,
   updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
-import i18n from "../i18n";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
@@ -97,6 +100,7 @@ import { useRateLimitedForSessions } from "../hooks/useAcpRateLimit";
 import {
   triageMenuShape,
   triageStateOf,
+  workspaceAttentionCount,
   workspaceIsPinned,
   workspaceIsSunk,
   workspaceIsTrashed,
@@ -129,6 +133,10 @@ const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
 const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 480;
+// Slim rail width for compact mode (#2288). Wide enough for the status glyph
+// plus a few truncated characters of a session/project name; the drag width
+// above is left untouched so toggling compact off restores it.
+const COMPACT_WIDTH = 88;
 
 /** Snooze duration presets surfaced by the sidebar context menu. Order
  *  and values mirror the TUI dialog presets at
@@ -165,6 +173,21 @@ export interface RowBulkApi {
 
 const CTX_ITEM =
   "w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2";
+
+/** MVP per-session color palette (#2383). Mirrors the Rust `SESSION_COLORS`
+ *  list; each entry maps a palette key to its display label and the Tailwind
+ *  class for its status dot. Kept small and status-oriented on purpose. */
+const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
+  { key: "red", label: "Red · needs attention", dotClass: "bg-red-500" },
+  { key: "amber", label: "Amber · working", dotClass: "bg-amber-400" },
+  { key: "green", label: "Green · done", dotClass: "bg-green-500" },
+];
+
+/** Tailwind dot class for a stored color key, or null when unset / unknown. */
+function sessionColorDotClass(color: string | null | undefined): string | null {
+  if (!color) return null;
+  return SESSION_COLOR_OPTIONS.find((o) => o.key === color)?.dotClass ?? null;
+}
 
 /** Triage actions for the right-click menu when more than one row is selected.
  *  Reuses the same eligibility buckets as the old bulk bar so a mixed
@@ -358,7 +381,7 @@ function bestSession(
       status: "Error",
       createdAt: error.created_at,
       idleEnteredAt: null,
-      dormant: error.dormant,
+      dormant: false,
     };
   const first = ws.sessions[0];
   return {
@@ -538,11 +561,11 @@ function TrashMenu({
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
 }) {
-  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const { t } = useTranslation();
 
   const positionPanel = useCallback(() => {
     const rect = ref.current?.getBoundingClientRect();
@@ -616,7 +639,7 @@ function TrashMenu({
             role="region"
             aria-label={t("sidebar:trash.label")}
             data-testid="sidebar-trash-menu"
-            className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            className="fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
             style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
           >
             <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
@@ -903,6 +926,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onSwitchView,
   onCreateSession,
   readOnly,
   indented,
@@ -924,6 +948,8 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Switch this row's session between structured view and terminal. The parent
+  // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   // Open the session wizard prefilled from this row's project (path, agent,
   // and the latest session's options), mirroring the per-project "+" button.
@@ -945,12 +971,18 @@ export const SessionRow = memo(function SessionRow({
   const { t } = useTranslation();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
-  const { status: sessionStatus, createdAt, idleEnteredAt, dormant } = bestSession(workspace, idleDecayWindowMs);
+  const sessionColorsEnabled = useSessionColorsEnabled();
+  const {
+    status: sessionStatus,
+    createdAt,
+    idleEnteredAt,
+    dormant: sessionDormant,
+  } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
       idle_entered_at: idleEnteredAt,
-      dormant,
+      dormant: sessionDormant,
     },
     idleDecayWindowMs,
   );
@@ -978,6 +1010,10 @@ export const SessionRow = memo(function SessionRow({
   // row visually so the user can find their starred work fast. Toggled
   // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
   const isFavorited = workspace.sessions.some((s) => s.favorited);
+  // Per-session color label (#2383): the first session in the workspace that
+  // carries a color wins, mirroring how `snoozedUntil` picks the first match.
+  const sessionColor = workspace.sessions.map((s) => s.color).find((c) => c != null) ?? null;
+  const sessionColorDot = sessionColorDotClass(sessionColor);
   // Web-only triage signals. `pinned` floats the workspace to the top
   // of every sort mode; `archived` and `snoozedUntil` mark the row as
   // sunk (the parent splits sunk workspaces into a separate collapsible
@@ -1006,10 +1042,24 @@ export const SessionRow = memo(function SessionRow({
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
   // and the auto-mark only ever lands on Idle anyway.
   const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
+  // Row-level attention marker, sharing the one predicate the group badge and
+  // jump-to-next use. The existing status glyph already encodes the status;
+  // this only adds emphasis and an accessible label so a Waiting/Error/urgent
+  // row is unmistakable without a second redundant dot.
+  const needsAttention = workspaceAttentionCount(workspace) > 0;
+  const attentionHint =
+    sessionStatus === "Waiting"
+      ? "waiting for your input"
+      : sessionStatus === "Error"
+        ? "needs attention (error)"
+        : "needs your attention";
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
   const isDeleting = sessionStatus === "Deleting";
+  // Compact rail: keep status glyph + color dot + truncated title, drop the
+  // prefix markers, trailing badges, and sub-rows that will not fit (#2288).
+  const compact = useSidebarCompact();
   const notifyPreset = detectNotifyPreset(
     firstSession?.notify_on_waiting,
     firstSession?.notify_on_idle,
@@ -1047,6 +1097,18 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     if (!sessionId || preset === notifyPreset) return;
     await setSessionNotifications(sessionId, preset);
+  };
+
+  // Set (or clear, with `null`) this row's color label. Fire-and-forget: the
+  // dot reflects on the next sessions poll (there is no optimistic overlay for
+  // color). A failed request surfaces a toast. See #2383.
+  const applyColor = async (color: string | null) => {
+    setContextMenu(null);
+    if (!sessionId || color === sessionColor) return;
+    const result = await setSessionColor(sessionId, color);
+    if (!result) {
+      reportError(color ? "Failed to set session color" : "Failed to clear session color");
+    }
   };
 
   // Triage actions (pin / archive / snooze). The optimistic overlay and the
@@ -1107,6 +1169,14 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Switch the row's session between structured view and terminal. The parent
+  // opens the capability-aware confirm dialog and calls acp enable/disable.
+  const handleSwitchView = () => {
+    setContextMenu(null);
+    if (!firstSession) return;
+    onSwitchView?.(firstSession.id, firstSession.view !== "structured");
+  };
+
   // Fork a structured session: create a new structured session that resumes the
   // source's ACP conversation and diverges from it. Gated on a captured
   // `acp_session_id` (the value the server forks from) AND `acp_can_fork`, so a
@@ -1126,7 +1196,7 @@ export const SessionRow = memo(function SessionRow({
     if (result.ok && result.session) {
       requestOpenSession(result.session.id);
     } else {
-      reportError(result.error ?? i18n.t("sidebar:ctx.forkFailed"));
+      reportError(result.error ?? t("sidebar:ctx.forkFailed"));
     }
   };
 
@@ -1140,7 +1210,23 @@ export const SessionRow = memo(function SessionRow({
     if (!acpSession) return;
     const result = await smartRenameSession(acpSession.id);
     if (!result.ok) {
-      reportError(result.message ?? i18n.t("sidebar:ctx.autoNameFailed"));
+      reportError(result.message ?? t("sidebar:ctx.autoNameFailed"));
+    }
+  };
+
+  // On-demand "summary of the conversation so far" for a structured session
+  // (see #2808). Best-effort and async, like Auto-name now: a 202 means the
+  // one-shot started; the summary appears as a callout in the transcript when
+  // it completes. Available for any structured session (unlike Auto-name, it
+  // does not depend on the title).
+  const handleSummarizeNow = async () => {
+    setContextMenu(null);
+    if (!acpSession) return;
+    const result = await summarizeSession(acpSession.id);
+    if (result.ok) {
+      reportInfo("Summarizing the conversation so far…");
+    } else {
+      reportError(result.message ?? "Could not start the summary. Please try again.");
     }
   };
 
@@ -1305,45 +1391,6 @@ export const SessionRow = memo(function SessionRow({
   // mid-lifecycle has nothing to stop, so hide the action for those.
   const canStop = !["Stopped", "Deleting", "Creating"].includes(sessionStatus);
 
-  // A terminal agent's environment is fixed when tmux launches it. Restrict
-  // injection to its prompt-waiting states, then restart through the normal
-  // stop/start API so the saved agent session id is resumed safely.
-  const canInjectProxy =
-    !readOnly &&
-    firstSession?.view === "terminal" &&
-    !firstSession.is_sandboxed &&
-    ["Waiting", "Idle", "Stopped"].includes(sessionStatus);
-
-  const handleInjectProxy = async () => {
-    setContextMenu(null);
-    if (!sessionId || !firstSession) return;
-    const value = window.prompt(
-      "Proxy server for this terminal session (leave blank to clear)",
-      firstSession.host_proxy ?? "",
-    );
-    if (value === null) return;
-    const updated = await setSessionProxy(sessionId, value.trim() || null);
-    if (!updated) {
-      reportError("Failed to update session proxy. The session must be waiting or stopped.");
-      return;
-    }
-    if (sessionStatus === "Stopped") {
-      reportInfo("Session proxy updated. Start the session when ready.");
-      return;
-    }
-    const stopped = await stopSession(sessionId);
-    if (!stopped) {
-      reportError("Proxy was saved, but the session could not be stopped for restart.");
-      return;
-    }
-    const started = await startSession(sessionId);
-    if (!started) {
-      reportError("Proxy was saved, but the session could not be resumed. Use Start to retry.");
-      return;
-    }
-    reportInfo("Session proxy injected and the terminal session resumed.");
-  };
-
   const handleStart = () => {
     setContextMenu(null);
     onStart?.(workspace.id);
@@ -1378,6 +1425,7 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
+        title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
         onClick={(e) => {
           // Let the browser handle non-primary clicks (middle-click still
@@ -1406,7 +1454,7 @@ export const SessionRow = memo(function SessionRow({
         onTouchCancel={clearLongPress}
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
-          indented ? "pl-6 pr-3" : "px-3"
+          compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
         } ${
           isActive
             ? "bg-surface-850 border-l-2 border-brand-600"
@@ -1418,7 +1466,11 @@ export const SessionRow = memo(function SessionRow({
         {isSelected && <span className="sr-only">{t("sidebar:badge.selected")}</span>}
         <div className="flex items-center gap-2">
           <span
-            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
+            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass} ${
+              needsAttention && !showUnreadGlyph ? "motion-safe:animate-pulse font-semibold" : ""
+            }`}
+            data-attention={needsAttention && !showUnreadGlyph ? "true" : undefined}
+            aria-label={needsAttention && !showUnreadGlyph ? `${sessionStatus} · ${attentionHint}` : undefined}
           >
             {showUnreadGlyph ? (
               <span
@@ -1429,14 +1481,28 @@ export const SessionRow = memo(function SessionRow({
                 ●
               </span>
             ) : (
-              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+              <StatusGlyph
+                status={sessionStatus}
+                createdAt={createdAt}
+                idleEnteredAt={idleEnteredAt}
+                dormant={sessionDormant}
+              />
             )}
           </span>
           <div className="min-w-0 flex-1">
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
-              {effectivePinned && (
+              {sessionColorsEnabled && sessionColorDot && (
+                <span
+                  title={`Color: ${sessionColor}`}
+                  aria-label={`Color: ${sessionColor}`}
+                  data-testid="sidebar-session-color-dot"
+                  data-color={sessionColor ?? undefined}
+                  className={`shrink-0 inline-block h-2 w-2 rounded-full ${sessionColorDot}`}
+                />
+              )}
+              {!compact && effectivePinned && (
                 <span
                   title={t("sidebar:badge.pinned")}
                   aria-label={t("sidebar:badge.pinned")}
@@ -1445,7 +1511,7 @@ export const SessionRow = memo(function SessionRow({
                   <Pin className="h-3 w-3 -rotate-45" />
                 </span>
               )}
-              {isFavorited && (
+              {!compact && isFavorited && (
                 <span
                   title={t("sidebar:badge.favorited")}
                   aria-label={t("sidebar:badge.favorited")}
@@ -1457,136 +1523,148 @@ export const SessionRow = memo(function SessionRow({
               <span className="truncate" title={label}>
                 {label}
               </span>
-              {rowTag && (
-                <span
-                  data-testid="sidebar-session-row-tag"
-                  title={rowTagTitle}
-                  className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
-                    rowTag.kind === "branch"
-                      ? "border-brand-700/40 bg-brand-700/5 text-brand-300"
-                      : "border-surface-700/40 bg-surface-800/40 text-text-dim"
-                  }`}
-                >
-                  [{rowTag.content}]
-                </span>
+              {/* Trailing badges hidden in the compact rail (#2288). */}
+              {!compact && (
+                <>
+                  {rowTag && (
+                    <span
+                      data-testid="sidebar-session-row-tag"
+                      title={rowTagTitle}
+                      className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
+                        rowTag.kind === "branch"
+                          ? "border-brand-700/40 bg-brand-700/5 text-brand-300"
+                          : "border-surface-700/40 bg-surface-800/40 text-text-dim"
+                      }`}
+                    >
+                      [{rowTag.content}]
+                    </span>
+                  )}
+                  {hasDraft && (
+                    <span
+                      title={t("sidebar:badge.unsentDraft")}
+                      aria-label={t("sidebar:badge.unsentDraft")}
+                      className="inline-flex shrink-0"
+                    >
+                      <Pencil className="h-3 w-3 text-amber-400/90" />
+                    </span>
+                  )}
+                  {queuedCount > 0 && (
+                    <span
+                      title={
+                        queuedCount === 1
+                          ? t("sidebar:badge.queuedPromptOne", { count: queuedCount })
+                          : t("sidebar:badge.queuedPromptOther", { count: queuedCount })
+                      }
+                      aria-label={t("sidebar:badge.queuedAria", { count: queuedCount })}
+                      className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
+                    >
+                      {queuedCount}
+                    </span>
+                  )}
+                  {rateLimited && (
+                    <span
+                      title={rateLimitTitle}
+                      aria-label={rateLimitTitle}
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-700/40 bg-orange-950/30 px-1 text-[10px] font-mono font-medium text-orange-300"
+                    >
+                      <Hourglass className="h-3 w-3" />
+                      {rateLimited.count > 1 && <span className="tabular-nums">{rateLimited.count}</span>}
+                      {rateLimitResetLabel && <span>{rateLimitResetLabel}</span>}
+                    </span>
+                  )}
+                  {effectiveArchived && (
+                    <span
+                      title={t("sidebar:badge.archived")}
+                      aria-label={t("sidebar:badge.archived")}
+                      className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                    >
+                      <Archive className="h-3 w-3" />
+                      <span className="hidden sm:inline">{t("sidebar:badge.archivedShort")}</span>
+                    </span>
+                  )}
+                  {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
+                    <span
+                      title={t("sidebar:badge.snoozedTitle", {
+                        when: new Date(effectiveSnoozedUntil).toLocaleString(),
+                      })}
+                      aria-label={t("sidebar:badge.snoozedAria")}
+                      className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                    >
+                      <Moon className="h-3 w-3" />
+                      <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
+                    </span>
+                  )}
+                  {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
+                    <span
+                      title={t("sidebar:badge.resumingTitle")}
+                      aria-label={t("sidebar:badge.resuming")}
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                    >
+                      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                      {t("sidebar:badge.resuming")}
+                    </span>
+                  )}
+                  {firstSession?.smart_rename === "pending" && (
+                    <span
+                      title={t("sidebar:badge.autoNameTitle")}
+                      aria-label={t("sidebar:badge.autoNameAria")}
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                    >
+                      <Sparkles className="h-3 w-3" />
+                      <span className="hidden sm:inline">{t("sidebar:badge.autoName")}</span>
+                    </span>
+                  )}
+                  {firstSession?.smart_rename === "running" && (
+                    <span
+                      title={t("sidebar:badge.namingTitle")}
+                      aria-label={t("sidebar:badge.namingAria")}
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                    >
+                      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                      {t("sidebar:badge.naming")}
+                    </span>
+                  )}
+                  {firstSession?.next_wakeup_at && (
+                    <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
+                  )}
+                  {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
+                </>
               )}
-              {hasDraft && (
-                <span
-                  title={t("sidebar:badge.unsentDraft")}
-                  aria-label={t("sidebar:badge.unsentDraft")}
-                  className="inline-flex shrink-0"
-                >
-                  <Pencil className="h-3 w-3 text-amber-400/90" />
-                </span>
-              )}
-              {queuedCount > 0 && (
-                <span
-                  title={
-                    queuedCount === 1
-                      ? t("sidebar:badge.queuedPromptOne", { count: queuedCount })
-                      : t("sidebar:badge.queuedPromptOther", { count: queuedCount })
-                  }
-                  aria-label={t("sidebar:badge.queuedAria", { count: queuedCount })}
-                  className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
-                >
-                  {queuedCount}
-                </span>
-              )}
-              {rateLimited && (
-                <span
-                  title={rateLimitTitle}
-                  aria-label={rateLimitTitle}
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-700/40 bg-orange-950/30 px-1 text-[10px] font-mono font-medium text-orange-300"
-                >
-                  <Hourglass className="h-3 w-3" />
-                  {rateLimited.count > 1 && <span className="tabular-nums">{rateLimited.count}</span>}
-                  {rateLimitResetLabel && <span>{rateLimitResetLabel}</span>}
-                </span>
-              )}
-              {effectiveArchived && (
-                <span
-                  title={t("sidebar:badge.archived")}
-                  aria-label={t("sidebar:badge.archived")}
-                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
-                >
-                  <Archive className="h-3 w-3" />
-                  <span className="hidden sm:inline">{t("sidebar:badge.archivedShort")}</span>
-                </span>
-              )}
-              {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
-                <span
-                  title={t("sidebar:badge.snoozedTitle", {
-                    when: new Date(effectiveSnoozedUntil).toLocaleString(),
-                  })}
-                  aria-label={t("sidebar:badge.snoozedAria")}
-                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
-                >
-                  <Moon className="h-3 w-3" />
-                  <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
-                </span>
-              )}
-              {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
-                <span
-                  title={t("sidebar:badge.resumingTitle")}
-                  aria-label={t("sidebar:badge.resuming")}
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
-                >
-                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
-                  {t("sidebar:badge.resuming")}
-                </span>
-              )}
-              {firstSession?.smart_rename === "pending" && (
-                <span
-                  title={t("sidebar:badge.autoNameTitle")}
-                  aria-label={t("sidebar:badge.autoNameAria")}
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
-                >
-                  <Sparkles className="h-3 w-3" />
-                  <span className="hidden sm:inline">{t("sidebar:badge.autoName")}</span>
-                </span>
-              )}
-              {firstSession?.smart_rename === "running" && (
-                <span
-                  title={t("sidebar:badge.namingTitle")}
-                  aria-label={t("sidebar:badge.namingAria")}
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
-                >
-                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
-                  {t("sidebar:badge.naming")}
-                </span>
-              )}
-              {firstSession?.next_wakeup_at && (
-                <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
-              )}
-              {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
-            {firstSession && <PluginRowLine sessionId={firstSession.id} />}
-            {firstSession?.plan_summary &&
-              firstSession.plan_summary.total > 0 &&
-              // Hide the completed-plan bar when the session is also
-              // sitting idle waiting for the next prompt: at that
-              // point the bar is a static "100% 5/5" line that adds
-              // clutter without conveying anything actionable. The
-              // bar reappears on the next prompt because the agent
-              // either emits a new plan (resetting completed) or
-              // stays on the old one but flips status back to Running.
-              !(
-                firstSession.plan_summary.completed >= firstSession.plan_summary.total && firstSession.status === "Idle"
-              ) && <PlanProgressMini summary={firstSession.plan_summary} />}
-            {firstSession && (firstSession.workspace_repos?.length ?? 0) > 1 && (
-              <span
-                className="mt-0.5 flex flex-wrap gap-1 text-[10px] font-mono text-text-dim"
-                title={firstSession.workspace_repos.map((r) => r.source_path).join("\n")}
-              >
-                {firstSession.workspace_repos.map((r) => (
+            {/* Sub-rows (plugin line, plan progress, multi-repo chips) add
+                height/clutter that does not belong in the slim rail (#2288). */}
+            {!compact && (
+              <>
+                {firstSession && <PluginRowLine sessionId={firstSession.id} />}
+                {firstSession?.plan_summary &&
+                  firstSession.plan_summary.total > 0 &&
+                  // Hide the completed-plan bar when the session is also
+                  // sitting idle waiting for the next prompt: at that
+                  // point the bar is a static "100% 5/5" line that adds
+                  // clutter without conveying anything actionable. The
+                  // bar reappears on the next prompt because the agent
+                  // either emits a new plan (resetting completed) or
+                  // stays on the old one but flips status back to Running.
+                  !(
+                    firstSession.plan_summary.completed >= firstSession.plan_summary.total &&
+                    firstSession.status === "Idle"
+                  ) && <PlanProgressMini summary={firstSession.plan_summary} />}
+                {firstSession && (firstSession.workspace_repos?.length ?? 0) > 1 && (
                   <span
-                    key={r.source_path}
-                    className="px-1 py-px bg-surface-800/50 border border-surface-700/40 rounded text-text-secondary"
+                    className="mt-0.5 flex flex-wrap gap-1 text-[10px] font-mono text-text-dim"
+                    title={firstSession.workspace_repos.map((r) => r.source_path).join("\n")}
                   >
-                    {r.name}
+                    {firstSession.workspace_repos.map((r) => (
+                      <span
+                        key={r.source_path}
+                        className="px-1 py-px bg-surface-800/50 border border-surface-700/40 rounded text-text-secondary"
+                      >
+                        {r.name}
+                      </span>
+                    ))}
                   </span>
-                ))}
-              </span>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -1600,7 +1678,7 @@ export const SessionRow = memo(function SessionRow({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {contextMenu.scope.kind === "bulk" ? (
@@ -1650,6 +1728,16 @@ export const SessionRow = memo(function SessionRow({
                     {t("sidebar:ctx.editGroup")}
                   </button>
                 )}
+                {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
+                  <button
+                    onClick={handleSwitchView}
+                    data-testid="sidebar-context-menu-switch-view"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
+                    {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+                  </button>
+                )}
                 {!readOnly && acpSession && (
                   <button
                     onClick={handleSwitchAgent}
@@ -1680,6 +1768,16 @@ export const SessionRow = memo(function SessionRow({
                     {t("sidebar:ctx.autoNameNow")}
                   </button>
                 )}
+                {!readOnly && acpSession && (
+                  <button
+                    onClick={() => void handleSummarizeNow()}
+                    data-testid="sidebar-context-menu-summarize"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <ScrollText className="h-3.5 w-3.5 shrink-0" />
+                    Summarize conversation
+                  </button>
+                )}
                 {!readOnly && canStop && (
                   <button
                     onClick={handleStop}
@@ -1688,16 +1786,6 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <CircleStop className="h-3.5 w-3.5 shrink-0" />
                     {t("sidebar:ctx.stop")}
-                  </button>
-                )}
-                {canInjectProxy && (
-                  <button
-                    onClick={() => void handleInjectProxy()}
-                    data-testid="sidebar-context-menu-inject-proxy"
-                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5 shrink-0" />
-                    Inject proxy
                   </button>
                 )}
                 {!readOnly && canStart && (
@@ -1735,6 +1823,41 @@ export const SessionRow = memo(function SessionRow({
                     </button>
                   );
                 })}
+                {!readOnly && sessionColorsEnabled && (
+                  <>
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Color
+                    </div>
+                    {SESSION_COLOR_OPTIONS.map((opt) => {
+                      const selected = sessionColor === opt.key;
+                      return (
+                        <button
+                          key={opt.key}
+                          onClick={() => void applyColor(opt.key)}
+                          data-testid={`sidebar-context-menu-color-${opt.key}`}
+                          className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
+                            selected ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${opt.dotClass}`} />
+                          {opt.label}
+                          {selected && <span className="ml-auto text-brand-500">✓</span>}
+                        </button>
+                      );
+                    })}
+                    {sessionColor && (
+                      <button
+                        onClick={() => void applyColor(null)}
+                        data-testid="sidebar-context-menu-color-clear"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full border border-surface-600" />
+                        Clear color
+                      </button>
+                    )}
+                  </>
+                )}
                 {!readOnly && (
                   <>
                     <div className="border-t border-surface-700/20 my-1" />
@@ -2295,6 +2418,12 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // workspaceIsSunk). Summing raw sessions inflated the badge above the
   // visible row count. See #2372.
   const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
+  // Compact rail: keep dot + icon + truncated name + attention badge; drop the
+  // session count and the New-session button that will not fit (#2288).
+  const compact = useSidebarCompact();
+  // Aggregate signal: how many sessions under this group need the user. Shown
+  // even when collapsed, which is exactly when the per-row glyphs are hidden.
+  const attentionCount = group.workspaces.reduce((n, v) => n + workspaceAttentionCount(v.workspace), 0);
 
   // The whole header row is the drag activator now (no grip handle), so a
   // drag ends with the pointer over one of the row's controls. Suppress the
@@ -2411,7 +2540,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
         }
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
         onClickCapture={suppressClickAfterDrag}
-        className={`group flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
         style={headerStyle}
@@ -2475,31 +2604,50 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
-          <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
-            ({sessionCount})
-          </span>
-        </button>
-        <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
-          <button
-            onClick={onNewSession}
-            disabled={offline}
-            className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-            aria-label={`New session in ${group.displayName}`}
-          >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
+          {attentionCount > 0 && (
+            <Tooltip
+              text={`${attentionCount} session${attentionCount === 1 ? "" : "s"} need${
+                attentionCount === 1 ? "s" : ""
+              } attention`}
             >
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-          </button>
-        </Tooltip>
+              <span
+                className="shrink-0 min-w-[1.25rem] rounded-full bg-status-error px-1.5 text-[11px] font-semibold leading-[1.25rem] tabular-nums text-white text-center"
+                data-testid="sidebar-group-attention-badge"
+                aria-label={`${attentionCount} needing attention`}
+              >
+                {attentionCount}
+              </span>
+            </Tooltip>
+          )}
+          {!compact && (
+            <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
+              ({sessionCount})
+            </span>
+          )}
+        </button>
+        {!compact && (
+          <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+            <button
+              onClick={onNewSession}
+              disabled={offline}
+              className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
+              aria-label={`New session in ${group.displayName}`}
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+              >
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
+          </Tooltip>
+        )}
       </div>
       {hasMenu &&
         contextMenu &&
@@ -2511,7 +2659,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {canPin && (
@@ -2676,11 +2824,20 @@ export function WorkspaceSidebar({
   axis,
   onAxisChange,
 }: Props) {
+  // Which mobile edge the drawer slides in from (client-local, #2244). Only
+  // affects the `fixed` mobile drawer; on desktop the sidebar is `md:static`
+  // and always sits to the left of the content.
+  const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const { t } = useTranslation();
   // Axis labels/aria are translated; map the 3 axes to catalog keys.
   const axisTipKey =
     axis === "repo" ? "axisTooltipRepo" : axis === "group" ? "axisTooltipGroup" : "axisTooltipRepoGroup";
   const axisAriaKey = axis === "repo" ? "axisAriaRepo" : axis === "group" ? "axisAriaGroup" : "axisAriaRepoGroup";
+  const rightSide = webSettings.sidebarSide === "right";
+  // Compact (slim) rail (#2288). Overrides the drag width with a fixed narrow
+  // rail and drops trailing badges via SidebarCompactContext; the saved drag
+  // width is left untouched so toggling off restores it.
+  const compact = webSettings.sidebarCompact;
   // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
   // control and the sort-picker options stay local to the sidebar; the active
   // plugin sort comparator itself is built and threaded by AppContent.
@@ -2736,15 +2893,26 @@ export function WorkspaceSidebar({
   useSuppressClickAfterDrag(dragSuppressRef);
   const offline = useServerDown();
   const [width, setWidth] = useState(loadSavedWidth);
+  // Rendered column width: the fixed rail when compact, otherwise the drag
+  // width. `width` state keeps the last drag value regardless.
+  const effectiveWidth = compact ? COMPACT_WIDTH : width;
   // Publish the live width so the TopBar's left zone can size itself to match
   // the column, extending the sidebar's right border up through the header.
   // Updates on every drag frame (cheap: a CSS var write, no React re-render).
   useEffect(() => {
-    document.documentElement.style.setProperty("--aoe-sidebar-width", `${width}px`);
-  }, [width]);
+    document.documentElement.style.setProperty("--aoe-sidebar-width", `${effectiveWidth}px`);
+  }, [effectiveWidth]);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
   const [facetOpen, setFacetOpen] = useState(false);
+  // Compact hides the filter and facet buttons, so neither panel may show in
+  // the rail (they are sized for the full column and would overflow), and a
+  // query typed before the toggle must stop narrowing the list, since there is
+  // no longer a control to clear it. Both are derived rather than reset on
+  // toggle, so leaving compact restores the filter exactly as the user left it.
+  const filterPanelOpen = filterOpen && !compact;
+  const facetPanelOpen = facetOpen && !compact;
+  const activeFilterQuery = compact ? "" : filterQuery;
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
   const toggleSunkExpanded = useCallback(() => {
     setSunkExpanded((prev) => {
@@ -2852,7 +3020,7 @@ export function WorkspaceSidebar({
   // truth. Triage always targets the workspace's primary session.
   const triage = useSidebarTriage(allWorkspaces);
 
-  const q = filterQuery.trim().toLowerCase();
+  const q = activeFilterQuery.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
 
@@ -3172,7 +3340,7 @@ export function WorkspaceSidebar({
   }, []);
 
   return (
-    <>
+    <SidebarCompactContext.Provider value={compact}>
       <div
         className={`fixed top-12 inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
           open ? "bg-black/50" : "opacity-0 pointer-events-none"
@@ -3181,66 +3349,121 @@ export function WorkspaceSidebar({
       />
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
-        style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
-          open ? "translate-x-0" : "-translate-x-full md:hidden"
-        }`}
+        style={{ width: effectiveWidth }}
+        data-compact={compact ? "true" : undefined}
+        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+          rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
+        } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
-        <div className="px-3 pt-3 pb-1 flex items-center">
-          <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
-            {axis === "group" ? t("sidebar:header.axisGroup") : t("sidebar:header.axisRepo")}
-          </span>
-          <Tooltip text={t(`sidebar:header.${axisTipKey}`)}>
-            <button
-              onClick={() => onAxisChange(NEXT_AXIS[axis])}
-              aria-pressed={axis !== "repo"}
-              aria-label={
-                axis === "repo"
-                  ? t(`sidebar:header.${axisAriaKey}`)
-                  : `${t(`sidebar:header.${axisAriaKey}`)}${t("sidebar:header.axisPressedSuffix")}`
-              }
-              data-testid="sidebar-axis-toggle"
-              data-axis={axis}
-              className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                axis !== "repo" ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
-              }`}
-            >
-              <Layers className="h-3.5 w-3.5" />
-            </button>
-          </Tooltip>
-          <SidebarSortPicker
-            sortMode={sortMode}
-            onSortModeChange={onSortModeChange}
-            pluginSorts={pluginSorts}
-            pluginSortRef={pluginSortRef}
-            onPluginSortChange={onPluginSortChange}
-          />
-          {facetSpecs.length > 0 && (
-            <Tooltip text={t("sidebar:header.pluginFacets")}>
-              <button
-                onClick={() => setFacetOpen((o) => !o)}
-                aria-haspopup="true"
-                aria-expanded={facetOpen}
-                aria-label={t("sidebar:header.pluginFacetFilters")}
-                data-testid="sidebar-facet-toggle"
-                className={`relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                  activeFacets.length > 0 || facetOpen ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
-                }`}
-              >
-                <ListFilter className="h-3.5 w-3.5" />
-                {activeFacets.length > 0 && (
-                  <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-brand-500" aria-hidden />
-                )}
-              </button>
-            </Tooltip>
+        <div className={`${compact ? "px-1" : "px-3"} pt-3 pb-1 flex items-center`}>
+          {!compact && (
+            <>
+              <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
+                {axis === "group" ? t("sidebar:header.axisGroup") : t("sidebar:header.axisRepo")}
+              </span>
+              <Tooltip text={t(`sidebar:header.${axisTipKey}`)}>
+                <button
+                  onClick={() => onAxisChange(NEXT_AXIS[axis])}
+                  aria-pressed={axis !== "repo"}
+                  aria-label={
+                    axis === "repo"
+                      ? t(`sidebar:header.${axisAriaKey}`)
+                      : `${t(`sidebar:header.${axisAriaKey}`)}${t("sidebar:header.axisPressedSuffix")}`
+                  }
+                  data-testid="sidebar-axis-toggle"
+                  data-axis={axis}
+                  className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                    axis !== "repo" ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
+                  }`}
+                >
+                  <Layers className="h-3.5 w-3.5" />
+                </button>
+              </Tooltip>
+              <SidebarSortPicker
+                sortMode={sortMode}
+                onSortModeChange={onSortModeChange}
+                pluginSorts={pluginSorts}
+                pluginSortRef={pluginSortRef}
+                onPluginSortChange={onPluginSortChange}
+              />
+              {facetSpecs.length > 0 && (
+                <Tooltip text={t("sidebar:header.pluginFacets")}>
+                  <button
+                    onClick={() => setFacetOpen((o) => !o)}
+                    aria-haspopup="true"
+                    aria-expanded={facetOpen}
+                    aria-label={t("sidebar:header.pluginFacetFilters")}
+                    data-testid="sidebar-facet-toggle"
+                    className={`relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                      activeFacets.length > 0 || facetOpen
+                        ? "text-brand-500"
+                        : "text-text-dim hover:text-text-secondary"
+                    }`}
+                  >
+                    <ListFilter className="h-3.5 w-3.5" />
+                    {activeFacets.length > 0 && (
+                      <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-brand-500" aria-hidden />
+                    )}
+                  </button>
+                </Tooltip>
+              )}
+              <Tooltip text={t("sidebar:header.filter")}>
+                <button
+                  onClick={toggleFilter}
+                  className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                    filterOpen ? "text-text-secondary" : "text-text-dim hover:text-text-secondary"
+                  }`}
+                  aria-label={t("sidebar:header.filterSessions")}
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+                  </svg>
+                </button>
+              </Tooltip>
+              <Tooltip text={offline ? OFFLINE_TITLE : t("sidebar:header.newProjectSession")}>
+                <button
+                  onClick={onNew}
+                  disabled={offline}
+                  className="w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
+                  aria-label={t("sidebar:header.newProjectSession")}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    <line x1="12" y1="11" x2="12" y2="17" />
+                    <line x1="9" y1="14" x2="15" y2="14" />
+                  </svg>
+                </button>
+              </Tooltip>
+            </>
           )}
-          <Tooltip text={t("sidebar:header.filter")}>
+          {compact && <span className="flex-1" />}
+          <Tooltip text={compact ? "Expand sidebar" : "Compact sidebar"}>
             <button
-              onClick={toggleFilter}
+              onClick={() => updateWebSettings({ sidebarCompact: !compact })}
+              aria-pressed={compact}
+              aria-label={compact ? "Expand sidebar" : "Compact sidebar"}
+              data-testid="sidebar-compact-toggle"
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                filterOpen ? "text-text-secondary" : "text-text-dim hover:text-text-secondary"
+                compact ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
               }`}
-              aria-label={t("sidebar:header.filterSessions")}
             >
               <svg
                 width="14"
@@ -3252,30 +3475,8 @@ export function WorkspaceSidebar({
                 strokeLinecap="round"
                 strokeLinejoin="round"
               >
-                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-              </svg>
-            </button>
-          </Tooltip>
-          <Tooltip text={offline ? OFFLINE_TITLE : t("sidebar:header.newProjectSession")}>
-            <button
-              onClick={onNew}
-              disabled={offline}
-              className="w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-              aria-label={t("sidebar:header.newProjectSession")}
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                <line x1="12" y1="11" x2="12" y2="17" />
-                <line x1="9" y1="14" x2="15" y2="14" />
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <line x1="9" y1="3" x2="9" y2="21" />
               </svg>
             </button>
           </Tooltip>
@@ -3287,7 +3488,7 @@ export function WorkspaceSidebar({
           </button>
         </div>
 
-        {filterOpen && (
+        {filterPanelOpen && (
           <div className="px-3 pb-2">
             <input
               ref={filterRef}
@@ -3304,7 +3505,7 @@ export function WorkspaceSidebar({
           </div>
         )}
 
-        {facetOpen && facetSpecs.length > 0 && (
+        {facetPanelOpen && facetSpecs.length > 0 && (
           <div className="px-3 pb-2 flex flex-col gap-2" data-testid="sidebar-facet-panel">
             {facetSpecs.map((facet) => {
               const selected = facetSelection.get(`${facet.pluginId}\u0000${facet.entryId}`);
@@ -3563,7 +3764,9 @@ export function WorkspaceSidebar({
                   onClick={toggleSunkExpanded}
                   data-testid="sidebar-sunk-toggle"
                   aria-expanded={sunkExpanded}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60"
+                  className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 ${
+                    compact ? "px-2" : "px-3 tracking-widest"
+                  }`}
                 >
                   <svg
                     width="10"
@@ -3581,7 +3784,12 @@ export function WorkspaceSidebar({
                       strokeLinejoin="round"
                     />
                   </svg>
-                  <span>{t("sidebar:footer.snoozedArchived", { count: sunkWorkspaces.length })}</span>
+                  {/* The count and the wide tracking do not fit the rail, and a
+                      clipped "(3)" is exactly what looks broken; truncate the
+                      label instead. See #2288. */}
+                  <span className="truncate">
+                    {t("sidebar:footer.snoozedArchived", { count: sunkWorkspaces.length })}
+                  </span>
                 </button>
                 {sunkExpanded &&
                   sunkWorkspaces.map((v) => (
@@ -3622,7 +3830,7 @@ export function WorkspaceSidebar({
 
           {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">{t("sidebar:empty.noMatches", { q: filterQuery })}</p>
+              <p className="text-sm text-text-muted">{t("sidebar:empty.noMatches", { q: activeFilterQuery })}</p>
             </div>
           )}
 
@@ -3693,8 +3901,8 @@ export function WorkspaceSidebar({
       <div
         data-testid="sidebar-resize-handle"
         onMouseDown={handleMouseDown}
-        className={`${open ? "hidden md:block" : "hidden"} w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75`}
+        className={`${open && !compact ? "hidden md:block" : "hidden"} w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75`}
       />
-    </>
+    </SidebarCompactContext.Provider>
   );
 }

@@ -724,6 +724,9 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         // Authoritative: the cursor is read straight from the owned grid, not
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
+        // The grid is pane 0's alone. `capture_composited_over_grid` sets this
+        // when it splices that grid into a composited window.
+        composite_pane0: None,
     }
 }
 
@@ -807,21 +810,40 @@ fn cell_sgr(cell: &vt100::Cell) -> String {
 /// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
 /// the column layout intact while preserving colour and intensity.
 fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
-    // Trim trailing *unstyled* blank cells, mirroring `capture-pane`'s
-    // trailing-space trim, so a row never carries a full width of padding into
-    // ratatui's wrapper. A trailing blank that carries styling (a background
-    // fill running to the edge) is kept: it is drawn as a coloured space below,
-    // exactly as a mid-row styled blank already is.
+    let last = row_last_col(screen, row, cols);
+    row_to_ansi_upto(screen, row, last)
+}
+
+/// Columns of `row` that carry content, i.e. the trim point past which only
+/// *unstyled* blank cells remain. Mirrors `capture-pane`'s trailing-space trim
+/// so a row never carries a full width of padding into ratatui's wrapper. A
+/// trailing blank that carries styling (a background fill running to the edge)
+/// counts as content: it is drawn as a coloured space, exactly as a mid-row
+/// styled blank already is.
+///
+/// The count is in display COLUMNS, not cells, so a trailing wide glyph
+/// contributes both of the columns it occupies. Its continuation cell carries no
+/// contents and, unstyled, no style either, so advancing by one per occupied
+/// cell would under-count by one and leave
+/// [`capture_rows_padded`] appending a space to a row that already fills its
+/// pane, shifting every pane to its right by a column.
+fn row_last_col(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
     let mut last = 0u16;
     for col in 0..cols {
-        if screen
-            .cell(row, col)
-            .is_some_and(|cell| cell.has_contents() || cell_has_style(cell))
-        {
-            last = col + 1;
+        if let Some(cell) = screen.cell(row, col) {
+            if cell.has_contents() || cell_has_style(cell) {
+                let width = if cell.is_wide() { 2 } else { 1 };
+                last = col.saturating_add(width).min(cols);
+            }
         }
     }
+    last
+}
 
+/// Serialise columns `0..last` of `row`. Split out of [`row_to_ansi`] so the
+/// pane compositor can ask for a row rendered to its pane's full width rather
+/// than to the trim point.
+fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
     let mut out = String::new();
     let mut cur_sgr: Option<String> = None;
     let mut col = 0u16;
@@ -853,6 +875,48 @@ fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
         col += if cell.is_wide() { 2 } else { 1 };
     }
     out
+}
+
+/// Render `raw` (one pane's `capture-pane -e -p` output) as exactly `rows`
+/// ANSI rows, each padded with spaces to `cols` display columns.
+///
+/// The compositor splices panes side by side by *concatenating* their rows, so
+/// unlike the single-pane preview path every row must occupy its pane's full
+/// width: a trimmed row would let the next pane's first column slide left into
+/// the gap. Going through a `vt100::Parser` rather than splitting the bytes on
+/// newlines is what makes that safe, because a row's escape sequences are
+/// resolved into cells before they are re-serialised, so no SGR state can leak
+/// across a pane boundary into its neighbour.
+pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<String> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    // Parse at two rows minimum, then read back only the pane's real height.
+    // vt100 0.16 underflows (panics) whenever content wraps on a ONE-row grid,
+    // regardless of scrollback, and `resize-pane -y 1` makes that a layout a
+    // user can actually produce. Captured content is already wrapped to the
+    // pane's width so it normally fits exactly; this keeps a stale geometry
+    // (the pane resized between the probe and the capture) from taking down
+    // the render thread.
+    let mut parser = vt100::Parser::new(rows.max(2), cols, 0);
+    // `capture-pane` joins rows with a bare LF, which staircases each row off
+    // the previous one's end column unless it is promoted to CRLF first (the
+    // same seeding fix the live channel applies).
+    parser.process(&lf_to_crlf(strip_trailing_row_terminator(raw)));
+
+    let screen = parser.screen();
+    (0..rows)
+        .map(|row| {
+            let last = row_last_col(screen, row, cols);
+            let mut out = row_to_ansi_upto(screen, row, last);
+            if last < cols {
+                // Reset before padding so a styled final cell (a background
+                // fill) does not bleed its colour across the gap.
+                out.push_str("\x1b[0m");
+                out.extend(std::iter::repeat_n(' ', (cols - last) as usize));
+            }
+            out
+        })
+        .collect()
 }
 
 /// Assemble the last `max_lines` rows of (scrollback + visible screen) as
@@ -926,6 +990,11 @@ struct ReaderCtx {
     /// copy overwrites an unconsumed older one, matching clipboard
     /// semantics (only the last copy matters).
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Broadcast copy of the clipboard slot for Web viewers. Each live-ws
+    /// connection owns a receiver, so one viewer cannot consume another's
+    /// OSC 52 event.
+    #[cfg(feature = "serve")]
+    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Chunk-arrival bookkeeping for the sample debounce (see the fields of the
     /// same name on `VtChannel`): a chunk counter, the last chunk's arrival
     /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
@@ -976,8 +1045,10 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // copy has to the host clipboard (#2420).
                 if let Some(text) = osc52.feed(&buf[..n]) {
                     if let Ok(mut guard) = ctx.clipboard.lock() {
-                        *guard = Some(text);
+                        *guard = Some(text.clone());
                     }
+                    #[cfg(feature = "serve")]
+                    let _ = ctx.clipboard_tx.send_replace(Some(text));
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -1066,6 +1137,10 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Broadcast OSC 52 stream for Web viewers. Unlike the TUI's consuming
+    /// slot above, every live-ws connection gets its own watch receiver.
+    #[cfg(feature = "serve")]
+    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -1224,6 +1299,8 @@ impl VtChannel {
         // `subscribe` mints one per connection.
         #[cfg(feature = "serve")]
         let changed_tx = Arc::new(tokio::sync::watch::channel(()).0);
+        #[cfg(feature = "serve")]
+        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
 
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -1258,6 +1335,8 @@ impl VtChannel {
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
+                #[cfg(feature = "serve")]
+                clipboard_tx: clipboard_tx.clone(),
                 chunk_seq: chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
@@ -1337,6 +1416,8 @@ impl VtChannel {
             changed_tx,
             wakeup,
             clipboard,
+            #[cfg(feature = "serve")]
+            clipboard_tx,
             chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
@@ -1468,6 +1549,53 @@ impl VtChannel {
         (content, Some(cursor))
     }
 
+    /// Sample the VISIBLE grid as `want_rows` rows padded to `want_cols`
+    /// display columns, for splicing this pane into a composited window.
+    ///
+    /// Unlike [`sample`](Self::sample) this never reaches into scrollback: a
+    /// composite shows the live window only, since panes have independent
+    /// histories with no coherent way to stack them.
+    ///
+    /// `want_cols` / `want_rows` come from tmux's view of the pane, which can
+    /// briefly disagree with the grid mid-resize. Padding and truncating to the
+    /// requested rectangle keeps that frame merely stale instead of shifting
+    /// every pane to its right.
+    pub(crate) fn sample_rows_padded(
+        &self,
+        want_cols: u16,
+        want_rows: u16,
+    ) -> Option<(Vec<String>, PaneCursor)> {
+        self.reconcile_size();
+        self.refresh_owner_heartbeat();
+        let cols = self.cols.load(Ordering::Relaxed);
+        let rows = self.rows.load(Ordering::Relaxed);
+        let want_cols = want_cols.max(1);
+        let want_rows = want_rows.max(1);
+
+        let p = self.parser.lock().ok()?;
+        let screen = p.screen();
+        let readable_cols = cols.min(want_cols);
+        let out = (0..want_rows)
+            .map(|row| {
+                if row >= rows {
+                    // Grid shorter than tmux says the pane is: blank filler
+                    // rather than a row borrowed from somewhere else.
+                    return " ".repeat(want_cols as usize);
+                }
+                let last = row_last_col(screen, row, readable_cols);
+                let mut line = row_to_ansi_upto(screen, row, last);
+                if last < want_cols {
+                    line.push_str("\x1b[0m");
+                    line.extend(std::iter::repeat_n(' ', (want_cols - last) as usize));
+                }
+                line
+            })
+            .collect();
+        let cursor = cursor_from_screen(screen, rows, cols);
+        drop(p);
+        Some((out, cursor))
+    }
+
     /// Whether the forwarder is connected and the reader loop is running. A
     /// channel that never connected, or whose pipe has since closed, reports
     /// `false` so input and capture fall back to the legacy tmux path instead
@@ -1487,6 +1615,16 @@ impl VtChannel {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
+    }
+
+    /// Subscribe to future OSC 52 clipboard writes. The current value is
+    /// marked seen before returning, so a newly opened dashboard does not
+    /// replay an old copy into the browser clipboard.
+    #[cfg(feature = "serve")]
+    pub(crate) fn subscribe_clipboard(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        let mut rx = self.clipboard_tx.subscribe();
+        let _ = rx.borrow_and_update();
+        rx
     }
 
     /// Register the in-process poller wakeup this channel pokes on each grid
@@ -1589,6 +1727,103 @@ mod tests {
             !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
             "cursor-forward escape leaked:\n{content:?}"
         );
+    }
+
+    /// Display columns a row occupies once its escape sequences are removed.
+    /// Measured as width, not `chars().count()`, so a wide glyph is counted as
+    /// the two columns it actually paints.
+    fn visible_width(row: &str) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        UnicodeWidthStr::width(crate::tmux::utils::strip_ansi(row).as_str())
+    }
+
+    #[test]
+    fn capture_rows_padded_fills_every_row_to_the_pane_width() {
+        // The compositor concatenates rows to splice panes side by side, so a
+        // short row must be padded or the next pane slides left into the gap.
+        let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
+        assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+        }
+        assert!(rows[0].contains("ab"));
+        assert!(rows[1].contains("longer"));
+    }
+
+    #[test]
+    fn capture_rows_padded_unstaircases_bare_lf_input() {
+        // Same hazard `lf_to_crlf` fixes for the live seed: `capture-pane`
+        // joins rows with a bare LF, which would staircase each pane row off
+        // the previous one's end column.
+        let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
+        let plain: Vec<String> = rows
+            .iter()
+            .map(|r| crate::tmux::utils::strip_ansi(r))
+            .collect();
+        assert_eq!(plain[0].trim_end(), "line-1");
+        assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
+    }
+
+    #[test]
+    fn capture_rows_padded_resets_style_before_padding() {
+        // A row ending in a background fill must not bleed that colour across
+        // the border into the pane beside it.
+        let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
+        assert_eq!(visible_width(&rows[0]), 8);
+        assert!(
+            rows[0].ends_with("\x1b[0m     "),
+            "padding not reset: {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn capture_rows_padded_counts_a_trailing_wide_glyph_as_two_columns() {
+        // A wide glyph's continuation cell holds no contents and, unstyled, no
+        // style, so counting one column per occupied cell under-counts the row
+        // by one. The padding step then appended a space to a row that already
+        // filled its pane, making it `cols + 1` wide and shifting every pane to
+        // its right by a column.
+        let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
+        assert_eq!(
+            visible_width(&rows[0]),
+            4,
+            "row should exactly fill the pane: {:?}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].ends_with(' '),
+            "no padding belongs on a row that already fills its width: {:?}",
+            rows[0]
+        );
+
+        // The same glyph with room to spare still pads, to the right total.
+        let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
+        assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
+
+        // A wide glyph split by the pane edge cannot push the count past `cols`.
+        let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn capture_rows_padded_survives_a_one_row_pane_that_wraps() {
+        // `resize-pane -y 1` is a real layout, and vt100 panics on a wrapping
+        // one-row grid, so this must come back with a single padded row.
+        let rows = capture_rows_padded(b"keep", 3, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(visible_width(&rows[0]), 3);
+    }
+
+    #[test]
+    fn capture_rows_padded_truncates_content_wider_than_the_pane() {
+        // Content wider than the pane wraps inside the parser rather than
+        // overflowing the row and shifting the neighbour.
+        let rows = capture_rows_padded(b"abcdefgh", 4, 2);
+        assert_eq!(visible_width(&rows[0]), 4);
+        assert_eq!(visible_width(&rows[1]), 4);
     }
 
     #[test]
@@ -1845,6 +2080,8 @@ mod tests {
             changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -1860,6 +2097,58 @@ mod tests {
             last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
+    }
+
+    #[test]
+    fn sample_rows_padded_renders_the_visible_grid_at_the_requested_rectangle() {
+        // The live composite asks for pane 0's rectangle as tmux reports it,
+        // which can differ from the grid's own size mid-resize. Every returned
+        // row must occupy exactly the requested width, and there must be
+        // exactly the requested number of them, or the panes spliced to the
+        // right of this one shift.
+        let name = format!("aoe_test_vt_padded_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ch, _alive) = dummy_channel(&name, dir.path());
+        // Grid is 4 rows x 20 cols (see `dummy_channel`).
+        ch.parser
+            .lock()
+            .unwrap()
+            .process(b"hello\r\nworld\r\n\x1b[41mfilled");
+
+        // Exact rectangle.
+        let (rows, cursor) = ch.sample_rows_padded(20, 4).expect("sample");
+        assert_eq!(rows.len(), 4);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(
+                crate::tmux::utils::strip_ansi(r).chars().count(),
+                20,
+                "row {i} not padded to width: {r:?}"
+            );
+        }
+        assert!(crate::tmux::utils::strip_ansi(&rows[0]).starts_with("hello"));
+        assert!(crate::tmux::utils::strip_ansi(&rows[1]).starts_with("world"));
+        // Cursor comes straight off the grid and is always trustworthy.
+        assert!(cursor.position_reliable);
+
+        // Narrower and shorter than the grid: truncate, never overflow.
+        let (rows, _) = ch.sample_rows_padded(6, 2).expect("sample");
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(crate::tmux::utils::strip_ansi(r).chars().count(), 6);
+        }
+
+        // Taller than the grid (tmux says the pane grew before the grid caught
+        // up): the extra rows are blank filler at the right width, not rows
+        // borrowed from elsewhere.
+        let (rows, _) = ch.sample_rows_padded(10, 6).expect("sample");
+        assert_eq!(rows.len(), 6);
+        for (i, r) in rows.iter().enumerate() {
+            let plain = crate::tmux::utils::strip_ansi(r);
+            assert_eq!(plain.chars().count(), 10, "row {i}: {r:?}");
+            if i >= 4 {
+                assert!(plain.trim().is_empty(), "row {i} should be filler: {r:?}");
+            }
+        }
     }
 
     #[test]
@@ -2013,6 +2302,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2096,6 +2387,8 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2246,6 +2539,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        #[cfg(feature = "serve")]
+        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
+        #[cfg(feature = "serve")]
+        let mut clipboard_rx = {
+            let mut rx = clipboard_tx.subscribe();
+            let _ = rx.borrow_and_update();
+            rx
+        };
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -2255,6 +2556,8 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
+            #[cfg(feature = "serve")]
+            clipboard_tx,
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2269,8 +2572,14 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let copied = loop {
-            if let Some(text) = clipboard.lock().unwrap().take() {
-                break Some(text);
+            #[cfg(feature = "serve")]
+            let clipboard_published = clipboard_rx.has_changed().unwrap();
+            #[cfg(not(feature = "serve"))]
+            let clipboard_published = true;
+            if clipboard_published {
+                if let Some(text) = clipboard.lock().unwrap().take() {
+                    break Some(text);
+                }
             }
             if Instant::now() >= deadline {
                 break None;
@@ -2278,6 +2587,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(copied.as_deref(), Some("hello"));
+        #[cfg(feature = "serve")]
+        {
+            assert!(
+                clipboard_rx.has_changed().unwrap(),
+                "web clipboard subscribers must receive the OSC 52 event"
+            );
+            assert_eq!(clipboard_rx.borrow_and_update().as_deref(), Some("hello"));
+        }
         assert!(
             parser
                 .lock()
@@ -2322,6 +2639,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "serve")]
+            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),

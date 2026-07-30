@@ -221,7 +221,7 @@ environment = [
 ]
 ```
 
-Top-level `environment` injects env vars into the host command line for every session spawned at global scope. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
+Top-level `environment` injects env vars into every host (non-sandboxed) session spawned at global scope, in both the terminal and the structured view. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
 
 Each entry follows the same grammar as `sandbox.environment`:
 
@@ -230,7 +230,7 @@ Each entry follows the same grammar as `sandbox.environment`:
 - **`KEY=$$literal`**: escape; emits `KEY=$literal`.
 - **`KEY`** (bare): passthrough from the host env (skipped with a warning if unset).
 
-All forms resolve to a literal `KEY=value` argument on the spawned process and are therefore visible in `ps`. For secrets you want hidden from argv, use [`sandbox.environment`](#sandbox-docker) instead. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
+In the terminal view every form resolves to a literal `KEY=value` prefix on the pane command and is therefore visible in `ps`; for secrets you want hidden from argv there, use [`sandbox.environment`](#sandbox-docker) instead. The structured view applies the same list to the agent process's environment rather than its argv, so values do not appear in `ps`. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
 
 Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
 
@@ -295,7 +295,7 @@ vt_live = true
 |--------|---------|-------------|
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
-| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session (the attached path), and in live-send aoe itself extracts the agent's OSC 52 from the pane stream and pushes it to your clipboard. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
+| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal or Web dashboard. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session (the attached path), and in live-send aoe itself extracts the agent's OSC 52 from the pane stream and pushes it to the native or browser clipboard. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
 | `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
 | `vt_live` | `true` | Render live views (the TUI live preview and the web/mobile live terminal) from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. Needs tmux 3.4+; panes that cannot arm a channel fall back to the polling `capture-pane` / `send-keys` path automatically. Disable only to troubleshoot the VT transport; the fallback is slower and loses agent clipboard forwarding in live-send. Applies in place: the TUI picks a change up on the next capture cycle, web connections on their next reconnect. |
 

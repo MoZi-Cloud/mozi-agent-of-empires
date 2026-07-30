@@ -471,7 +471,9 @@ export function SettingsView({
                 values={session}
                 onSaveField={saveSubField}
                 onAfterSave={(descriptor) => {
-                  if (descriptor.field === "row_tag") return onSettingsRefresh();
+                  if (descriptor.field === "row_tag" || descriptor.field === "show_session_colors") {
+                    return onSettingsRefresh();
+                  }
                 }}
                 advancedSubtitle={t("settings:subtitle.session")}
               />
