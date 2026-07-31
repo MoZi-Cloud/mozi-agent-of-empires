@@ -3216,6 +3216,92 @@ pub async fn update_session_proxy(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+/// Probe the session's outbound IP by running `curl https://ipinfo.io` with the
+/// session's per-session proxy env (the same `http_proxy`/`https_proxy`/`
+/// all_proxy` set the agent's terminal launches with), so the result reflects
+/// what the agent would see. Non-disruptive: the agent is not stopped. Returns
+/// curl's stdout for the dashboard to render in a modal.
+pub async fn session_ipinfo(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+    let (proxy, cwd) = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message": "Session not found"})),
+            )
+                .into_response();
+        };
+        #[cfg(feature = "serve")]
+        let structured = instance.is_structured();
+        #[cfg(not(feature = "serve"))]
+        let structured = false;
+        if structured || instance.is_sandboxed() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "terminal_session_required",
+                    "message": "ipinfo is only available for a non-sandbox terminal session"
+                })),
+            )
+                .into_response();
+        }
+        (
+            instance.host_proxy.clone(),
+            instance.project_path.clone(),
+        )
+    };
+    let proxy = proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let ran = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-s", "--max-time", "12", "https://ipinfo.io"])
+            .current_dir(&cwd);
+        if let Some(proxy) = proxy.as_deref() {
+            for key in [
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+            ] {
+                cmd.env(key, proxy);
+            }
+        }
+        let out = cmd.output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+    .await;
+    match ran {
+        Ok(Ok(output)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "output": output })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "message": format!("Failed to run curl: {e}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "message": format!("Background task failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 /// Start (resume) a stopped session, the inverse of [`stop_session`]. Plain
 /// sessions are restarted exactly like `ensure_session` (kill any corpse pane,
 /// then `start_with_resume_fallback`); structured sessions are un-parked by

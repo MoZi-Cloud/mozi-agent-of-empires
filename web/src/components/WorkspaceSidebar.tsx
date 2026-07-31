@@ -21,6 +21,7 @@ import {
   CircleStop,
   Folder,
   GitFork,
+  Globe,
   Hourglass,
   Layers,
   ListFilter,
@@ -83,6 +84,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
   renameSession,
+  sessionIpinfo,
   setSessionColor,
   setSessionNotifications,
   setSessionProxy,
@@ -127,6 +129,7 @@ export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
+import { IpinfoModal } from "./IpinfoModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
 import { PluginRowLine } from "./plugin/PluginSlots";
@@ -1127,6 +1130,12 @@ export const SessionRow = memo(function SessionRow({
   // Edit-workdir-name picker, also in its own portal-rendered modal so the
   // context-menu dismissal listener does not close it. See #1723.
   const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
+  // ipinfo (`curl https://ipinfo.io` via the session's proxy env) result
+  // dialog. null = closed; otherwise loading/result drives the modal body.
+  // Portal-rendered for the same reason as the pickers above.
+  const [ipinfoState, setIpinfoState] = useState<
+    { loading: true } | { loading: false; output: string } | { loading: false; error: string } | null
+  >(null);
 
   const togglePin = () => {
     setContextMenu(null);
@@ -1441,6 +1450,18 @@ export const SessionRow = memo(function SessionRow({
       return;
     }
     reportInfo("Session proxy injected and the terminal session resumed.");
+  };
+
+  const handleIpinfo = async () => {
+    setContextMenu(null);
+    if (!sessionId) return;
+    setIpinfoState({ loading: true });
+    const result = await sessionIpinfo(sessionId);
+    if ("output" in result) {
+      setIpinfoState({ loading: false, output: result.output });
+    } else {
+      setIpinfoState({ loading: false, error: result.error });
+    }
   };
 
   if (renaming) {
@@ -1843,6 +1864,16 @@ export const SessionRow = memo(function SessionRow({
                     {t("sidebar:ctx.injectProxy")}
                   </button>
                 )}
+                {canInjectProxy && (
+                  <button
+                    onClick={() => void handleIpinfo()}
+                    data-testid="sidebar-context-menu-ipinfo"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <Globe className="h-3.5 w-3.5 shrink-0" />
+                    {t("sidebar:ctx.ipinfo")}
+                  </button>
+                )}
                 {!readOnly && canStart && (
                   <button
                     onClick={handleStart}
@@ -2061,6 +2092,11 @@ export const SessionRow = memo(function SessionRow({
             onSave={saveGroup}
             onClose={() => setEditingGroup(false)}
           />,
+          document.body,
+        )}
+      {ipinfoState &&
+        createPortal(
+          <IpinfoModal sessionTitle={sessionTitle || label} state={ipinfoState} onClose={() => setIpinfoState(null)} />,
           document.body,
         )}
     </>

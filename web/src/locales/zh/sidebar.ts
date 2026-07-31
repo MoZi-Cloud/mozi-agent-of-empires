@@ -40,6 +40,7 @@ export const sidebar = {
     stop: "停止",
     start: "启动",
     injectProxy: "注入代理",
+    ipinfo: "IP 信息",
     notifications: "通知",
     off: "关闭",
     default: "默认",
@@ -123,5 +124,11 @@ export const sidebar = {
       "1440": "1 天",
       "10080": "1 周",
     },
+  },
+  ipinfo: {
+    title: "出口 IP (ipinfo.io)",
+    loading: "正在通过会话代理探测出口 IP…",
+    empty: "(无输出)",
+    confirm: "确认",
   },
 };

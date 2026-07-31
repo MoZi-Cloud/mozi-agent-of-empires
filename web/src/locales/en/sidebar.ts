@@ -41,6 +41,7 @@ export const sidebar = {
     stop: "Stop",
     start: "Start",
     injectProxy: "Inject proxy",
+    ipinfo: "ipinfo",
     notifications: "Notifications",
     off: "Off",
     default: "Default",
@@ -124,5 +125,11 @@ export const sidebar = {
       "1440": "1 day",
       "10080": "1 week",
     },
+  },
+  ipinfo: {
+    title: "Outbound IP (ipinfo.io)",
+    loading: "Probing outbound IP via the session proxy…",
+    empty: "(no output)",
+    confirm: "OK",
   },
 };

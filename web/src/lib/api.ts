@@ -2342,6 +2342,25 @@ export async function setSessionProxy(id: string, proxy: string | null): Promise
   }
 }
 
+/** Probe the session's outbound IP via `curl https://ipinfo.io`, run on the
+ *  server with the session's per-session proxy env so the result reflects what
+ *  the agent's terminal would see. Non-disruptive: the agent is not stopped.
+ *  Returns the curl stdout, or an error message. */
+export async function sessionIpinfo(id: string): Promise<{ output: string } | { error: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/ipinfo`, {
+      method: "POST",
+    });
+    const data = (await res.json().catch(() => null)) as { output?: string; message?: string } | null;
+    if (!res.ok) {
+      return { error: data?.message ?? "Failed to run ipinfo." };
+    }
+    return { output: data?.output ?? "" };
+  } catch {
+    return { error: "Failed to run ipinfo." };
+  }
+}
+
 /** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
  *  number of minutes between 1 and 43200 (30 days) to snooze. The server
  *  validates against the shared `validate_snooze_duration` so the bounds
