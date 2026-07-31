@@ -39,6 +39,7 @@ export const sidebar = {
     autoNameNow: "立即自动命名",
     stop: "停止",
     start: "启动",
+    injectProxy: "注入代理",
     notifications: "通知",
     off: "关闭",
     default: "默认",

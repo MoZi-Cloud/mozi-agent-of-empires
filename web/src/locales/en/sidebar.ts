@@ -40,6 +40,7 @@ export const sidebar = {
     autoNameNow: "Auto-name now",
     stop: "Stop",
     start: "Start",
+    injectProxy: "Inject proxy",
     notifications: "Notifications",
     off: "Off",
     default: "Default",
