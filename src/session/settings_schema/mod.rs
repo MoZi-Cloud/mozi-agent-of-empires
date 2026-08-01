@@ -31,7 +31,9 @@ pub use plugin::{
     storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
     PLUGIN_SECTION_PREFIX,
 };
-pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
+pub use policy::{
+    split_global_only, strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope,
+};
 pub use registry::{descriptor, runtime_schema, schema};
 pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSource};
 pub use validate::{validate_value, ValidationError};

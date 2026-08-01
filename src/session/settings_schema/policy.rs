@@ -131,6 +131,61 @@ pub fn strip_local_only(patch: &mut Value) {
     }
 }
 
+/// Insert a `{section: {field: value}}` leaf into a partition map, creating the
+/// section object lazily. Shared by both partitions of [`split_global_only`].
+fn put_leaf(part: &mut serde_json::Map<String, Value>, section: &str, field: &str, val: &Value) {
+    let slot = part
+        .entry(section.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    // Always `Some`: the line above just inserted a fresh `Object`.
+    if let Some(sec) = slot.as_object_mut() {
+        sec.insert(field.to_string(), val.clone());
+    }
+}
+
+/// Partition a validated PATCH body into `(global_only, profile_overridable)`.
+///
+/// A leaf whose schema descriptor has `profile_overridable == false` (the
+/// `global_only` attribute: `web.*`, `logging.*`, ...) belongs in the **global**
+/// partition, because such fields can never be profile overrides: resolution
+/// always takes the global value, so writing one as a per-profile override is
+/// silently lost (the bug behind `web.mobile_quick_button_count` not applying).
+/// Leaves with `profile_overridable == true` stay in the **profile** partition.
+///
+/// Top-level non-object values (the profile-only `description` string) and
+/// unknown sections/fields have no field descriptor, so they are left in the
+/// profile partition for the caller's write path to handle as before.
+///
+/// Call this after [`strip_local_only`] + [`validate_patch`], so every leaf is
+/// already known and well-formed. Both returned values are JSON objects
+/// (possibly empty `{}`).
+pub fn split_global_only(patch: &Value, descriptors: &[FieldDescriptor]) -> (Value, Value) {
+    let mut global = serde_json::Map::new();
+    let mut profile = serde_json::Map::new();
+    let Some(obj) = patch.as_object() else {
+        // Non-object root: nothing to partition, hand it back as profile so the
+        // caller's write path handles it unchanged.
+        return (Value::Object(global), patch.clone());
+    };
+    for (section, value) in obj {
+        let Some(fields) = value.as_object() else {
+            profile.insert(section.clone(), value.clone());
+            continue;
+        };
+        for (field, fval) in fields {
+            let is_global_only = lookup_in(descriptors, section, field)
+                .map(|d| !d.profile_overridable)
+                .unwrap_or(false);
+            if is_global_only {
+                put_leaf(&mut global, section, field, fval);
+            } else {
+                put_leaf(&mut profile, section, field, fval);
+            }
+        }
+    }
+    (Value::Object(global), Value::Object(profile))
+}
+
 /// Validate every leaf of a settings PATCH body against the schema. Returns the
 /// first rejection encountered, or `Ok(())` if every leaf is a known field the
 /// web may write (given `elevated`) carrying a well-formed value. A `null` leaf
@@ -277,6 +332,57 @@ mod tests {
         }
         assert_eq!(body["status_hooks"]["enabled"], json!(true));
         assert!(validate_patch(&body, Scope::Profile, true).is_ok());
+    }
+
+    #[test]
+    fn split_global_only_routes_global_only_leaves_to_global() {
+        // `web.*` fields are `global_only` (profile_overridable == false): they
+        // must land in the global partition so update_profile_settings writes
+        // them to the global Config instead of a profile override that
+        // resolution discards (the bug behind mobile_quick_button_count).
+        // `session.smart_rename` is profile-overridable, so it stays in profile.
+        let descriptors = schema();
+        let patch = json!({
+            "web": { "mobile_quick_button_count": 9, "disable_mouse_forwarding": true },
+            "session": { "smart_rename": true },
+        });
+        let (global, profile) = split_global_only(&patch, &descriptors);
+
+        assert_eq!(global["web"]["mobile_quick_button_count"], json!(9));
+        assert_eq!(global["web"]["disable_mouse_forwarding"], json!(true));
+        assert!(
+            global.get("session").is_none(),
+            "profile-overridable leaf must not leak into global: {global}"
+        );
+
+        assert_eq!(profile["session"]["smart_rename"], json!(true));
+        assert!(
+            profile.get("web").is_none(),
+            "global_only leaf must not appear in profile partition: {profile}"
+        );
+    }
+
+    #[test]
+    fn split_global_only_empty_global_when_all_profile_overridable() {
+        let descriptors = schema();
+        let patch = json!({ "session": { "smart_rename": true } });
+        let (global, profile) = split_global_only(&patch, &descriptors);
+        assert!(global.as_object().map(|o| o.is_empty()).unwrap_or(true));
+        assert_eq!(profile["session"]["smart_rename"], json!(true));
+    }
+
+    #[test]
+    fn split_global_only_keeps_description_in_profile() {
+        // `description` is a profile-only top-level string with no descriptor;
+        // it must stay in the profile partition.
+        let descriptors = schema();
+        let patch = json!({
+            "description": "my profile",
+            "web": { "notify_on_idle": true },
+        });
+        let (global, profile) = split_global_only(&patch, &descriptors);
+        assert_eq!(global["web"]["notify_on_idle"], json!(true));
+        assert_eq!(profile["description"], json!("my profile"));
     }
 
     #[test]

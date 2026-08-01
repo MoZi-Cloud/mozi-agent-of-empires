@@ -3253,10 +3253,7 @@ pub async fn session_ipinfo(
             )
                 .into_response();
         }
-        (
-            instance.host_proxy.clone(),
-            instance.project_path.clone(),
-        )
+        (instance.host_proxy.clone(), instance.project_path.clone())
     };
     let proxy = proxy
         .as_deref()

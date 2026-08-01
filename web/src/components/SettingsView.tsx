@@ -726,6 +726,19 @@ export function SettingsView({
                     focusRequest={focusRequest}
                     values={web}
                     onSaveField={saveSubField}
+                    onAfterSave={(descriptor) => {
+                      // These web fields feed app-shell contexts that App.tsx
+                      // parses once at mount (MobileQuickButtonCountContext,
+                      // DisableMouseForwardingContext); re-fetch so the
+                      // terminal toolbar and mouse-forwarding policy update
+                      // live instead of waiting for a page reload.
+                      if (
+                        descriptor.field === "mobile_quick_button_count" ||
+                        descriptor.field === "disable_mouse_forwarding"
+                      ) {
+                        return onSettingsRefresh();
+                      }
+                    }}
                   />
                 ))}
             </div>

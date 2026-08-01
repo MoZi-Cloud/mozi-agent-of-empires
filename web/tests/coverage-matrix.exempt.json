@@ -40,6 +40,10 @@
     {
       "path": "web/src/components/command-palette/CommandPalette.tsx",
       "reason": "Command palette covered by command-palette.spec.ts (mocked)"
+    },
+    {
+      "path": "web/src/components/IpinfoModal.tsx",
+      "reason": "Read-only modal rendering the outbound-IP curl result from POST /api/sessions/{id}/ipinfo; manually verified, wired into the sidebar context menu alongside inject-proxy"
     }
   ]
 }

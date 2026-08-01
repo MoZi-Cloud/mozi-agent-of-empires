@@ -563,6 +563,13 @@
       "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
+      "id": "settings.web-global-only-persistence",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SettingsView.notifications.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx"]
+    },
+    {
       "id": "notifications.service-worker-clear",
       "kind": "vitest",
       "risk": "medium",

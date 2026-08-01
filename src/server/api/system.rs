@@ -11,8 +11,8 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 use crate::session::settings_schema::{
-    clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
-    validate_patch_with, PatchRejection, Scope,
+    clear_path, rewrite_plugin_sections, runtime_schema, split_global_only, strip_local_only,
+    validate_patch, validate_patch_with, PatchRejection, Scope,
 };
 
 // --- Agents ---
@@ -1686,42 +1686,39 @@ pub async fn update_profile_settings(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        // The `logging` section is process-global (no profile overrides
-        // for v1), so peel it off the patch and write it into the
-        // global Config. Everything else stays a per-profile override.
-        let mut body = body;
-        let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
-        if let Some(patch) = logging_patch {
+        // Partition the patch: `global_only` leaves (descriptor
+        // `profile_overridable == false`: `web.*`, `logging.*`, ...) go to the
+        // global Config because they can never be profile overrides (resolution
+        // always takes the global value, so a profile override is silently
+        // lost); the remaining profile-overridable leaves become the per-profile
+        // override. This generalizes the old logging-only peel so that, e.g.,
+        // `web.mobile_quick_button_count` actually applies instead of being
+        // stranded in a profile override.
+        let (global_patch, body) = split_global_only(&body, &runtime_schema());
+
+        let global_has_leaves = global_patch
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        if global_has_leaves {
+            let touches_logging = global_patch.get("logging").is_some();
             let global = crate::session::update_config(|global| -> anyhow::Result<()> {
                 let mut current = serde_json::to_value(&*global)?;
-                if let Some(current_obj) = current.as_object_mut() {
-                    match current_obj.get_mut("logging") {
-                        Some(existing) => {
-                            if let (Some(existing_obj), Some(new_obj)) =
-                                (existing.as_object_mut(), patch.as_object())
-                            {
-                                for (k, v) in new_obj {
-                                    existing_obj.insert(k.clone(), v.clone());
-                                }
-                            } else {
-                                current_obj.insert("logging".to_string(), patch);
-                            }
-                        }
-                        None => {
-                            current_obj.insert("logging".to_string(), patch);
-                        }
-                    }
-                }
+                crate::session::settings_schema::merge_json(&mut current, &global_patch);
                 *global = serde_json::from_value(current)?;
                 Ok(())
             })
             .and_then(|inner| inner.map(|()| crate::session::Config::load_or_warn()))?;
-            if let Ok(app_dir) = crate::session::get_app_dir() {
-                crate::logging::apply_persisted_config(
-                    &global.logging.default_level,
-                    &global.logging.targets,
-                    &app_dir,
-                );
+            // `logging` is process-global: re-apply the live filter so the
+            // daemon and acp runners pick up the new level/targets at once.
+            if touches_logging {
+                if let Ok(app_dir) = crate::session::get_app_dir() {
+                    crate::logging::apply_persisted_config(
+                        &global.logging.default_level,
+                        &global.logging.targets,
+                        &app_dir,
+                    );
+                }
             }
         }
 
@@ -1731,7 +1728,8 @@ pub async fn update_profile_settings(
         // clears the override (revert to inheriting the global); anything else
         // sets it. Sections are created lazily so a single-field patch never
         // wipes its siblings. `description` is a top-level string, handled the
-        // same way (set, or removed on null).
+        // same way (set, or removed on null). `body` is now the profile
+        // partition: global_only leaves have already been routed to global above.
         if let Some(update_obj) = body.as_object() {
             for (key, value) in update_obj {
                 match value {
