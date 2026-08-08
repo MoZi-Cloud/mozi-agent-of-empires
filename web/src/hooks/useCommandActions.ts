@@ -217,7 +217,7 @@ export function useCommandActions({
 
     actions.push({
       id: "action:about",
-      title: "About Agent of Empires",
+      title: "About Mozi AoE",
       group: "Actions",
       keywords: ["info", "version", "links", "github", "website"],
       perform: onOpenAbout,

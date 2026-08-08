@@ -505,7 +505,7 @@ impl IntroDialog {
             Line::from(vec![
                 Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.agent-of-empires.com/docs/quick-start",
+                    "https://u8erp.com/docs/quick-start",
                     Style::default().fg(theme.accent),
                 ),
             ]),
@@ -921,7 +921,7 @@ impl IntroDialog {
             Line::from(vec![
                 Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.agent-of-empires.com/docs",
+                    "https://u8erp.com/docs",
                     Style::default().fg(theme.accent),
                 ),
             ]),

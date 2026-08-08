@@ -255,7 +255,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if !crate::tmux::is_tmux_available() {
         eprintln!("Error: tmux not found in PATH");
         eprintln!();
-        eprintln!("Agent of Empires requires tmux. Install with:");
+        eprintln!("Mozi AoE requires tmux. Install with:");
         eprintln!("  brew install tmux     # macOS");
         eprintln!("  apt install tmux      # Debian/Ubuntu");
         eprintln!("  pacman -S tmux        # Arch");

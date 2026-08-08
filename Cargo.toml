@@ -3,13 +3,13 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.13.2"
+version = "1.13.2-mozi.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 license = "MIT"
-repository = "https://github.com/agent-of-empires/agent-of-empires"
+repository = "https://github.com/MoZi-Cloud/mozi-agent-of-empires"
 keywords = ["tmux", "tui", "ai", "claude", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -308,3 +308,20 @@ required-features = ["e2e-tests"]
 [[bin]]
 name = "aoe"
 path = "src/main.rs"
+
+# Packaging metadata for `cargo deb` (Mozi AoE unofficial fork build). The deb
+# package is named `mozi-aoe` and installs the `aoe` binary to /usr/bin. Cargo
+# ignores this section for normal builds; only `cargo deb` reads it.
+[package.metadata.deb]
+name = "mozi-aoe"
+maintainer = "MoZi <mozi@u8erp.com>"
+depends = "$auto, tmux"
+section = "devel"
+priority = "optional"
+extended-description-file = "NOTICE"
+assets = [
+    ["target/release/aoe", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mozi-aoe/", "644"],
+    ["LICENSE", "usr/share/doc/mozi-aoe/", "644"],
+    ["NOTICE", "usr/share/doc/mozi-aoe/", "644"],
+]

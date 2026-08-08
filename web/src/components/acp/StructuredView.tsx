@@ -2004,7 +2004,7 @@ export function StartupErrorBanner({ sessionId, message }: { sessionId: string; 
             </ul>
             Open the agent log below for the verbatim adapter error, or see{" "}
             <a
-              href="https://agent-of-empires.com/docs/structured-view#native-binary-launch-failure"
+              href="https://u8erp.com/docs/structured-view#native-binary-launch-failure"
               target="_blank"
               rel="noreferrer"
               className="underline hover:text-rose-100"

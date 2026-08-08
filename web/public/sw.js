@@ -63,7 +63,7 @@ self.addEventListener("push", (event) => {
     try {
       payload = event.data.json();
     } catch {
-      payload = { title: "Agent of Empires", body: event.data.text() };
+      payload = { title: "Mozi AoE", body: event.data.text() };
     }
   }
   // Retract path: a "clear" push closes a previously shown approval or
@@ -102,7 +102,7 @@ self.addEventListener("push", (event) => {
   if (isStaleSeq(tag, payload.seq)) return;
   recordSeq(tag, payload.seq);
 
-  const title = payload.title || "Agent of Empires";
+  const title = payload.title || "Mozi AoE";
   const options = {
     body: payload.body || "",
     tag,

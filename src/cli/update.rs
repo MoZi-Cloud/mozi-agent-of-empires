@@ -266,7 +266,7 @@ fn daemon_restart_hint() -> &'static str {
 fn completion_refresh_hint() -> &'static str {
     "  If you use static shell completions, regenerate them so they pick up new\n  \
      commands, e.g. `aoe completion zsh > ~/.zfunc/_aoe`. Eval-on-startup setups\n  \
-     stay in sync automatically: https://www.agent-of-empires.com/guides/shell-completions/"
+     stay in sync automatically: https://u8erp.com/guides/shell-completions/"
 }
 
 #[cfg(test)]

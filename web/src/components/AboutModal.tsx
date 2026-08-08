@@ -22,18 +22,13 @@ interface LinkRow {
 const LINKS: LinkRow[] = [
   {
     label: "Website",
-    href: "https://agent-of-empires.com",
-    display: "agent-of-empires.com",
+    href: "https://u8erp.com",
+    display: "u8erp.com",
   },
   {
     label: "GitHub",
-    href: "https://github.com/agent-of-empires/agent-of-empires",
-    display: "github.com/agent-of-empires/agent-of-empires",
-  },
-  {
-    label: "Twitter",
-    href: "https://x.com/agentofempires",
-    display: "@agentofempires",
+    href: "https://github.com/MoZi-Cloud/mozi-agent-of-empires",
+    display: "github.com/MoZi-Cloud/mozi-agent-of-empires",
   },
 ];
 
@@ -58,7 +53,7 @@ function buildFeedbackUrl(version: string | null): string {
     body,
     labels: "web,feedback",
   });
-  return `https://github.com/agent-of-empires/agent-of-empires/issues/new?${params.toString()}`;
+  return `https://github.com/MoZi-Cloud/mozi-agent-of-empires/issues/new?${params.toString()}`;
 }
 
 export function AboutModal({ onClose, sessionId }: Props) {
@@ -87,7 +82,7 @@ export function AboutModal({ onClose, sessionId }: Props) {
           <div className="flex items-center gap-2 min-w-0">
             <img src="/icon-192.png" alt="" width="24" height="24" className="rounded-sm shrink-0" />
             <h2 id="about-modal-title" className="text-sm font-semibold text-text-bright truncate">
-              Agent of Empires
+              Mozi AoE
             </h2>
             {version && (
               <span

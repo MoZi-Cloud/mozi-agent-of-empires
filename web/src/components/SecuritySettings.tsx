@@ -106,7 +106,7 @@ export function SecuritySettings() {
         Security settings are configured at launch via <code className="font-mono text-text-muted">aoe serve</code>{" "}
         flags. See the{" "}
         <a
-          href="https://agent-of-empires.com/guides/web-dashboard/"
+          href="https://u8erp.com/guides/web-dashboard/"
           target="_blank"
           rel="noopener noreferrer"
           className="text-brand-500 hover:text-brand-400 underline decoration-brand-500/30"

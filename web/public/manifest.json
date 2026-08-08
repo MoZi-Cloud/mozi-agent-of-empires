@@ -1,7 +1,7 @@
 {
-  "name": "Agent of Empires",
-  "short_name": "AoE",
-  "description": "AI agent session manager",
+  "name": "Mozi AoE",
+  "short_name": "Mozi AoE",
+  "description": "Mozi AoE: AI agent session manager",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f172a",

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO="agent-of-empires/agent-of-empires"
+REPO="MoZi-Cloud/mozi-agent-of-empires"
 DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 BINARY_NAME="aoe"
@@ -30,7 +30,7 @@ check_glibc() {
 Options:
   - Use a newer distro (Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2/2023)
   - Install via Homebrew: brew install aoe
-  - Build from source: https://www.agent-of-empires.com/docs/installation/#build-from-source"
+  - Build from source: https://u8erp.com/docs/installation/#build-from-source"
     fi
 }
 
@@ -156,7 +156,7 @@ main() {
     echo ""
     success "Run 'aoe' to get started!"
     echo ""
-    info "For shell completions, see: https://www.agent-of-empires.com/guides/shell-completions/"
+    info "For shell completions, see: https://u8erp.com/guides/shell-completions/"
 }
 
 main "$@"

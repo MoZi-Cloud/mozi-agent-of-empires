@@ -1,6 +1,9 @@
+> **Mozi AoE** is an unofficial fork of [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires), distributed under the MIT License.
+> Website: https://u8erp.com, Source: https://github.com/MoZi-Cloud/mozi-agent-of-empires, Details: [NOTICE](NOTICE).
+
 <p align="center">
-  <img src="assets/logo.png" alt="Agent of Empires" width="128">
-  <h1 align="center">Agent of Empires (AoE)</h1>
+  <img src="assets/logo.png" alt="Mozi AoE" width="128">
+  <h1 align="center">Mozi AoE</h1>
   <p align="center">
     <a href="https://trendshift.io/repositories/22434" target="_blank"><img src="https://trendshift.io/api/badge/repositories/22434" alt="agent-of-empires%2Fagent-of-empires | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
   </p>

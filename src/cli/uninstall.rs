@@ -288,7 +288,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     println!();
     println!("Thank you for using Agent of Empires!");
-    println!("Feedback: https://github.com/agent-of-empires/agent-of-empires/issues");
+    println!("Feedback: https://github.com/MoZi-Cloud/mozi-agent-of-empires/issues");
 
     Ok(())
 }

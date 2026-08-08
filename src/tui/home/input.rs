@@ -3649,7 +3649,7 @@ impl HomeView {
                             "Nix install: run `nix run github:agent-of-empires/agent-of-empires` to update".to_string()
                         }
                         InstallMethod::Cargo => {
-                            "Cargo install: run `cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe`".to_string()
+                            "Cargo install: run `cargo install --git https://github.com/MoZi-Cloud/mozi-agent-of-empires aoe`".to_string()
                         }
                         InstallMethod::Unknown { .. } => {
                             "Unknown install method: run `aoe update` in a terminal for instructions".to_string()

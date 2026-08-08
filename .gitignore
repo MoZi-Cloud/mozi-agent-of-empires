@@ -83,3 +83,7 @@ website/src/pages/docs/development/internals/*.md
 web/coverage/
 web/playwright-report/
 web/playwright-live-report/
+
+# Mozi AoE fork release artifacts (built by packaging/make-deb.sh, make-zip.sh)
+/*.deb
+/*.zip

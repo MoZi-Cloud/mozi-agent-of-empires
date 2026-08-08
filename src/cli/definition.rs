@@ -46,7 +46,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(about = "Terminal session manager for AI coding agents")]
 #[command(version = VERSION)]
 #[command(
-    long_about = "Agent of Empires (aoe) is a terminal session manager that uses tmux to help \
+    long_about = "Mozi AoE (aoe) is a terminal session manager that uses tmux to help \
     you manage and monitor AI coding agents like Claude Code and OpenCode.\n\n\
     Run without arguments to launch the TUI dashboard."
 )]

@@ -149,7 +149,7 @@ describe("service-worker push toasts", () => {
   it("uses the default title and a plain info toast when payload omits title and session", () => {
     renderProvider();
     dispatchPush({ type: "aoe-push", payload: { body: "just a body" } });
-    const toast = screen.getByText("Agent of Empires: just a body").closest("div");
+    const toast = screen.getByText("Mozi AoE: just a body").closest("div");
     expect(toast?.getAttribute("role")).toBe("status");
     expect(toast?.className).not.toContain("cursor-pointer");
   });

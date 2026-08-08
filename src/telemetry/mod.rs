@@ -130,14 +130,18 @@ pub fn endpoint() -> String {
 /// opted in and `DO_NOT_TRACK` is not suppressing. Drives id generation and
 /// whether events are built at all.
 pub fn is_opted_in() -> bool {
-    crate::session::get_telemetry_settings().enabled && !do_not_track()
+    // Unofficial fork (Mozi AoE): telemetry to the upstream collection gateway
+    // is permanently disabled. No events are ever built or sent, regardless of
+    // the opt-in setting or DO_NOT_TRACK. The settings toggle is a no-op.
+    false
 }
 
 /// Opt-in check against an already-loaded `Config`, so a caller that needs the
 /// full config anyway (e.g. [`build_usage_snapshot`] for `active_features`)
 /// doesn't parse `config.toml` a second time via [`is_opted_in`].
-fn opted_in_with(config: &crate::session::Config) -> bool {
-    config.telemetry.enabled && !do_not_track()
+fn opted_in_with(_config: &crate::session::Config) -> bool {
+    // Unofficial fork (Mozi AoE): see is_opted_in(); telemetry is always off.
+    false
 }
 
 /// Apply an opt-in/opt-out transition's side effect on the install id. The

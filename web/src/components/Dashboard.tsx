@@ -85,14 +85,14 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
         </g>
       </svg>
       <div className="mb-1 text-center">
-        <p className="text-[11px] md:text-xs font-mono text-text-muted uppercase tracking-[0.2em]">agent of</p>
+        <p className="text-[11px] md:text-xs font-mono text-text-muted uppercase tracking-[0.2em]">mozi</p>
         <h1
           className="text-3xl md:text-5xl font-mono font-semibold text-brand-500 uppercase tracking-tight"
           style={{
             textShadow: AOE_BRAND_MARK_TEXT_SHADOW,
           }}
         >
-          empires
+          aoe
         </h1>
       </div>
 
@@ -139,12 +139,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
       {readOnly ? (
         <div className="max-w-sm w-full">
           <p className="text-xs text-text-dim text-center mb-3">This dashboard is in read-only mode.</p>
-          <ActionPane
-            title="Docs"
-            subtitle="Guides and reference"
-            href="https://www.agent-of-empires.com/docs"
-            icon="book"
-          />
+          <ActionPane title="Docs" subtitle="Guides and reference" href="https://u8erp.com/docs" icon="book" />
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-2xl w-full">
@@ -157,12 +152,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
             dataTour={TOUR_ANCHORS.dashboardNewSession}
           />
           <ActionPane title="Clone URL" subtitle="Clone a repo from a URL" onClick={onCloneFromUrl} icon="git" />
-          <ActionPane
-            title="Docs"
-            subtitle="Guides and reference"
-            href="https://www.agent-of-empires.com/docs"
-            icon="book"
-          />
+          <ActionPane title="Docs" subtitle="Guides and reference" href="https://u8erp.com/docs" icon="book" />
         </div>
       )}
 
