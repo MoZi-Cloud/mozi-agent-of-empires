@@ -75,6 +75,15 @@ jobs:
       # release profile's codegen-units=1 + opt-level=3 can trigger on large
       # crates. Matches the local fork build's working flag set.
       RUST_MIN_STACK: '134217728'
+      # Bypass pnpm in build.rs: copy the npm-built frontend (staged by the
+      # "Build web frontend" step at <workspace>/web-dist-staged) instead of
+      # invoking pnpm, which is absent from the manylinux containers.
+      AOE_WEB_DIST: ${{ github.workspace }}/web-dist-staged
+      # Split release codegen into 16 units so the agent-of-empires crate's
+      # LLVM optimization does not overflow a worker stack (the local fork
+      # build ICE'd with codegen-units=1; 16 dodges it). Binary stays
+      # optimized, marginally less than upstream's codegen-units=1.
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +143,14 @@ jobs:
           node-version: '22'
 
       - name: Build web frontend
-        run: cd web && npm install && npm run build
+        # build.rs invokes pnpm unconditionally, but the manylinux containers
+        # and these runners have no pnpm. Build with npm, stage the dist
+        # outside web/, and set AOE_WEB_DIST in the job env so build.rs copies
+        # it instead of running pnpm.
+        run: |
+          cd web && npm install && npm run build
+          rm -rf ../web-dist-staged
+          mv dist ../web-dist-staged
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
