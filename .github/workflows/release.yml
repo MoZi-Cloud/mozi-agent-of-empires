@@ -23,10 +23,10 @@ jobs:
   validate:
     name: Validate Version
     runs-on: ubuntu-latest
-    # Required-reviewer gate. Pauses every release (tag push or manual
-    # dispatch) until njbrake approves in the Actions UI. The whole pipeline
-    # waits here, so no build compute or release publish runs without sign-off.
-    environment: release
+    # Mozi AoE fork: the upstream `environment: release` required-reviewer
+    # gate waited on njbrake, who cannot approve in MoZi-Cloud and would block
+    # every release forever. It is removed; re-add an environment with your own
+    # reviewers if you want a publish gate.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,6 +71,10 @@ jobs:
     container: ${{ matrix.container }}
     env:
       LINUX_GLIBC_FLOOR: '2.28'
+      # Guard against the rustc LLVM-codegen stack overflow (SIGSEGV) the
+      # release profile's codegen-units=1 + opt-level=3 can trigger on large
+      # crates. Matches the local fork build's working flag set.
+      RUST_MIN_STACK: '134217728'
     strategy:
       fail-fast: false
       matrix:
@@ -177,13 +181,34 @@ jobs:
           # not installed on macOS by default.
           shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
+      - name: Build unsigned macOS .dmg (arm64 / Mac mini M4 only)
+        # Unsigned: Gatekeeper blocks first launch until the user runs
+        #   xattr -dr com.apple.quarantine /Applications/Mozi\ AoE.app
+        # (or against the mounted dmg). Notarization needs an Apple Developer ID
+        # the fork does not have. hdiutil ships with macOS, no extra tooling.
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          DMG="mozi-aoe-${VERSION}-darwin-arm64.dmg"
+          mkdir -p dmg-stage dist
+          cp target/${{ matrix.target }}/release/aoe dmg-stage/aoe
+          hdiutil create -volname "Mozi AoE" -srcfolder dmg-stage -ov -format UDZO "dist/${DMG}"
+          shasum -a 256 "dist/${DMG}" > "dist/${DMG}.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.name }}
           path: |
-            dist/${{ matrix.name }}.tar.gz
-            dist/${{ matrix.name }}.tar.gz.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.dmg
+            dist/*.dmg.sha256
 
   release:
     name: Create Release
@@ -254,13 +279,18 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.version.outputs.version }}
-          name: Agent of Empires ${{ steps.version.outputs.version }}
-          draft: false
+          name: Mozi AoE ${{ steps.version.outputs.version }}
+          # Draft so the locally-built .deb and .zip (attached separately via
+          # `gh release upload`) and the macOS .dmg can be verified before the
+          # release goes public. Publish with: gh release edit <tag> --draft=false
+          draft: true
           prerelease: false
           body_path: release-notes.md
           files: |
             artifacts/*.tar.gz
             artifacts/*.tar.gz.sha256
+            artifacts/*.dmg
+            artifacts/*.dmg.sha256
 
     outputs:
       version: ${{ steps.version.outputs.version }}
