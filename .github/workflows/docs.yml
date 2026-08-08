@@ -1,17 +1,11 @@
 name: Deploy Website
 
+# Manual-only on this fork: GitHub Pages is not enabled here (the public site
+# is u8erp.com), so a push-triggered deploy fails at actions/deploy-pages with
+# 404 "Ensure GitHub Pages has been enabled" and leaves a red github-pages
+# deployment on /deployments. Re-add the push trigger below if you enable Pages
+# (Settings -> Pages -> Source: GitHub Actions).
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'website/**'
-      - 'docs/**'
-      - 'assets/**'
-      - 'scripts/build-site.sh'
-      - 'scripts/install.sh'
-      - 'src/**'
-      - 'xtask/**'
-      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
