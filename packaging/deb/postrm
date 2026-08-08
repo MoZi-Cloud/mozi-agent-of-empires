@@ -1,0 +1,12 @@
+#!/bin/sh
+# On purge, remove the generated systemd unit and reload the daemon.
+set -e
+case "$1" in
+    purge)
+        rm -f /etc/systemd/system/mozi-aoe.service
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        ;;
+esac
+exit 0

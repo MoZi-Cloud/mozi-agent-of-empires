@@ -1,0 +1,73 @@
+#!/bin/sh
+# Mozi AoE postinst: generate, enable, and start the systemd service so the
+# dashboard auto-starts at boot. Runs as the login user who triggered the
+# install (detected via SUDO_USER / logname), on fixed port 40080.
+set -e
+
+detect_login_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "$SUDO_USER"; return
+    fi
+    if command -v logname >/dev/null 2>&1; then
+        u="$(logname 2>/dev/null || true)"
+        if [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi
+    fi
+    echo ""
+}
+
+write_unit() {
+    user="$1"; home="$2"
+    mkdir -p /etc/systemd/system
+    cat > /etc/systemd/system/mozi-aoe.service <<EOF
+[Unit]
+Description=Mozi AoE web dashboard (aoe serve on port 40080)
+Documentation=https://github.com/MoZi-Cloud/mozi-agent-of-empires
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$user
+Group=$user
+Environment=HOME=$home
+ExecStart=/usr/bin/aoe serve --host 0.0.0.0 --port 40080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "mozi-aoe: systemd not found; start manually:" >&2
+    echo "  aoe serve --host 0.0.0.0 --port 40080" >&2
+    exit 0
+fi
+
+AOE_USER="$(detect_login_user)"
+if [ -z "$AOE_USER" ]; then
+    echo "mozi-aoe: could not detect the login user (SUDO_USER / logname empty)." >&2
+    echo "  Re-run the install as yourself:  sudo apt install ./mozi-aoe_*.deb" >&2
+    echo "  The binary is installed; only the auto-start service was skipped." >&2
+    exit 0
+fi
+
+AOE_HOME="$(getent passwd "$AOE_USER" | cut -d: -f6)"
+if [ -z "$AOE_HOME" ]; then
+    echo "mozi-aoe: no home directory found for user '$AOE_USER'; skipping auto-start." >&2
+    exit 0
+fi
+
+write_unit "$AOE_USER" "$AOE_HOME"
+systemctl daemon-reload
+systemctl enable mozi-aoe.service >/dev/null 2>&1 || true
+if systemctl start mozi-aoe.service; then
+    echo "mozi-aoe: service enabled and started (user=$AOE_USER, port 40080, LAN-reachable)."
+else
+    echo "mozi-aoe: service enabled but failed to start; check 'journalctl -u mozi-aoe'." >&2
+fi
+echo "  Dashboard URL + token: cat $AOE_HOME/.config/agent-of-empires/serve.url"
+echo "  Status:                systemctl status mozi-aoe"
+
+exit 0

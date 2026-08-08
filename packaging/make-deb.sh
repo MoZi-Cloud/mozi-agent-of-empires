@@ -49,6 +49,14 @@ Description: Terminal session manager for AI coding agents
 EOF
 chmod 0644 "$PKG/DEBIAN/control"
 
+# Maintainer scripts: postinst enables + starts the systemd service at boot
+# (running as the login user who installed, on port 40080); prerm stops it;
+# postrm purges the generated unit.
+for s in postinst prerm postrm; do
+    cp "$ROOT/packaging/deb/$s" "$PKG/DEBIAN/$s"
+    chmod 0755 "$PKG/DEBIAN/$s"
+done
+
 OUT="$ROOT/mozi-aoe_${VERSION}_amd64.deb"
 dpkg-deb --build --root-owner-group "$PKG" "$OUT"
 

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stop and disable the service on remove/deconfigure.
+set -e
+case "$1" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop mozi-aoe.service 2>/dev/null || true
+            systemctl disable mozi-aoe.service 2>/dev/null || true
+        fi
+        ;;
+esac
+exit 0
