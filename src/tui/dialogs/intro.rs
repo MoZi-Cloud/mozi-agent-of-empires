@@ -920,10 +920,7 @@ impl IntroDialog {
             )),
             Line::from(vec![
                 Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    "https://u8erp.com/docs",
-                    Style::default().fg(theme.accent),
-                ),
+                Span::styled("https://u8erp.com/docs", Style::default().fg(theme.accent)),
             ]),
             Line::from(vec![
                 Span::styled("  Tutorials: ", Style::default().fg(theme.dimmed)),

@@ -113,7 +113,7 @@ This document contains the help content for the `aoe` command-line program.
 
 ## `aoe`
 
-Agent of Empires (aoe) is a terminal session manager that uses tmux to help you manage and monitor AI coding agents like Claude Code and OpenCode.
+Mozi AoE (aoe) is a terminal session manager that uses tmux to help you manage and monitor AI coding agents like Claude Code and OpenCode.
 
 Run without arguments to launch the TUI dashboard.
 
